@@ -1,5 +1,11 @@
 // smarty-dev#16938: 60 screenshots exceeded the gateway's 16 MiB JSON body limit.
 // Keep reasons: recorded incident, attachment data safety, and the diagnostic publication trust boundary.
+import {
+	BedrockRuntimeClient,
+	ConverseStreamCommand,
+	type ConverseStreamCommandInput,
+} from "@aws-sdk/client-bedrock-runtime";
+import type { HttpRequest } from "@smithy/types";
 import { describe, expect, it } from "vitest";
 import type { Api, Context, ImageContent, Model, ToolResultMessage, UserMessage } from "../src/types.ts";
 import {
@@ -66,6 +72,37 @@ function anthropicImage(data: string) {
 
 function bytes(payload: unknown): number {
 	return new TextEncoder().encode(JSON.stringify(payload)).length;
+}
+
+/** Run the installed SDK serializer and signer, then stop at the handler without opening a socket. */
+async function serializedBedrockRequest(input: ConverseStreamCommandInput): Promise<{ body: string; path: string }> {
+	let captured: { body: string; path: string } | undefined;
+	const stopped = new Error("Offline Bedrock request captured");
+	const client = new BedrockRuntimeClient({
+		region: "us-east-1",
+		endpoint: "https://bedrock.invalid",
+		credentials: { accessKeyId: "dummy-access-key", secretAccessKey: "dummy-secret-key" },
+		maxAttempts: 1,
+		requestHandler: {
+			async handle(request: HttpRequest) {
+				const body: unknown = request.body;
+				if (typeof body !== "string" && !(body instanceof Uint8Array)) {
+					throw new Error("Expected a serialized Bedrock JSON body");
+				}
+				captured = { body: typeof body === "string" ? body : new TextDecoder().decode(body), path: request.path };
+				throw stopped;
+			},
+			updateHttpClientConfig: () => undefined,
+			httpHandlerConfigs: () => ({}),
+		},
+	});
+	try {
+		await expect(client.send(new ConverseStreamCommand(input))).rejects.toBe(stopped);
+		if (!captured) throw new Error("Bedrock SDK did not reach the offline handler");
+		return captured;
+	} finally {
+		client.destroy();
+	}
 }
 
 describe("fitRequestImages", () => {
@@ -463,23 +500,111 @@ describe("explicit provider conversation paths", () => {
 	});
 
 	// smarty-dev#16938: JSON.stringify(Uint8Array) falsely exceeded 16 MiB for a 2 MiB SDK image.
-	it("admits an under-budget native Bedrock image without changing the payload", () => {
+	it("admits an under-budget native Bedrock image without changing the payload", async () => {
 		const nativeBytes = new Uint8Array(2 * MIB).fill(255);
 		const data = Buffer.from(nativeBytes).toString("base64");
 		const payload = {
 			modelId: "test-model",
-			messages: [{ role: "user", content: [{ image: { format: "png", source: { bytes: nativeBytes } } }] }],
+			messages: [
+				{ role: "user" as const, content: [{ image: { format: "png" as const, source: { bytes: nativeBytes } } }] },
+			],
 		};
-		const expectedBytes = bytes({
-			...payload,
-			messages: [{ role: "user", content: [{ image: { format: "png", source: { bytes: data } } }] }],
-		});
+		const wire = await serializedBedrockRequest(payload);
+		const expectedBytes = Buffer.byteLength(wire.body);
 		expect(bytes(payload)).toBeGreaterThan(DEFAULT_MAX_REQUEST_BYTES);
 		expect(expectedBytes).toBeLessThan(DEFAULT_REQUEST_IMAGE_BUDGET_BYTES);
 		const result = fitRequestImages(payload, model("bedrock-converse-stream"), { messages: [user(data)] });
 		expect(result).toEqual({ payload, imagesOmitted: 0, bytesSaved: 0, requestBytes: expectedBytes });
 		expect(result.payload).toBe(payload);
 		expect(payload.messages[0].content[0].image.source.bytes).toBe(nativeBytes);
+	});
+
+	// smarty-dev#16938: ConverseStream's modelId is an HTTP label, not part of the gateway's JSON body.
+	it.each([-1, 1])("measures Bedrock at 16 MiB offset %d without the path modelId", async (offset) => {
+		const payload = {
+			modelId: "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/test",
+			messages: [{ role: "user" as const, content: [{ text: "" }] }],
+			system: [{ text: 'Keep 😀\n"\\' }],
+			inferenceConfig: { maxTokens: 1024, temperature: 0.5 },
+			toolConfig: {
+				tools: [{ toolSpec: { name: "test", inputSchema: { json: { modelId: "schema-model" } } } }],
+			},
+			additionalModelRequestFields: { modelId: "nested-model" },
+			requestMetadata: { modelId: "metadata-model" },
+		};
+		const baseline = await serializedBedrockRequest(payload);
+		payload.messages[0].content[0].text = "x".repeat(
+			DEFAULT_MAX_REQUEST_BYTES + offset - Buffer.byteLength(baseline.body),
+		);
+		const wire = await serializedBedrockRequest(payload);
+		const bodyBytes = Buffer.byteLength(wire.body);
+		expect(bodyBytes).toBe(DEFAULT_MAX_REQUEST_BYTES + offset);
+		expect(bytes(payload)).toBeGreaterThan(DEFAULT_MAX_REQUEST_BYTES);
+		expect(wire.path).toBe(`/model/${encodeURIComponent(payload.modelId)}/converse-stream`);
+		expect(JSON.parse(wire.body)).not.toHaveProperty("modelId");
+		expect(JSON.parse(wire.body)).toMatchObject({
+			toolConfig: payload.toolConfig,
+			additionalModelRequestFields: payload.additionalModelRequestFields,
+			requestMetadata: payload.requestMetadata,
+		});
+		if (offset < 0) {
+			const result = fitRequestImages(payload, model("bedrock-converse-stream"), { messages: [] });
+			expect(result).toEqual({ payload, imagesOmitted: 0, bytesSaved: 0, requestBytes: bodyBytes });
+			expect(result.payload).toBe(payload);
+		} else {
+			try {
+				fitRequestImages(payload, model("bedrock-converse-stream"), { messages: [] });
+				throw new Error("Expected local request-size refusal");
+			} catch (error) {
+				expect(error).toBeInstanceOf(RequestTooLargeError);
+				expect(error).toMatchObject({ requestBytes: bodyBytes, imagesOmitted: 0, bytesSaved: 0 });
+			}
+		}
+		expect(payload.modelId).toBe("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/test");
+	});
+
+	// smarty-dev#16938: path overhead alone must not omit the latest user's native image below the soft target.
+	it("retains a native Bedrock image below the actual soft target but trims a genuinely oversized body", async () => {
+		const nativeBytes = new Uint8Array(32 * KIB).fill(255);
+		const data = Buffer.from(nativeBytes).toString("base64");
+		const payload = {
+			modelId: "test-model",
+			messages: [
+				{
+					role: "user" as const,
+					content: [{ text: "" }, { image: { format: "png" as const, source: { bytes: nativeBytes } } }],
+				},
+			],
+		};
+		const baseline = await serializedBedrockRequest(payload);
+		payload.messages[0].content[0].text = "x".repeat(
+			DEFAULT_REQUEST_IMAGE_BUDGET_BYTES - 1 - Buffer.byteLength(baseline.body),
+		);
+		const wire = await serializedBedrockRequest(payload);
+		const bodyBytes = Buffer.byteLength(wire.body);
+		expect(bodyBytes).toBe(DEFAULT_REQUEST_IMAGE_BUDGET_BYTES - 1);
+		// Adding the path member to this SDK body reproduces the former projection's overcount.
+		expect(bodyBytes + bytes({ modelId: payload.modelId }) - 1).toBeGreaterThan(DEFAULT_REQUEST_IMAGE_BUDGET_BYTES);
+		const context: Context = { messages: [user(data)] };
+		const result = fitRequestImages(payload, model("bedrock-converse-stream"), context);
+		expect(result).toEqual({ payload, imagesOmitted: 0, bytesSaved: 0, requestBytes: bodyBytes });
+		expect(result.payload).toBe(payload);
+		expect(payload.messages[0].content[1].image?.source.bytes).toBe(nativeBytes);
+
+		payload.messages[0].content[0].text += "x".repeat(DEFAULT_MAX_REQUEST_BYTES - bodyBytes + 1);
+		const oversized = await serializedBedrockRequest(payload);
+		expect(Buffer.byteLength(oversized.body)).toBe(DEFAULT_MAX_REQUEST_BYTES + 1);
+		const trimmed = fitRequestImages(payload, model("bedrock-converse-stream"), context, DEFAULT_MAX_REQUEST_BYTES);
+		const fitted = trimmed.payload as typeof payload;
+		const fittedWire = await serializedBedrockRequest(fitted);
+		expect(trimmed.imagesOmitted).toBe(1);
+		expect(trimmed.requestBytes).toBe(Buffer.byteLength(fittedWire.body));
+		expect(trimmed.requestBytes).toBeLessThan(DEFAULT_MAX_REQUEST_BYTES);
+		expect(trimmed.bytesSaved).toBe(Buffer.byteLength(oversized.body) - trimmed.requestBytes);
+		expect(fitted.modelId).toBe(payload.modelId);
+		expect(fitted.messages[0].content[0]).toBe(payload.messages[0].content[0]);
+		expect(payload.messages[0].content[1].image?.source.bytes).toBe(nativeBytes);
+		expect(context.messages[0]).toEqual(user(data));
 	});
 
 	// smarty-dev#16938: real SDK history is bytes, but transcript ordering and labels are base64-based.
@@ -519,9 +644,9 @@ describe("explicit provider conversation paths", () => {
 				},
 			] as const,
 		};
-		const wireBytes = (value: unknown) =>
+		const wireBytes = (value: typeof payload) =>
 			new TextEncoder().encode(
-				JSON.stringify(value, (_key, entry: unknown) =>
+				JSON.stringify({ ...value, modelId: undefined }, (_key, entry: unknown) =>
 					entry instanceof Uint8Array ? Buffer.from(entry).toString("base64") : entry,
 				),
 			).length;
@@ -580,18 +705,48 @@ describe("explicit provider conversation paths", () => {
 	// smarty-dev#16938: only modeled binary paths may change measurement, never schemas or tool JSON.
 	it("does not reinterpret arbitrary Bedrock typed arrays as modeled binary fields", () => {
 		const nativeBytes = new Uint8Array([1, 2, 3]);
-		const planted = { image: { source: { bytes: nativeBytes } } };
+		const planted = { modelId: "nested-model", image: { source: { bytes: nativeBytes } } };
 		const payload = {
+			modelId: "path-model",
 			messages: [
 				{ role: "assistant", content: [{ toolUse: { input: planted } }] },
 				{ role: "user", content: [{ toolResult: { toolUseId: "x", content: [{ json: planted }] } }] },
-			],
+			] as const,
 			toolConfig: { tools: [{ toolSpec: { inputSchema: { json: planted } } }] },
 			metadata: planted,
 		};
 		const result = fitRequestImages(payload, model("bedrock-converse-stream"), { messages: [] }, 1);
+		expect(result).toEqual({
+			payload,
+			imagesOmitted: 0,
+			bytesSaved: 0,
+			requestBytes: bytes({ ...payload, modelId: undefined }),
+		});
+		expect(result.payload).toBe(payload);
+		expect(payload.modelId).toBe("path-model");
+		expect(payload.messages[0].content[0].toolUse?.input).toBe(planted);
+		expect(payload.messages[1].content[0].toolResult?.content[0].json).toBe(planted);
+	});
+
+	it.each([
+		"anthropic-messages",
+		"openai-completions",
+		"mistral-conversations",
+		"openai-responses",
+		"azure-openai-responses",
+		"openai-codex-responses",
+		"google-generative-ai",
+		"google-vertex",
+		"pi-messages",
+		"custom-api",
+	] as const)("keeps counting top-level and nested modelId for %s", (api) => {
+		const payload = { modelId: "body-model".repeat(200), metadata: { modelId: "nested-model" }, messages: [] };
+		const result = fitRequestImages(payload, model(api), { messages: [] }, 1);
 		expect(result).toEqual({ payload, imagesOmitted: 0, bytesSaved: 0, requestBytes: bytes(payload) });
 		expect(result.payload).toBe(payload);
+		expect(() => fitRequestImages(payload, model(api, bytes(payload) - 1), { messages: [] })).toThrow(
+			RequestTooLargeError,
+		);
 	});
 
 	it.each(payloadShapes)("fits $api image blocks", ({ api, payload: build }) => {

@@ -125,7 +125,7 @@ function serializePayload(payload: unknown, api?: Api): string {
 		const root = api === "bedrock-converse-stream" ? object(payload) : undefined;
 		if (root) {
 			// Do not return this projection: retained SDK bytes and all caller options must keep their identity.
-			payload = {
+			const projection: ObjectValue = {
 				...root,
 				...(Array.isArray(root.messages) && {
 					messages: root.messages.map((value) => {
@@ -139,6 +139,9 @@ function serializePayload(payload: unknown, api?: Api): string {
 					system: root.system.map((entry) => bedrockBlockForJson(entry, "system")),
 				}),
 			};
+			// Smithy binds only the top-level modelId to the URL path, not the JSON body.
+			delete projection.modelId;
+			payload = projection;
 		}
 		const json = JSON.stringify(payload);
 		if (json !== undefined) return json;
@@ -400,7 +403,7 @@ function discoverImages(payload: ObjectValue, api: Api): PayloadImage[] {
  * Under target, preserves payload identity. Otherwise operates on a detached snapshot; neither the original
  * payload nor transcript is changed. Unknown paths/encodings are left intact, never searched recursively.
  * Bedrock's known SDK blob fields are measured as base64 JSON strings, without changing native byte sources.
- * Other parameter fields (including modelId) are conservatively included, rather than rebuilding the SDK body.
+ * Bedrock's path-bound modelId is excluded from measurement; other parameter fields remain included.
  */
 export function fitRequestImages(
 	payload: unknown,
