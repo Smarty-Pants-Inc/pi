@@ -163,7 +163,7 @@ describe("AgentSession Anthropic mid-output fallback replay", () => {
 	}
 
 	// smarty-dev#2890: production thinking/text fallback loses the partial response, not the user's input.
-	it("replays once on the same model, discards thinking and durably omits the failed partial", async () => {
+	it("replays once on the same model, records bounded MID metadata, and omits failed output from replay", async () => {
 		const { h, requests, payloads } = await setup(
 			[
 				midOutput([
@@ -198,8 +198,19 @@ describe("AgentSession Anthropic mid-output fallback replay", () => {
 		const failed = assistantHistory(h)[0];
 		expect(failed.stopReason).toBe("error");
 		expect(isRetryableAnthropicMidOutputFallback(failed)).toBe(true);
-		expect(failed.fallback).toHaveLength(1);
-		expect(failed.fallback?.[0].position).toBe("mid-output");
+		const fallbackRecord = {
+			position: "mid-output",
+			blockIndex: 2,
+			blockState: "retained",
+			rawBlock: JSON.stringify({
+				type: "fallback",
+				from: { model: requestedModel },
+				to: { model: "older-model" },
+				provider_field: rawMarker,
+			}),
+		};
+		expect(failed.fallback).toEqual([fallbackRecord]);
+		expect(failed.errorMessage ?? "").not.toContain(rawMarker);
 		expect(failed.content).toContainEqual({ type: "text", text: partialText });
 		expect(failed.content.filter((block) => block.type === "thinking")).toEqual([{ type: "thinking", thinking: "" }]);
 		expect(failed.diagnostics).toContainEqual(
@@ -211,15 +222,30 @@ describe("AgentSession Anthropic mid-output fallback replay", () => {
 			expect.objectContaining({ type: "context_edit", targetId: failedEntry?.id, replacement: null }),
 		);
 		expect(entries.filter((entry) => entry.type === "message" && entry.message.role === "user")).toHaveLength(1);
+		const persistedBytes = readFileSync(h.session.sessionFile!, "utf8");
+		expect(persistedBytes).toContain(rawMarker);
 		const reopened = SessionManager.open(h.session.sessionFile!);
+		const reopenedFailures = reopened
+			.getEntries()
+			.flatMap((entry) =>
+				entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "error"
+					? [entry.message]
+					: [],
+			);
+		expect(reopenedFailures).toHaveLength(1);
+		expect(reopenedFailures[0].fallback).toEqual([fallbackRecord]);
+		expect(reopenedFailures[0].diagnostics).toContainEqual(
+			expect.objectContaining({ type: "anthropic_model_fallback", fallbackCount: 1 }),
+		);
 		for (const marker of [partialThinking, "partial-signature", partialText, rawMarker]) {
 			expect(requests[1].messages).not.toContain(marker);
 			expect(payloads[1]).not.toContain(marker);
 			expect(JSON.stringify(reopened.buildSessionProjection().messages)).not.toContain(marker);
 		}
-		expect(readFileSync(h.session.sessionFile!, "utf8")).toContain("anthropic_fallback_retry");
+		expect(persistedBytes).toContain("anthropic_fallback_retry");
 		expect(JSON.stringify(reopened.getEntries())).not.toContain(partialThinking);
 		expect(JSON.stringify(reopened.getEntries())).toContain(partialText);
+		expect(JSON.stringify(reopened.getEntries())).toContain(rawMarker);
 	});
 
 	// smarty-dev#2890: thinking alone counts as mid-output, and its held events must not survive recovery.
@@ -759,24 +785,85 @@ describe("AgentSession Anthropic mid-output fallback replay", () => {
 		expect(h.eventsOfType("auto_retry_start")).toEqual([]);
 	});
 
-	it("does not mistake a stream observer's marker-shaped exception for an owned marker", async () => {
-		let observed = 0;
-		const { h, requests } = await setup(
-			[midOutput(), success()],
-			{},
-			{
-				onProviderStreamEvent: () => {
-					if (++observed === 2) throw new Error(markerError);
-				},
-			},
+	it("does not let an observer error authorize MID retry before or after marker capture", async () => {
+		const responseEvents = midOutput();
+		const markerEventIndex = responseEvents.findIndex(
+			(event) =>
+				event.type === "content_block_start" &&
+				typeof event.content_block === "object" &&
+				event.content_block !== null &&
+				"type" in event.content_block &&
+				event.content_block.type === "fallback",
 		);
-		await h.session.prompt("test request");
-		expect(requests).toHaveLength(1);
-		expect(isRetryableAnthropicMidOutputFallback(assistantHistory(h)[0])).toBe(false);
-		expect(assistantHistory(h)[0].diagnostics).toContainEqual(
+		const textBlockStartIndex = responseEvents.findIndex(
+			(event) =>
+				event.type === "content_block_start" &&
+				typeof event.content_block === "object" &&
+				event.content_block !== null &&
+				"type" in event.content_block &&
+				event.content_block.type === "text",
+		);
+		expect(textBlockStartIndex).toBeGreaterThanOrEqual(0);
+		expect(markerEventIndex).toBeGreaterThan(textBlockStartIndex);
+
+		// The adapter notifies once per parsed wire event. It records the marker before
+		// notifying for that event, but applies MID recovery classification only afterward.
+		const runObserverFailure = async (notifyAt: number) => {
+			let observed = 0;
+			const { h, requests } = await setup(
+				[responseEvents, success()],
+				{},
+				{
+					onProviderStreamEvent: () => {
+						if (++observed === notifyAt) throw new Error(markerError);
+					},
+				},
+			);
+			await h.session.prompt("test request");
+			return { h, requests, failed: assistantHistory(h)[0] };
+		};
+
+		const beforeMarker = await runObserverFailure(textBlockStartIndex + 1);
+		expect(beforeMarker.requests).toHaveLength(1);
+		expect(beforeMarker.failed.fallback).toBeUndefined();
+		expect(isRetryableAnthropicMidOutputFallback(beforeMarker.failed)).toBe(false);
+		expect(beforeMarker.failed.diagnostics ?? []).not.toContainEqual(
+			expect.objectContaining({ type: "anthropic_model_fallback" }),
+		);
+		expect(beforeMarker.failed.diagnostics).toContainEqual(
 			expect.objectContaining({ type: "provider_stream_observer_error" }),
 		);
-		expect(h.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(beforeMarker.failed.errorMessage ?? "").not.toContain(rawMarker);
+		expect(JSON.stringify(beforeMarker.failed.diagnostics ?? [])).not.toContain(rawMarker);
+		expect(beforeMarker.h.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(retryEntries(beforeMarker.h)).toEqual([]);
+
+		const afterMarker = await runObserverFailure(markerEventIndex + 1);
+		expect(afterMarker.requests).toHaveLength(1);
+		expect(afterMarker.failed.fallback).toEqual([
+			{
+				position: "mid-output",
+				blockIndex: 1,
+				blockState: "retained",
+				rawBlock: JSON.stringify({
+					type: "fallback",
+					from: { model: requestedModel },
+					to: { model: "older-model" },
+					provider_field: rawMarker,
+				}),
+			},
+		]);
+		expect(afterMarker.failed.errorMessage ?? "").not.toContain(rawMarker);
+		expect(JSON.stringify(afterMarker.failed.diagnostics ?? [])).not.toContain(rawMarker);
+		expect(isRetryableAnthropicMidOutputFallback(afterMarker.failed)).toBe(false);
+		expect(afterMarker.failed.diagnostics).toContainEqual(
+			expect.objectContaining({ type: "provider_stream_observer_error" }),
+		);
+		expect(afterMarker.failed.diagnostics).toContainEqual(
+			expect.objectContaining({ type: "anthropic_model_fallback", fallbackCount: 1 }),
+		);
+		expect(afterMarker.h.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(retryEntries(afterMarker.h)).toEqual([]);
 	});
 
 	it("does not replay after the user aborts while output is arriving", async () => {
