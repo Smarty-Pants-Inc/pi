@@ -733,20 +733,15 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					const diagnostic = createAssistantMessageDiagnostic("anthropic_model_fallback");
 					diagnostic.fallbackCount = 1;
 					appendAssistantMessageDiagnostic(output, diagnostic);
-					if (position === "start") {
-						fallback.push(
-							await recordAnthropicFallback(
-								event.content_block,
-								event.index,
-								position,
-								getRequestDiagnosticSecrets(model, options),
-								injectedClient || sdkManagedCredentials,
-							),
-						);
-					} else {
-						// smarty-dev#2890: full MID raw capture is phase2; do not serialize the block here.
-						fallback.push({ position, blockIndex: event.index, blockState: "discarded" });
-					}
+					fallback.push(
+						await recordAnthropicFallback(
+							event.content_block,
+							event.index,
+							position,
+							getRequestDiagnosticSecrets(model, options),
+							injectedClient || sdkManagedCredentials,
+						),
+					);
 				}
 				await notifyProviderStreamEvent(options, output);
 				if (event.type === "message_start") {
