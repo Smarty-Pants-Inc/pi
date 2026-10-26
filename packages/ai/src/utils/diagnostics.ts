@@ -3,8 +3,8 @@
 // A published diagnostic is rebuilt from a closed list of Pi-owned types and a locally generated timestamp. No
 // provider error, name, stack, cause, error code, nested details or provider timestamp has an output path, so
 // neither a numeric `.code` nor any nested value can carry a credential equivalent into an event, result,
-// callback or session file through diagnostics. The separate rawStopDetails field below is an explicit,
-// bounded, untrusted record-only exception; it is not an owned diagnostic or a recovery input.
+// callback or session file through diagnostics. The separate rawStopDetails and fallback fields below are
+// explicit, bounded, untrusted record-only exceptions; neither is an owned diagnostic or a recovery input.
 
 import type { AssistantMessage, TextContent, ThinkingContent, ToolCall } from "../types.ts";
 import { isolateValue } from "./assistant-message-snapshot.ts";
@@ -18,6 +18,7 @@ export const ASSISTANT_DIAGNOSTIC_TYPES = [
 	"pi_messages_rewrite",
 	"anthropic_input_transformations",
 	"anthropic_strict_tools_fallback",
+	"anthropic_model_fallback",
 ] as const;
 
 export type AssistantMessageDiagnosticType = (typeof ASSISTANT_DIAGNOSTIC_TYPES)[number];
@@ -28,12 +29,15 @@ export interface AssistantMessageDiagnostic {
 	timestamp: number;
 	/** `anthropic_input_transformations` only: how many thinking blocks the provider dropped from the input. */
 	thinkingBlocksDropped?: number;
+	/** `anthropic_model_fallback` only: Pi's count of observed fallback markers, including start markers. */
+	fallbackCount?: number;
 }
 
 const DIAGNOSTIC_TYPES: ReadonlySet<string> = new Set(ASSISTANT_DIAGNOSTIC_TYPES);
 
-/** Bound of the one numeric diagnostic field: a count of input blocks, far below any request size. */
+/** Bounds of the owned counts; provider-supplied numeric values are never published. */
 const MAX_THINKING_BLOCKS_DROPPED = 100_000;
+const MAX_FALLBACK_COUNT = 100_000;
 
 /** Diagnostics Pi created or rebuilt; re-projection keeps their local timestamps. */
 const ownedDiagnostics = new WeakSet<object>();
@@ -59,8 +63,8 @@ export function appendAssistantMessageDiagnostic<T extends { diagnostics?: Assis
 }
 
 /**
- * Rebuild a message's diagnostics for publication: closed types only, local timestamps, and the one bounded
- * owned count. Everything else on a diagnostic, including any `details`, `error` or provider timestamp, is
+ * Rebuild a message's diagnostics for publication: closed types only, local timestamps, and bounded owned
+ * counts. Everything else on a diagnostic, including any `details`, `error` or provider timestamp, is
  * dropped. Returns undefined when nothing remains.
  */
 export function projectAssistantMessageDiagnostics(value: unknown): AssistantMessageDiagnostic[] | undefined {
@@ -68,12 +72,12 @@ export function projectAssistantMessageDiagnostics(value: unknown): AssistantMes
 	const projected: AssistantMessageDiagnostic[] = [];
 	for (const diagnostic of value) {
 		if (typeof diagnostic !== "object" || diagnostic === null) continue;
-		const { type, timestamp, thinkingBlocksDropped } = diagnostic as Record<string, unknown>;
+		const { type, timestamp, thinkingBlocksDropped, fallbackCount } = diagnostic as Record<string, unknown>;
 		if (typeof type !== "string" || !DIAGNOSTIC_TYPES.has(type)) continue;
 		const rebuilt = createAssistantMessageDiagnostic(type as AssistantMessageDiagnosticType);
 		const owned = ownedDiagnostics.has(diagnostic);
 		if (owned && typeof timestamp === "number") rebuilt.timestamp = timestamp;
-		// The count is Pi's only when Pi created the diagnostic; a producer-supplied number could be a credential
+		// A count is Pi's only when Pi created the diagnostic; a producer-supplied number could be a credential
 		// or a fragment of one, so it is dropped (smarty-dev#5822 pi#202 round 2).
 		if (
 			owned &&
@@ -83,6 +87,15 @@ export function projectAssistantMessageDiagnostics(value: unknown): AssistantMes
 			thinkingBlocksDropped >= 0
 		) {
 			rebuilt.thinkingBlocksDropped = Math.min(thinkingBlocksDropped, MAX_THINKING_BLOCKS_DROPPED);
+		}
+		if (
+			owned &&
+			type === "anthropic_model_fallback" &&
+			typeof fallbackCount === "number" &&
+			Number.isSafeInteger(fallbackCount) &&
+			fallbackCount >= 0
+		) {
+			rebuilt.fallbackCount = Math.min(fallbackCount, MAX_FALLBACK_COUNT);
 		}
 		projected.push(rebuilt);
 	}
@@ -272,6 +285,44 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 		typeof message.responseId === "string"
 	) {
 		projected.responseId = message.responseId;
+	}
+	// Fallback blocks are terminal-only records, not streamed content or recovery inputs. Rebuild each item
+	// with closed keys so producer/consumer mutations and extra properties cannot cross publication.
+	if (phase !== "partial" && message.api === "anthropic-messages" && Array.isArray(message.fallback)) {
+		const fallback: NonNullable<AssistantMessage["fallback"]> = [];
+		for (const record of message.fallback) {
+			if (
+				!record ||
+				(record.position !== "start" && record.position !== "mid-output") ||
+				!Number.isSafeInteger(record.blockIndex) ||
+				record.blockIndex < 0
+			)
+				continue;
+			const rebuilt: (typeof fallback)[number] = {
+				position: record.position,
+				blockIndex: record.blockIndex,
+				blockState: "discarded",
+			};
+			if (
+				record.blockState === "retained" &&
+				typeof record.rawBlock === "string" &&
+				new TextEncoder().encode(record.rawBlock).length <= MAX_STOP_DETAILS_BYTES
+			) {
+				rebuilt.rawBlock = record.rawBlock;
+				rebuilt.blockState = "retained";
+			} else if (
+				record.blockState === "discarded" &&
+				Number.isSafeInteger(record.blockBytes) &&
+				record.blockBytes! >= 0 &&
+				typeof record.blockSha256 === "string" &&
+				/^[a-f0-9]{64}$/.test(record.blockSha256)
+			) {
+				rebuilt.blockBytes = record.blockBytes;
+				rebuilt.blockSha256 = record.blockSha256;
+			}
+			fallback.push(rebuilt);
+		}
+		if (fallback.length > 0) projected.fallback = fallback;
 	}
 	if (message.thinkingLevel !== undefined) projected.thinkingLevel = message.thinkingLevel;
 	const diagnostics = projectAssistantMessageDiagnostics(message.diagnostics);

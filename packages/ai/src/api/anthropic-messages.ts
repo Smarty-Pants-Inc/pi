@@ -22,6 +22,7 @@ import { calculateCost } from "../models.ts";
 import type {
 	Api,
 	AssistantMessage,
+	AssistantMessageFallback,
 	CacheRetention,
 	ImageContent,
 	Message,
@@ -38,6 +39,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
+import { recordAnthropicFallback } from "../utils/anthropic-fallback.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError, ProviderDataError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
@@ -612,12 +614,15 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 		let hasPendingStopDetails = false;
 		let terminalStopReason: string | undefined;
 		let injectedClient = false;
+		// Keep raw records off the live partial; attach them only to a separate terminal message.
+		const fallback: AssistantMessageFallback[] = [];
 
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
 			let usageModel = model;
 			let inputTransformations: BetaInputTransformation[] | undefined;
+			let sdkManagedCredentials = false;
 
 			if (options?.client) {
 				client = options.client;
@@ -626,6 +631,8 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			} else {
 				const apiKey = options?.apiKey;
 				const federation = getAnthropicFederation(model, apiKey, options?.headers, options?.env);
+				// The SDK exchanges/refreshes its own bearer token, which is absent from Pi's redaction list.
+				sdkManagedCredentials = federation !== undefined;
 				if (!federation) assertRequestAuth(model.provider, apiKey, options?.headers);
 
 				let copilotDynamicHeaders: Record<string, string> | undefined;
@@ -719,6 +726,28 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			const blocks = output.content as Block[];
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
+				if (event.type === "content_block_start" && event.content_block.type === "fallback") {
+					const position = output.content.length > 0 ? "mid-output" : "start";
+					// Count each parsed marker, even when an observer rejects the event. One owned count per
+					// marker avoids saturating a cumulative count on repeated start-of-stream fallbacks.
+					const diagnostic = createAssistantMessageDiagnostic("anthropic_model_fallback");
+					diagnostic.fallbackCount = 1;
+					appendAssistantMessageDiagnostic(output, diagnostic);
+					if (position === "start") {
+						fallback.push(
+							await recordAnthropicFallback(
+								event.content_block,
+								event.index,
+								position,
+								getRequestDiagnosticSecrets(model, options),
+								injectedClient || sdkManagedCredentials,
+							),
+						);
+					} else {
+						// smarty-dev#2890: full MID raw capture is phase2; do not serialize the block here.
+						fallback.push({ position, blockIndex: event.index, blockState: "discarded" });
+					}
+				}
 				await notifyProviderStreamEvent(options, output);
 				if (event.type === "message_start") {
 					output.responseId = event.message.id;
@@ -747,7 +776,8 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				} else if (event.type === "content_block_start") {
 					if (event.content_block.type === "fallback") {
 						if (output.content.length > 0) {
-							throw new Error("Anthropic performed an unsupported mid-output model fallback");
+							output.recovery = { recovery: "anthropic_mid_output_fallback", retryable: true };
+							throw new Error("Anthropic performed a mid-output model fallback");
 						}
 						continue;
 					}
@@ -945,7 +975,11 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				appendAssistantMessageDiagnostic(output, diagnostic);
 			}
 
-			stream.push({ type: "done", reason: output.stopReason, message: output });
+			stream.push({
+				type: "done",
+				reason: output.stopReason,
+				message: fallback.length > 0 ? { ...output, fallback } : output,
+			});
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) {
@@ -965,7 +999,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			output.recovery ??= norm.recovery;
 			output.errorMessage = formatProviderError(norm, "Anthropic API error");
 			// Partials share output; attach record-only details only to the separate terminal failure object.
-			const failure = { ...output };
+			const failure = { ...output, ...(fallback.length > 0 ? { fallback } : {}) };
 			if (terminalStopReason === "refusal") {
 				await recordAssistantMessageStopDetails(
 					failure,

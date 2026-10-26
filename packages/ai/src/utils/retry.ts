@@ -41,6 +41,23 @@ export function isRetryableCodexStreamDisconnect(message: AssistantMessage): boo
 	);
 }
 
+/**
+ * A parsed Anthropic fallback marker after any content block began (smarty-dev#2890). The owned class is
+ * assigned only by that adapter branch, never inferred from error text or the untrusted fallback record.
+ * The session must discard this attempt, request the same model, allow at most one retry, and ensure no
+ * tool from the failed response has started. Observer errors, limits and aborts remain terminal.
+ */
+export function isRetryableAnthropicMidOutputFallback(message: AssistantMessage): boolean {
+	if (message.api !== "anthropic-messages" || message.stopReason !== "error") return false;
+	if (
+		message.diagnostics?.some(
+			(diagnostic) => diagnostic.type === "provider_stream_observer_error" || diagnostic.type === "provider_limit",
+		)
+	)
+		return false;
+	return message.recovery?.recovery === "anthropic_mid_output_fallback" && message.recovery.retryable === true;
+}
+
 /** Empty reasoning signatures are metadata, not output. Even a partial tool call is output. */
 export function hasAssistantOutput(message: AssistantMessage): boolean {
 	return (
@@ -309,6 +326,8 @@ export function throttledLimitWait(message: AssistantMessage): { delayMs: number
  */
 export function isRetryableAssistantError(message: AssistantMessage, observed?: AssistantStreamObservation): boolean {
 	if (message.stopReason !== "error" || !message.errorMessage) return false;
+	// Marker recovery requires the dedicated one-shot policy even for an empty thinking/text start block.
+	if (message.recovery?.recovery === "anthropic_mid_output_fallback") return false;
 	// Output is never replayed, except reasoning-only output on a premature close (smarty-dev#6730).
 	const output = hasAssistantOutput(message) || observed?.answer === true || observed?.reasoning === true;
 	if (output && !isReasoningOnlyPrematureStream(message, observed)) return false;
