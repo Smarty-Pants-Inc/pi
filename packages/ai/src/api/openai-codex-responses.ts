@@ -28,7 +28,13 @@ import {
 	createAssistantMessageDiagnostic,
 	formatThrownValue,
 } from "../utils/diagnostics.ts";
-import { formatProviderError, normalizeProviderError, ProviderDataError, providerLabel } from "../utils/error-body.ts";
+import {
+	formatProviderError,
+	normalizeProviderError,
+	ProviderDataError,
+	providerErrorStatus,
+	providerLabel,
+} from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
@@ -716,8 +722,8 @@ type CodexApiErrorKind = "connection_limit" | "previous_response_not_found";
 class CodexApiError extends ProviderDataError {
 	readonly kind?: CodexApiErrorKind;
 
-	constructor(privateText: string, code?: unknown) {
-		super(privateText, undefined, "CodexApiError");
+	constructor(privateText: string, code?: unknown, status?: number, errorType?: unknown) {
+		super(privateText, status, "CodexApiError", [code, errorType]);
 		if (code === WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE) this.kind = "connection_limit";
 		else if (code === PREVIOUS_RESPONSE_NOT_FOUND_CODE) this.kind = "previous_response_not_found";
 	}
@@ -754,7 +760,12 @@ function isPreviousResponseNotFoundError(error: unknown): boolean {
 	return error instanceof CodexApiError && error.kind === "previous_response_not_found";
 }
 
-function extractCodexEventError(event: Record<string, unknown>): { code?: string; message?: string } {
+function extractCodexEventError(event: Record<string, unknown>): {
+	code?: string;
+	message?: string;
+	type?: string;
+	status?: number;
+} {
 	const nested = event.error && typeof event.error === "object" ? (event.error as Record<string, unknown>) : undefined;
 	return {
 		code: typeof event.code === "string" ? event.code : typeof nested?.code === "string" ? nested.code : undefined,
@@ -764,6 +775,8 @@ function extractCodexEventError(event: Record<string, unknown>): { code?: string
 				: typeof nested?.message === "string"
 					? nested.message
 					: undefined,
+		type: typeof nested?.type === "string" ? nested.type : undefined,
+		status: providerErrorStatus(event) ?? providerErrorStatus(nested),
 	};
 }
 
@@ -807,8 +820,13 @@ async function* mapCodexEvents(
 		if (!type) continue;
 
 		if (type === "error") {
-			const { code, message } = extractCodexEventError(event);
-			throw new CodexApiError(`${code ?? ""}\n${message || JSON.stringify(event)}`, code);
+			const { code, message, type: errorType, status } = extractCodexEventError(event);
+			throw new CodexApiError(
+				`${code ?? ""}\n${errorType ?? ""}\n${message || JSON.stringify(event)}`,
+				code,
+				status,
+				errorType,
+			);
 		}
 
 		if (type === "response.failed") {
@@ -820,9 +838,16 @@ async function* mapCodexEvents(
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 			});
 			output.rawStopReason = response?.status;
-			const code = response?.error?.code;
-			const message = response?.error?.message;
-			throw new CodexApiError(`${code ?? ""}\n${message || "Codex response failed"}`, code);
+			const error = response?.error;
+			const code = error?.code;
+			const message = error?.message;
+			const errorType = (error as { type?: unknown } | null | undefined)?.type;
+			throw new CodexApiError(
+				`${code ?? ""}\n${typeof errorType === "string" ? errorType : ""}\n${message || "Codex response failed"}`,
+				code,
+				providerErrorStatus(event) ?? providerErrorStatus(error),
+				errorType,
+			);
 		}
 
 		if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {

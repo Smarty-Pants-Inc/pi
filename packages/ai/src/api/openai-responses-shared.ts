@@ -32,7 +32,7 @@ import type {
 	Usage,
 } from "../types.ts";
 import { closedRawStopReason } from "../utils/diagnostics.ts";
-import { ProviderDataError } from "../utils/error-body.ts";
+import { ProviderDataError, providerErrorStatus } from "../utils/error-body.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
@@ -769,20 +769,32 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			finalizeResponse(event.response);
 		} else if (event.type === "error") {
-			// A provider error by origin: the code and message only classify (smarty-dev#5822, pi#202 round 3).
-			throw new ProviderDataError(`${event.code ?? ""}\n${event.message ?? ""}`);
+			// Provider text stays private; only a validated status and the exact code classify beside it.
+			throw new ProviderDataError(
+				`${event.code ?? ""}\n${event.message ?? ""}`,
+				providerErrorStatus(event),
+				undefined,
+				[event.code],
+			);
 		} else if (event.type === "response.failed") {
 			sawTerminalResponseEvent = true;
 			finalizeResponsesUsage(event.response, output, model, options);
 			output.rawStopReason = event.response?.status;
 			const error = event.response?.error;
+			const errorType = (error as { type?: unknown } | null | undefined)?.type;
 			const details = event.response?.incomplete_details;
 			const msg = error
 				? `${error.code || "unknown"}: ${error.message || "no message"}`
 				: details?.reason
 					? `incomplete: ${details.reason}`
 					: "Unknown error (no error details in response)";
-			throw new ProviderDataError(msg);
+			// Keep a provider error type private too: final limit refusals need not carry a diagnostic.
+			throw new ProviderDataError(
+				`${msg}\n${typeof errorType === "string" ? errorType : ""}`,
+				providerErrorStatus(event) ?? providerErrorStatus(error),
+				undefined,
+				[error?.code, errorType],
+			);
 		}
 	}
 	if (!sawTerminalResponseEvent) {

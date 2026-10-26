@@ -324,6 +324,10 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 		}
 		if (fallback.length > 0) projected.fallback = fallback;
 	}
+	// Replay metadata is a closed, terminal-only record, never provider content or a recovery input.
+	if (phase !== "partial" && message.retry?.count === 1 && message.retry.reason === "midstream_overload") {
+		projected.retry = { count: 1, reason: "midstream_overload" };
+	}
 	if (message.thinkingLevel !== undefined) projected.thinkingLevel = message.thinkingLevel;
 	const diagnostics = projectAssistantMessageDiagnostics(message.diagnostics);
 	if (diagnostics !== undefined) projected.diagnostics = diagnostics;
