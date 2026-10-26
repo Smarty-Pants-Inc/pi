@@ -584,12 +584,32 @@ export interface UserMessage {
 export type AssistantErrorHint = "bedrock_data_retention" | "chatgpt_usage";
 
 /** Closed recovery classes of a failed response. */
-export type AssistantRecoveryClass = "retryable" | "premature_stream" | "context_length_exceeded";
+export type AssistantRecoveryClass =
+	| "retryable"
+	| "premature_stream"
+	| "context_length_exceeded"
+	| "anthropic_mid_output_fallback";
 
 /** Pi-owned recovery decision: a closed class and whether an outer retry may replay the request. */
 export interface AssistantRecovery {
 	recovery?: AssistantRecoveryClass;
 	retryable: boolean;
+}
+
+/** One untrusted, record-only Anthropic fallback marker. Never display or send its raw fields to a provider. */
+export interface AssistantMessageFallback {
+	position: "start" | "mid-output";
+	/** The provider's content-block index, not an index into Pi's content array. */
+	blockIndex: number;
+	blockState: "retained" | "discarded";
+	/** JSON of a START block with content fields removed and known live credentials masked, at most 4096 UTF-8 bytes.
+	 * Injected-client, SDK-managed federation and over-cap blocks are discarded entirely, never shortened to a prefix.
+	 * This is not content, a recovery input or replay data. MID blocks are never serialized.
+	 */
+	rawBlock?: string;
+	/** Discarded START blocks only: byte length and SHA-256 after masking known credentials and removing content. */
+	blockBytes?: number;
+	blockSha256?: string;
 }
 
 export interface AssistantMessage {
@@ -606,6 +626,8 @@ export interface AssistantMessage {
 	/** Pi thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. */
 	thinkingLevel?: ModelThinkingLevel;
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
+	/** Record-only fallback markers, including start markers; published only on the terminal message. */
+	fallback?: AssistantMessageFallback[];
 	usage: Usage;
 	stopReason: StopReason;
 	deferred?: DeferredHandle;

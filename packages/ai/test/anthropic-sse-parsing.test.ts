@@ -309,7 +309,8 @@ describe("Anthropic raw SSE parsing", () => {
 		).result();
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("unsupported mid-output model fallback");
+		expect(result.errorMessage).toBe("Anthropic performed a mid-output model fallback");
+		expect(result.recovery).toEqual({ recovery: "anthropic_mid_output_fallback", retryable: true });
 	});
 
 	it("forces streaming after an onPayload replacement", async () => {
