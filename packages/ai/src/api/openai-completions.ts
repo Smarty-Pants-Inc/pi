@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { _iterSSEMessages, Stream } from "openai/core/streaming";
 import type {
 	ChatCompletionAssistantMessageParam,
 	ChatCompletionChunk,
@@ -49,6 +50,8 @@ import {
 	formatProviderError,
 	normalizeProviderError,
 	PROVIDER_LIMIT_DIAGNOSTIC,
+	ProviderDataError,
+	providerErrorStatus,
 	smartyLimitMessage,
 	smartyThrottleRetryAfterSeconds,
 } from "../utils/error-body.ts";
@@ -390,6 +393,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
+				__streamClass: CompletionsStream,
 			};
 			const { data: openaiStream, response } = await retryProviderRequest(
 				() => client.chat.completions.create(params, requestOptions).withResponse(),
@@ -789,6 +793,61 @@ export const streamSimple: StreamFunction<"openai-completions", SimpleStreamOpti
 		thinkingBudgets: options?.thinkingBudgets,
 	} satisfies OpenAICompletionsOptions);
 };
+
+// Keep the SDK decoder and Stream lifecycle, but retain envelope status before the SDK would unwrap
+// data.error (smarty-dev#16938). Malformed frames never become local errors or classification text.
+class CompletionsStream<Chunk> extends Stream<Chunk> {
+	static override fromSSEResponse<Item>(
+		response: Response,
+		controller: AbortController,
+		client?: OpenAI,
+		synthesizeEventData?: boolean,
+	): Stream<Item> {
+		let consumed = false;
+		async function* iterator(): AsyncGenerator<Item> {
+			if (consumed) {
+				throw new OpenAI.OpenAIError("Cannot iterate over a consumed stream, use `.tee()` to split the stream.");
+			}
+			consumed = true;
+			let done = false;
+			try {
+				for await (const sse of _iterSSEMessages(response, controller)) {
+					if (done) continue;
+					if (sse.data.startsWith("[DONE]")) {
+						done = true;
+						continue;
+					}
+					let data: unknown;
+					try {
+						data = JSON.parse(sse.data);
+					} catch {
+						throw new ProviderDataError("");
+					}
+					const isThreadEvent = sse.event?.startsWith("thread.") ?? false;
+					if (!isThreadEvent && typeof data === "object" && data !== null && "error" in data && data.error) {
+						throw new OpenAI.APIError(providerErrorStatus(data), data.error, undefined, response.headers);
+					}
+					yield (synthesizeEventData || isThreadEvent ? { event: sse.event, data } : data) as Item;
+				}
+				done = true;
+			} catch (error) {
+				// Match the SDK's fetch/Expo abort handling without publishing provider data.
+				if (
+					typeof error === "object" &&
+					error !== null &&
+					(("name" in error && error.name === "AbortError") ||
+						("message" in error && String(error.message).includes("FetchRequestCanceledException")))
+				) {
+					return;
+				}
+				throw error;
+			} finally {
+				if (!done) controller.abort();
+			}
+		}
+		return new Stream<Item>(iterator, controller, client);
+	}
+}
 
 function createClient(
 	model: Model<"openai-completions">,

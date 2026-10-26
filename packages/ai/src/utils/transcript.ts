@@ -29,7 +29,15 @@ export function createInitialSystemMessage(
  */
 export function normalizeContext(context: Context): TranscriptContext {
 	const initialMessage = createInitialSystemMessage(context.systemPrompt, context.tools);
-	const messages = initialMessage ? [initialMessage, ...context.messages] : context.messages;
+	// Replay bookkeeping belongs to the raw trace, not even to a provider that accepts Pi messages verbatim.
+	const projected = context.messages.some((message) => message.role === "assistant" && message.retry !== undefined)
+		? context.messages.map((message) => {
+				if (message.role !== "assistant" || message.retry === undefined) return message;
+				const { retry: _retry, ...rest } = message;
+				return rest;
+			})
+		: context.messages;
+	const messages = initialMessage ? [initialMessage, ...projected] : projected;
 	return { messages } as TranscriptContext;
 }
 

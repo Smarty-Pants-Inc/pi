@@ -51,9 +51,14 @@ export function normalizeProviderError(
 	privateText?: string,
 	secrets: readonly string[] = [],
 ): NormalizedProviderError {
-	const status = error instanceof Error ? extractStatus(error as SdkErrorShape) : undefined;
+	// OpenAI's stream errors keep the parsed SSE error body but have no outer HTTP status.
+	// A genuine SDK response status always takes precedence over that body's dedicated status fields.
+	const status =
+		error instanceof Error
+			? (providerErrorStatus(error) ?? providerErrorStatus((error as SdkErrorShape).error))
+			: undefined;
 	const text = privateText ? `${providerErrorText(error)}\n${privateText}` : providerErrorText(error);
-	const recovery = classifyProviderFailure({ text, status, provider });
+	const recovery = classifyProviderFailure({ text, status, provider, codes: providerErrorCodes(error) });
 	if (status !== undefined) return { status, recovery };
 	// ponytail: label-based masking stays on local text until the universal owned rendering (next slice).
 	return isLocalError(error)
@@ -63,6 +68,8 @@ export function normalizeProviderError(
 
 /** Private provider text of errors adapters build from provider data; never on the error object itself. */
 const providerDataTexts = new WeakMap<object, string>();
+/** Private exact error code/type values of those errors, kept apart from the text for classification only. */
+const providerDataCodes = new WeakMap<object, readonly string[]>();
 
 /**
  * An error an adapter builds from provider data (a stream error event, a failed response, an unparsable frame).
@@ -73,12 +80,13 @@ const providerDataTexts = new WeakMap<object, string>();
 export class ProviderDataError extends Error {
 	readonly status?: number;
 
-	constructor(privateText: string, status?: number, name = "ProviderDataError") {
+	constructor(privateText: string, status?: number, name = "ProviderDataError", codes: readonly unknown[] = []) {
 		super("Provider request failed");
 		this.name = name;
 		const valid = validHttpStatus(status);
 		if (valid !== undefined) this.status = valid;
 		providerDataTexts.set(this, privateText);
+		providerDataCodes.set(this, stringValues(codes));
 	}
 }
 
@@ -120,16 +128,40 @@ export function providerErrorText(error: unknown): string {
 }
 
 /**
- * Probe the HTTP status, first integer 100-599 wins, in SDK-field order:
+ * Exact provider error code/type values, PRIVATE and for classification only: an adapter-built error's recorded
+ * values, else the SDK error's `code`/`type` and its parsed body's `code`/`type` (`openai` SDK `error.error`).
+ * Only strings count; nothing is parsed out of free text.
+ */
+function providerErrorCodes(error: unknown): string[] {
+	if (!(error instanceof Error)) return [];
+	const dataCodes = providerDataCodes.get(error);
+	if (dataCodes !== undefined) return [...dataCodes];
+	const fields = error as SdkErrorShape & { code?: unknown; type?: unknown };
+	const body =
+		typeof fields.error === "object" && fields.error !== null
+			? (fields.error as { code?: unknown; type?: unknown })
+			: undefined;
+	return stringValues([fields.code, fields.type, body?.code, body?.type]);
+}
+
+function stringValues(values: readonly unknown[]): string[] {
+	return values.filter((value): value is string => typeof value === "string" && value !== "");
+}
+
+/**
+ * Probe dedicated HTTP status fields on an SDK error or parsed provider error, first integer 100-599 wins:
  * `statusCode` (Mistral) → `status` (`openai`, `@google/genai`) →
  * `$metadata.httpStatusCode` (Bedrock) → `$response.statusCode` (Bedrock).
+ * Never infer a status from provider text, error codes or other numeric fields.
  */
-function extractStatus(error: SdkErrorShape): number | undefined {
+export function providerErrorStatus(error: unknown): number | undefined {
+	if (typeof error !== "object" || error === null) return undefined;
+	const fields = error as SdkErrorShape;
 	return (
-		validHttpStatus(error.statusCode) ??
-		validHttpStatus(error.status) ??
-		validHttpStatus(error.$metadata?.httpStatusCode) ??
-		validHttpStatus(error.$response?.statusCode)
+		validHttpStatus(fields.statusCode) ??
+		validHttpStatus(fields.status) ??
+		validHttpStatus(fields.$metadata?.httpStatusCode) ??
+		validHttpStatus(fields.$response?.statusCode)
 	);
 }
 

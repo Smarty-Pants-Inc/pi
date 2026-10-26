@@ -594,6 +594,8 @@ export type AssistantRecoveryClass =
 export interface AssistantRecovery {
 	recovery?: AssistantRecoveryClass;
 	retryable: boolean;
+	/** Original provider-overload classification for an API-scoped, one-shot mid-output replay only. */
+	midstream?: "overload";
 }
 
 /** One untrusted, record-only Anthropic fallback marker. Never display or send its raw fields to a provider. */
@@ -638,6 +640,8 @@ export interface AssistantMessage {
 	 * text is suppressed (smarty-dev#5822). Retry, premature-stream and context-overflow checks read it first.
 	 */
 	recovery?: AssistantRecovery;
+	/** Record-only replay count and closed reason. Persisted, never included in provider requests. */
+	retry?: { count: number; reason: "midstream_overload" };
 	/** Pi-owned remedy for a failure Pi recognized before suppressing provider text (smarty-dev#5822 C4). */
 	errorHint?: AssistantErrorHint;
 	rawStopReason?: string;
