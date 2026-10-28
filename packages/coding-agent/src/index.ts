@@ -1,7 +1,6 @@
 // Core session management
 
 export { type Args, parseArgs } from "./cli/args.ts";
-
 // Config paths
 export {
 	CONFIG_DIR_NAME,
@@ -326,6 +325,23 @@ export {
 	sessionEntryToContextMessages,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.ts";
+export {
+	type AcceptedRecoveryInput,
+	type InputOutcomeRequest,
+	type InputOutcomeResult,
+	type NativeTerminalWitness,
+	nativeEntryDeliveryId,
+	PI_PROCESS_INCARNATION_ID,
+	type RecoveryCarrier,
+	type RecoveryOccurrence,
+	type RecoveryPreOpenBinding,
+	type SessionRecoveryBinding,
+	type SessionRecoveryContext,
+	SessionRecoveryError,
+	type SessionRecoveryOptions,
+	type SessionRecoveryPhase,
+} from "./core/session-recovery-control.ts";
+export type { NativeRecoveryAppend, NativeRecoveryScan } from "./core/session-recovery-persistence.ts";
 export {
 	type CacheWarmingMode,
 	type CompactionModelOverride,

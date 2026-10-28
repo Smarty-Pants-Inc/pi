@@ -13,21 +13,27 @@ import {
 	type UserMessage,
 	uuidv7,
 } from "@earendil-works/pi-ai";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import {
 	appendFileSync,
 	closeSync,
+	constants,
 	createReadStream,
 	existsSync,
+	fstatSync,
+	fsyncSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
+	readFileSync,
 	readSync,
 	realpathSync,
 	renameSync,
 	type Stats,
 	statSync,
 	writeFileSync,
+	writeSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
@@ -61,7 +67,15 @@ import {
 	toColdEntry,
 	toHotEntry,
 } from "./session-lazy-entries.ts";
-
+import type { RecoveryPreOpenBinding } from "./session-recovery-control.ts";
+import {
+	assertSessionPersistenceReleased,
+	inspectNativeRecoveryBytes,
+	type NativeFlushReceipt,
+	type NativeRecoveryAppend,
+	type NativeRecoveryScan,
+	nativeRecoveryAppend,
+} from "./session-recovery-persistence.ts";
 import { bindSessionTurnAppender } from "./session-turn-appender.ts";
 import type { TurnProvenance } from "./turn-provenance.ts";
 import { freezeDetached, receiptRecord, sealEntryProvenance, type TurnReceipt } from "./turn-receipts.ts";
@@ -70,6 +84,15 @@ import type { UserMessageMetadata, UserMessageMetadataSource } from "./user-mess
 
 /** Entries at the end of the file that stay resident besides the current context (smarty-dev#2177). */
 const RECENT_RESIDENT_ENTRIES = 100;
+
+type RecoveryPersistenceState = {
+	sessionId: string;
+	file: string;
+	identity?: { dev: number; ino: number };
+	appends: NativeRecoveryAppend[];
+	needsRecovery: boolean;
+	failure?: unknown;
+};
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -1093,7 +1116,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
  * Parse a session file. With `cold`, entries keep only small fields in memory and read large
  * fields back from the file by byte offset (see session-lazy-entries.ts).
  */
-function readEntriesFromFile(filePath: string, cold: boolean): FileEntry[] {
+function readEntriesFromFile(filePath: string, cold: boolean, repairFinalNewline = true): FileEntry[] {
 	const resolvedFilePath = normalizePath(filePath);
 	if (!existsSync(resolvedFilePath)) return [];
 
@@ -1121,7 +1144,7 @@ function readEntriesFromFile(filePath: string, cold: boolean): FileEntry[] {
 		return [];
 	}
 
-	if (missingFinalNewline) appendFileSync(resolvedFilePath, "\n");
+	if (missingFinalNewline && repairFinalNewline) appendFileSync(resolvedFilePath, "\n");
 	return entries;
 }
 
@@ -1469,6 +1492,10 @@ export class SessionManager {
 	#ownedTerminalTail: Promise<void> = Promise.resolve();
 	#ownedTerminalPending = 0;
 	#terminalIndexFailure?: { error: unknown; entry: SessionEntry; bytes: Buffer; nativeWriteAccepted: true };
+	#recoveryPersistence?: RecoveryPersistenceState;
+	#recoveryOpenOrigin: "new" | "ordinary-open" | "recovery-open" | "owned-open" = "new";
+	#recoveryPreparedNew = false;
+	#recoveryExclusion?: () => void;
 	private constructor(
 		cwd: string,
 		sessionDir: string,
@@ -1517,6 +1544,7 @@ export class SessionManager {
 				this.#appendReceivedCustomMessage(customType, content, display, details, receipt),
 		});
 		if (ownedJournal) {
+			this.#recoveryOpenOrigin = "owned-open";
 			ownedTerminalPersistence.set(this, () => this.#persistOwnedTerminal());
 			ownedTerminalAppenders.set(this, {
 				appendMessage: (message, receipt, metadata, metadataSource) =>
@@ -1572,6 +1600,8 @@ export class SessionManager {
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+		this.#recoveryOpenOrigin = "ordinary-open";
+		if (this.#recoveryPersistence) throw new Error("RECOVERY_SESSION_REPLACEMENT_REQUIRED");
 		if (this.#ownedJournal) throw new Error("OWNER_REPLACEMENT_REQUIRED");
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
@@ -1602,6 +1632,7 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
+		if (this.#recoveryPersistence) throw new Error("RECOVERY_SESSION_REPLACEMENT_REQUIRED");
 		if (this.#ownedJournal) throw new Error("OWNER_REPLACEMENT_REQUIRED");
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
@@ -1680,6 +1711,7 @@ export class SessionManager {
 	}
 
 	private _rewriteFile(): void {
+		if (this.#recoveryPersistence) throw new Error("RECOVERY_APPEND_ONLY_REQUIRED");
 		if (this.#ownedJournal) {
 			this.persistCurrent();
 			return;
@@ -1703,7 +1735,15 @@ export class SessionManager {
 	 * Write every entry to `fd` (a new file that becomes `file`) and record each entry's new byte
 	 * range. Cold entries are rebound to the new file one line at a time.
 	 */
-	#writeEntries(fd: number, file: string): void {
+	#writeEntries(
+		fd: number,
+		file: string,
+	): Array<{ entryId: string; location: { file: string; offset: number; length: number }; bytes: Buffer }> {
+		const captured: Array<{
+			entryId: string;
+			location: { file: string; offset: number; length: number };
+			bytes: Buffer;
+		}> = [];
 		let offset = 0;
 		for (let i = 0; i < this.fileEntries.length; i++) {
 			const entry = this.fileEntries[i];
@@ -1711,6 +1751,8 @@ export class SessionManager {
 			const length = Buffer.byteLength(line);
 			writeFileSync(fd, `${line}\n`);
 			const location = { file, offset, length };
+			if (this.#recoveryPersistence && entry.type !== "session")
+				captured.push({ entryId: entry.id, location, bytes: Buffer.from(`${line}\n`) });
 			offset += length + 1;
 			if (!isColdEntry(entry)) {
 				setEntryLocation(entry, location);
@@ -1724,11 +1766,35 @@ export class SessionManager {
 		detachedSelectionInvalidators.get(this)?.();
 		this.#revisionKey = undefined;
 		this.#branchProjection = undefined;
+		return captured;
 	}
 
 	/** Append one entry line and record its byte range. */
 	#appendLine(file: string, entry: SessionEntry): void {
 		const line = JSON.stringify(entry);
+		if (this.#recoveryPersistence) {
+			const bytes = Buffer.from(`${line}\n`);
+			const fd = this.#openRecoveryFile();
+			try {
+				const offset = fstatSync(fd).size;
+				if (offset) {
+					const last = Buffer.alloc(1);
+					if (readSync(fd, last, 0, 1, offset - 1) !== 1 || last[0] !== 10)
+						throw new Error("RECOVERY_NATIVE_TAIL_UNCERTAIN");
+				}
+				this.#writeRecoveryBytes(fd, bytes, offset);
+				const receipt = this.#flushRecoveryFile(fd);
+				const location = { file, offset, length: bytes.length - 1 };
+				setEntryLocation(entry, location);
+				this.#captureRecoveryAppend(entry.id, location, bytes, receipt);
+			} catch (error) {
+				this.#recoveryPersistence.failure = error;
+				throw error;
+			} finally {
+				closeSync(fd);
+			}
+			return;
+		}
 		// The file can be deleted while Pi runs; appendFileSync then recreates it.
 		const offset = existsSync(file) ? statSync(file).size : 0;
 		appendFileSync(file, `${line}\n`);
@@ -1767,6 +1833,251 @@ export class SessionManager {
 			this.#revisionKey = undefined;
 			this.#branchProjection = undefined;
 		}
+	}
+
+	/** Native construction provenance; enabling persistence cannot certify an ordinary retained open. */
+	getRecoveryPersistenceState(): Readonly<{
+		enabled: boolean;
+		preparedOpen: boolean;
+		exclusionValidated: boolean;
+		needsRecovery: boolean;
+	}> {
+		return Object.freeze({
+			enabled: this.#recoveryPersistence !== undefined,
+			preparedOpen:
+				this.#recoveryOpenOrigin !== "ordinary-open" &&
+				(this.#recoveryOpenOrigin !== "new" || !this.flushed || this.#recoveryPreparedNew),
+			exclusionValidated:
+				this.#recoveryExclusion !== undefined ||
+				this.#recoveryOpenOrigin === "owned-open" ||
+				(this.#recoveryOpenOrigin === "new" && (!this.flushed || this.#recoveryPreparedNew)),
+			needsRecovery: this.#recoveryPersistence?.needsRecovery ?? this.flushed,
+		});
+	}
+
+	/** A retained manager loaded before exclusion cannot be certified by a later extension observer. */
+	assertRecoveryExclusion(): void {
+		const state = this.getRecoveryPersistenceState();
+		if (!state.preparedOpen) throw new Error("RECOVERY_PREPARED_OPEN_REQUIRED");
+		if (!state.exclusionValidated) throw new Error("RECOVERY_PREOPEN_EXCLUSION_REQUIRED");
+		this.#ownedJournal?.assertActive();
+		this.#recoveryExclusion?.();
+	}
+
+	/** Opt in before REQUIRED startup. No callbacks, promises, B5 IDs or alternate writer. */
+	enableRecoveryPersistence(): void {
+		if (this.#recoveryPersistence) {
+			if (this.#recoveryPersistence.failure)
+				throw new Error("RECOVERY_PERSISTENCE_FAILED", { cause: this.#recoveryPersistence.failure });
+			return;
+		}
+		if (!this.persist || !this.sessionFile) throw new Error("RECOVERY_BACKING_FILE_REQUIRED");
+		this.#recoveryPreparedNew ||= this.#recoveryOpenOrigin === "new" && !this.flushed;
+		const state: RecoveryPersistenceState = {
+			sessionId: this.#ownedJournal?.sessionId ?? this.sessionId,
+			file: this.#ownedJournal?.file ?? this.sessionFile,
+			appends: [],
+			needsRecovery: this.flushed,
+		};
+		this.#recoveryPersistence = state;
+		if (this.#ownedJournal) {
+			this.#ownedJournal.assertWritable();
+			state.needsRecovery = this.#ownedBootstrap === undefined;
+			return;
+		}
+		let fd: number | undefined;
+		try {
+			// A previously flushed file MUST exist. Never recreate a missing required file.
+			fd = openSync(state.file, this.flushed ? constants.O_RDWR | constants.O_NOFOLLOW : "wx+");
+			const stat = fstatSync(fd);
+			if (!stat.isFile() || stat.nlink !== 1) throw new Error("RECOVERY_BACKING_FILE_INVALID");
+			this.#recoveryPersistence.identity = { dev: stat.dev, ino: stat.ino };
+			if (!this.flushed) {
+				const captured = this.#writeEntries(fd, state.file);
+				const receipt = this.#flushRecoveryFile(fd);
+				for (const entry of captured)
+					this.#captureRecoveryAppend(entry.entryId, entry.location, entry.bytes, receipt);
+				this.flushed = true;
+			}
+		} catch (error) {
+			this.#recoveryPersistence.failure = error;
+			throw error;
+		} finally {
+			if (fd !== undefined) closeSync(fd);
+		}
+	}
+
+	/** Must be called AFTER the enclosing AgentSession persistenceReleased boundary.
+	 * No early promise callback is exposed. Owned terminal scopes also enforce this locally. */
+	drainRecoveryAppends(): NativeRecoveryAppend[] {
+		this.#assertRecoveryReleased();
+		const state = this.#recoveryPersistence;
+		if (!state) throw new Error("RECOVERY_PERSISTENCE_NOT_ENABLED");
+		return state.appends
+			.splice(0)
+			.map((entry) =>
+				nativeRecoveryAppend(entry.sessionId, entry.entryId, entry.location, entry.bytes, entry.flushReceipt),
+			);
+	}
+
+	/** Full native file, including abandoned branches and unframed final candidates.
+	 * Inspection never manufactures a flush receipt or changes an old byte. */
+	inspectRecoveryEntries(): NativeRecoveryScan {
+		this.#assertRecoveryReleased();
+		const state = this.#recoveryPersistence;
+		if (!state) throw new Error("RECOVERY_PERSISTENCE_NOT_ENABLED");
+		if (this.#ownedJournal) return inspectNativeRecoveryBytes(state.sessionId, state.file, this.#ownedJournal.read());
+		const fd = this.#openRecoveryFile();
+		try {
+			return inspectNativeRecoveryBytes(state.sessionId, state.file, readFileSync(fd));
+		} finally {
+			closeSync(fd);
+		}
+	}
+
+	/** Under legitimate writer custody, flush/re-emit complete retained entries.
+	 * Owned restart uses an explicit native prefix flush, never readback as commit proof.
+	 * Torn/unknown ranges stay explicit and never authorize a replacement carrier. */
+	recoverRecoveryAppends(): NativeRecoveryScan {
+		this.#assertRecoveryReleased();
+		const state = this.#recoveryPersistence;
+		if (!state) throw new Error("RECOVERY_PERSISTENCE_NOT_ENABLED");
+		const fd = this.#ownedJournal ? undefined : this.#openRecoveryFile();
+		try {
+			if (state.failure) throw new Error("RECOVERY_PERSISTENCE_FAILED", { cause: state.failure });
+			if (
+				state.sessionId !== this.sessionId ||
+				state.file !== this.sessionFile ||
+				(this.#ownedJournal &&
+					(state.sessionId !== this.#ownedJournal.sessionId || state.file !== this.#ownedJournal.file))
+			)
+				throw new Error("RECOVERY_NATIVE_IDENTITY_CHANGED");
+			// Until a full validated scan AND flush succeeds, absence is not authoritative.
+			state.needsRecovery = true;
+			// Inspect and flush through the SAME validated backing descriptor/native owner.
+			const raw = this.#ownedJournal ? this.#ownedJournal.read() : readFileSync(fd!);
+			const scan = inspectNativeRecoveryBytes(state.sessionId, state.file, raw);
+			if (scan.issues.some((issue) => issue.reason !== "missing-final-lf")) return scan;
+			let receipt: NativeFlushReceipt;
+			if (this.#ownedJournal) {
+				const committed = scan.issues.length ? undefined : this.#ownedJournal.flushRecoveryPrefix();
+				if (!committed) {
+					scan.issues.push({
+						location: { file: scan.file, offset: 0, length: scan.bytes },
+						bytes: new Uint8Array(),
+						reason: "commit-unproven",
+					});
+					// No proof means no descriptor and no permission to append a replacement.
+					state.needsRecovery = true;
+					return scan;
+				}
+				if (committed.bytes !== raw.length || committed.sha256 !== createHash("sha256").update(raw).digest("hex"))
+					throw new Error("RECOVERY_NATIVE_PREFIX_CHANGED");
+				receipt = { kind: "owned-journal-commit", file: scan.file, ...committed };
+			} else {
+				if (fstatSync(fd!).size !== raw.length) throw new Error("RECOVERY_NATIVE_FILE_CHANGED");
+				if (scan.issues.length) this.#writeRecoveryBytes(fd!, Buffer.from("\n"), raw.length);
+				receipt = this.#flushRecoveryFile(fd!);
+			}
+			for (const entry of scan.entries) {
+				const bytes = entry.terminated ? entry.bytes : Buffer.concat([entry.bytes, Buffer.from("\n")]);
+				this.#captureRecoveryAppend(entry.entryId, entry.location, bytes, receipt);
+			}
+			state.needsRecovery = false;
+			return scan;
+		} catch (error) {
+			state.failure = error;
+			throw error;
+		} finally {
+			if (fd !== undefined) closeSync(fd);
+		}
+	}
+
+	#assertRecoveryReleased(): void {
+		assertSessionPersistenceReleased(this);
+		if (this.#ownedTerminalPending || (this.#ownedJournal && isOwnedTerminalWrite(this.#ownedJournal)))
+			throw new Error("RECOVERY_PERSISTENCE_NOT_RELEASED");
+	}
+
+	#openRecoveryFile(): number {
+		const state = this.#recoveryPersistence;
+		if (!state?.identity || state.sessionId !== this.sessionId || state.file !== this.sessionFile)
+			throw new Error("RECOVERY_NATIVE_IDENTITY_CHANGED");
+		if (state.failure) throw new Error("RECOVERY_PERSISTENCE_FAILED", { cause: state.failure });
+		const fd = openSync(state.file, constants.O_RDWR | constants.O_NOFOLLOW);
+		try {
+			const actual = fstatSync(fd),
+				named = lstatSync(state.file);
+			if (
+				!actual.isFile() ||
+				actual.nlink !== 1 ||
+				actual.dev !== state.identity.dev ||
+				actual.ino !== state.identity.ino ||
+				named.dev !== actual.dev ||
+				named.ino !== actual.ino
+			)
+				throw new Error("RECOVERY_NATIVE_IDENTITY_CHANGED");
+			return fd;
+		} catch (error) {
+			closeSync(fd);
+			throw error;
+		}
+	}
+
+	#writeRecoveryBytes(fd: number, bytes: Buffer, offset: number): void {
+		let written = 0;
+		while (written < bytes.length) {
+			const count = writeSync(fd, bytes, written, bytes.length - written, offset + written);
+			if (count <= 0) throw new Error("RECOVERY_NATIVE_SHORT_WRITE");
+			written += count;
+		}
+	}
+
+	#flushRecoveryFile(fd: number): NativeFlushReceipt {
+		const state = this.#recoveryPersistence!;
+		fsyncSync(fd);
+		// Also cover newly created session directories, not just the file's directory entry.
+		for (let directory = dirname(state.file); ; directory = dirname(directory)) {
+			const parent = openSync(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+			try {
+				fsyncSync(parent);
+			} finally {
+				closeSync(parent);
+			}
+			if (directory === dirname(directory)) break;
+		}
+		const actual = fstatSync(fd),
+			named = lstatSync(state.file),
+			identity = state.identity;
+		if (
+			!identity ||
+			actual.dev !== identity.dev ||
+			actual.ino !== identity.ino ||
+			actual.dev !== named.dev ||
+			actual.ino !== named.ino
+		)
+			throw new Error("RECOVERY_NATIVE_IDENTITY_CHANGED");
+		return { kind: "file-fsync", file: state.file, bytesThrough: actual.size, namespaceDurable: true };
+	}
+
+	#captureRecoveryAppend(
+		entryId: string,
+		location: { file: string; offset: number; length: number },
+		bytes: Uint8Array,
+		receipt: NativeFlushReceipt,
+	): void {
+		const state = this.#recoveryPersistence!;
+		state.appends.push(nativeRecoveryAppend(state.sessionId, entryId, location, bytes, receipt));
+	}
+
+	#captureOwnedRecoveryAppend(entryId: string, bytes: Buffer, receipt: { bytes: number; sha256: string }): void {
+		const file = this.#ownedJournal!.file;
+		this.#captureRecoveryAppend(
+			entryId,
+			{ file, offset: receipt.bytes - bytes.length, length: bytes.length - 1 },
+			bytes,
+			{ kind: "owned-journal-commit", file, ...receipt },
+		);
 	}
 
 	isPersisted(): boolean {
@@ -1843,6 +2154,9 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		if (this.#recoveryPersistence?.failure)
+			throw new Error("RECOVERY_PERSISTENCE_FAILED", { cause: this.#recoveryPersistence.failure });
+		if (this.#recoveryPersistence?.needsRecovery) throw new Error("RECOVERY_SCAN_REQUIRED");
 		if (this.#ownedTerminalPending) throw new Error("OWNER_TERMINAL_APPEND_BUSY");
 		if (this.#ownedJournal) {
 			this.#ownedJournal.assertWritable();
@@ -1851,7 +2165,10 @@ export class SessionManager {
 			const line = Buffer.from(`${JSON.stringify(published)}\n`);
 			if (this.#ownedBootstrap) this.#persistOwnedBootstrap();
 			// Publish only the admitted suffix before changing the canonical index or acknowledging the entry.
-			this.#ownedJournal.append(line);
+			if (this.#recoveryPersistence) {
+				const receipt = this.#ownedJournal.append(line, true);
+				this.#captureOwnedRecoveryAppend(published.id, line, receipt);
+			} else this.#ownedJournal.append(line);
 			this.#ownedEntryIndex.set(published.id, ownedSessionEntryMetadata(published));
 			this.fileEntries.push(published);
 			this.byId.set(published.id, published);
@@ -1867,7 +2184,12 @@ export class SessionManager {
 		this.leafId = entry.id;
 		this.extendBranchProjection(entry);
 		detachedSelectionAppenders.get(this)?.(entry);
-		this.#persistEntry(entry);
+		try {
+			this.#persistEntry(entry);
+		} catch (error) {
+			if (this.#recoveryPersistence) this.#recoveryPersistence.failure = error;
+			throw error;
+		}
 	}
 
 	#enqueueOwnedTerminal<T>(operation: () => Promise<T>): Promise<T> {
@@ -1960,6 +2282,9 @@ export class SessionManager {
 	}
 
 	async #appendEntryOwnedTerminal(entry: SessionEntry): Promise<void> {
+		if (this.#recoveryPersistence?.failure)
+			throw new Error("RECOVERY_PERSISTENCE_FAILED", { cause: this.#recoveryPersistence.failure });
+		if (this.#recoveryPersistence?.needsRecovery) throw new Error("RECOVERY_SCAN_REQUIRED");
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
 		this.#ownedJournal.assertWritable();
 		const published = validateOwnedSessionEntry(materializeOwnedEntry(entry), this.#ownedEntryIndex);
@@ -1971,7 +2296,12 @@ export class SessionManager {
 			this.#ownedBootstrap = undefined;
 			this.flushed = true;
 		}
-		await this.#ownedJournal.appendTerminalAsync(line);
+		if (this.#recoveryPersistence) {
+			const receipt = await this.#ownedJournal.appendTerminalAsync(line, true);
+			this.#captureOwnedRecoveryAppend(published.id, line, receipt);
+		} else {
+			await this.#ownedJournal.appendTerminalAsync(line);
+		}
 		try {
 			this.#ownedJournal.assertWritable();
 			this.#ownedEntryIndex.set(published.id, ownedSessionEntryMetadata(published));
@@ -2616,6 +2946,22 @@ export class SessionManager {
 		return this.selectBranchedSession(leafId);
 	}
 
+	/** Fork a joined REQUIRED source through the existing branch writer, never ordinary-open its live file. */
+	forkForRecovery(leafId: string): SessionManager {
+		this.assertRecoveryExclusion();
+		if (this.#ownedJournal) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED");
+		const child = new SessionManager(this.cwd, this.sessionDir, undefined, true);
+		child.fileEntries = [this.getHeader()!, ...this.getEntries()];
+		child.sessionFile = this.sessionFile;
+		child._buildIndex();
+		child.selectBranchedSession(leafId);
+		this.assertRecoveryExclusion();
+		// This fresh file was allocated here, not certified after an ordinary retained open.
+		child.#recoveryPreparedNew = true;
+		child.enableRecoveryPersistence();
+		return child;
+	}
+
 	/** Select once through the maintained branch/label algorithm into a detached child. */
 	forkSelected(leafId: string | null, journal: OwnedJournal): SessionManager {
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
@@ -2649,6 +2995,7 @@ export class SessionManager {
 	}
 
 	private selectBranchedSession(leafId: string, selectedHeader?: SessionHeader): string | undefined {
+		if (this.#recoveryPersistence) throw new Error("RECOVERY_SESSION_REPLACEMENT_REQUIRED");
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
@@ -2805,6 +3152,45 @@ export class SessionManager {
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
 		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries);
+	}
+
+	/** Recovery-only open under already acquired writer custody. Unlike ordinary open,
+	 * preserve final framing and refuse legacy migration rather than rewriting evidence. */
+	static openForRecovery(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
+		const file = resolvePath(path);
+		const entries = readEntriesFromFile(file, true, false);
+		const header = entries[0];
+		if (!header || header.type !== "session" || header.version !== CURRENT_SESSION_VERSION)
+			throw new Error("RECOVERY_CURRENT_SESSION_HEADER_REQUIRED");
+		const manager = new SessionManager(
+			cwdOverride ?? header.cwd,
+			sessionDir ?? dirname(file),
+			file,
+			true,
+			undefined,
+			entries,
+		);
+		manager.#recoveryOpenOrigin = "recovery-open";
+		manager.enableRecoveryPersistence();
+		return manager;
+	}
+
+	/** Native owns the read ordering: acquire/validate exclusion, then read current header/history. */
+	static async openForRecoveryAfterExclusion(
+		path: string,
+		binding: RecoveryPreOpenBinding | undefined,
+		sessionDir?: string,
+		cwdOverride?: string,
+	): Promise<SessionManager> {
+		if (typeof binding?.excludeWriter !== "function") throw new Error("RECOVERY_PREOPEN_BINDING_REQUIRED");
+		const file = resolvePath(path);
+		const exclusion = await binding.excludeWriter({ sessionFile: file });
+		if (typeof exclusion?.assertCurrent !== "function") throw new Error("RECOVERY_PREOPEN_EXCLUSION_REQUIRED");
+		exclusion.assertCurrent();
+		const manager = SessionManager.openForRecovery(file, sessionDir, cwdOverride);
+		exclusion.assertCurrent();
+		manager.#recoveryExclusion = () => exclusion.assertCurrent();
+		return manager;
 	}
 
 	/**

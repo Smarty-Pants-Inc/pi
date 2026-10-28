@@ -77,6 +77,7 @@ import type {
 	SessionEntry,
 	SessionManager,
 } from "../session-manager.ts";
+import type { SessionRecoveryBinding, SessionRecoveryContext } from "../session-recovery-control.ts";
 import type { Settings } from "../settings-manager.ts";
 import type { SlashCommandInfo } from "../slash-commands.ts";
 import type { SourceInfo } from "../source-info.ts";
@@ -441,7 +442,9 @@ export interface ExtensionContext {
 	/** @internal Host callback used by the built-in bash tool immediately before execution. */
 	emitBashSpawn?: (event: BashSpawnEvent, signal?: AbortSignal) => Promise<BashSpawnEventResult | undefined>;
 	/** Abort the current agent operation */
-	abort(): void;
+	abort(): void | Promise<void>;
+	/** REQUIRED native startup/occurrence context; absent on ordinary sessions. */
+	readonly sessionRecovery?: SessionRecoveryContext;
 	/** Whether there are queued messages waiting */
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown pi and exit. Available in all contexts. */
@@ -866,8 +869,8 @@ export interface SessionStartEvent {
  */
 export interface SessionReadyEvent {
 	type: "session_ready";
-	/** The replacement that published this session. */
-	reason: "new" | "resume" | "fork";
+	/** REQUIRED also awaits this handshake on cold startup and reload. */
+	reason: "new" | "resume" | "fork" | "startup" | "reload";
 	/** Current `userMessageSessionGeneration` when the event was dispatched. */
 	sessionGeneration: string;
 }
@@ -1760,6 +1763,8 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
+	/** Cheap loader-source-bound registration; inert unless native REQUIRED was selected before open. */
+	registerSessionRecovery(binding: SessionRecoveryBinding): void;
 	/** Behaviors of the Pi that runs this extension (see HOST_CAPABILITIES). */
 	readonly hostCapabilities: HostCapabilities;
 
@@ -2438,7 +2443,8 @@ export interface ExtensionContextActions {
 	getInputState?: () => ExtensionInputState;
 	isProjectTrusted: () => boolean;
 	getSignal: () => AbortSignal | undefined;
-	abort: () => void;
+	abort: () => void | Promise<void>;
+	getSessionRecovery?: () => SessionRecoveryContext | undefined;
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
@@ -2490,6 +2496,7 @@ export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionAction
 
 /** Loaded extension with all registered items. */
 export interface Extension {
+	sessionRecovery?: SessionRecoveryBinding;
 	path: string;
 	resolvedPath: string;
 	hidden?: boolean;

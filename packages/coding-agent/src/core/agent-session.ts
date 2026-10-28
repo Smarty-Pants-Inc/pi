@@ -50,6 +50,7 @@ import {
 	observeAssistantStreamEvent,
 	type RetryPolicy,
 	retryDelayMs,
+	type ToolCall,
 } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
@@ -158,6 +159,7 @@ import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.t
 import { exportSessionToJsonl } from "./session-export.ts";
 import {
 	appendOwnedTerminalCustomMessage,
+	appendOwnedTerminalEntry,
 	appendOwnedTerminalMessage,
 	type BranchSummaryEntry,
 	type CompactionEntry,
@@ -168,6 +170,17 @@ import {
 	SessionManager,
 	type SessionProjection,
 } from "./session-manager.ts";
+import {
+	type AcceptedRecoveryInput,
+	type NativeTerminalWitness,
+	PI_PROCESS_INCARNATION_ID,
+	type RecoveryCarrier,
+	type RecoveryOccurrence,
+	type SessionRecoveryContext,
+	SessionRecoveryControl,
+	type SessionRecoveryOptions,
+} from "./session-recovery-control.ts";
+import { type NativeRecoveryAppend, withSessionPersistenceScope } from "./session-recovery-persistence.ts";
 import { appendReceivedCustomMessage, appendReceivedMessage } from "./session-turn-appender.ts";
 import {
 	applyToolModifiers,
@@ -205,6 +218,7 @@ import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-total
 import { type UserMessageAdmission, UserMessageIngress } from "./user-message-ingress.ts";
 import {
 	bindExtensionMetadataSender,
+	getExtensionExecutionPath,
 	getUserMessageMetadataSource,
 	type SendUserMessageOptions,
 	type SendUserMessageResult,
@@ -368,6 +382,7 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 }
 
 export interface AgentSessionConfig {
+	recovery?: SessionRecoveryOptions;
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
@@ -579,6 +594,17 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly #originalAgent: Agent;
 	readonly sessionManager: SessionManager;
+	readonly recovery: SessionRecoveryControl;
+	private readonly _recoveryScope = new AsyncLocalStorage<{ epoch: number; active: boolean; admitted: boolean }>();
+	private readonly _recoveryEntries = new Map<string, NativeRecoveryAppend>();
+	private _recoveryCarrier?: { resolve(value: RecoveryCarrier): void; reject(error: unknown): void };
+	private _recoveryStartupEpoch = -1;
+	private _recoveryStartup?: { epoch: number; promise: Promise<void> };
+	private readonly _recoveryDeferStartup: boolean;
+	private _recoveryStop?: Promise<void>;
+	private _recoveryRawQueueMutation = false;
+	private _recoveryNativeDispatch = false;
+	private readonly _rawAgentAbort: () => void | Promise<void>;
 	#contextUsageCache: { revision: number; contextWindow: number; usage: ContextUsage } | undefined;
 	readonly settingsManager: SettingsManager;
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
@@ -660,8 +686,10 @@ export class AgentSession {
 	private readonly _userMessageSubmissions = new WeakMap<AgentMessage, UserMessageSubmission>();
 	private readonly _pendingUserMessageSubmissions = new Set<UserMessageSubmission>();
 	/** Session-owned submitUserMessage ledger and generation fence. */
-	private readonly _userMessageIngress = new UserMessageIngress(this._shutdownCancellation.signal, () =>
-		this._userMessageIngressBlocked(),
+	private readonly _userMessageIngress = new UserMessageIngress(
+		this._shutdownCancellation.signal,
+		() => this._userMessageIngressBlocked(),
+		() => (this.recovery?.required ? "admission_refused" : undefined),
 	);
 	/** Undelivered ingress follow-ups and their display slot in _followUpMessages. */
 	private readonly _ingressQueuedMessages = new Map<AgentMessage, { displayIndex: number }>();
@@ -806,6 +834,63 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.#originalAgent = this.agent;
 		this.sessionManager = sessionManager;
+		// REQUIRED replaces agent.abort with durable cancellation; its stop path must bypass that interceptor.
+		// Ordinary sessions keep the original instance's live abort hooks, even if a callback swaps session.agent.
+		this._rawAgentAbort =
+			config.recovery?.required === true
+				? Agent.prototype.abort.bind(this.#originalAgent)
+				: () => this.#originalAgent.abort();
+		this._recoveryDeferStartup = config.recovery?.deferStartup === true;
+		this.recovery = new SessionRecoveryControl(config.recovery, {
+			sessionId: sessionManager.getSessionId(),
+			sessionFile: sessionManager.getSessionFile() ?? "",
+			stop: () => {
+				this._recoveryStop = this._abortOperation();
+				void this._recoveryStop.catch(() => {});
+			},
+			join: async () => {
+				await this._recoveryStop;
+				await this.waitForIdle();
+			},
+		});
+		if (this.recovery.required) {
+			if (!sessionManager.isPersisted() || !sessionManager.getRecoveryPersistenceState().preparedOpen)
+				throw this.recovery.block("RECOVERY_PREPARED_OPEN_REQUIRED");
+			sessionManager.assertRecoveryExclusion();
+			sessionManager.enableRecoveryPersistence();
+			if (
+				sessionManager.getRecoveryPersistenceState().needsRecovery &&
+				sessionManager.recoverRecoveryAppends().issues.length
+			)
+				throw this.recovery.block("RECOVERY_NATIVE_SCAN_INCOMPLETE");
+			for (const method of ["prompt", "continue"] as const) {
+				const original = this.agent[method].bind(this.agent);
+				Object.defineProperty(this.agent, method, {
+					configurable: true,
+					value: (...args: unknown[]) => {
+						if (!this._recoveryNativeDispatch)
+							return Promise.reject(new Error("RECOVERY_CONTROLLED_OCCURRENCE_REQUIRED"));
+						return Reflect.apply(original, this.agent, args);
+					},
+				});
+			}
+			this.agent.assertProviderPermission = (signal) => this._beforeRecoveryProvider(signal);
+			this.agent.projectProviderContext = (messages) => this.recovery.project(messages);
+			Object.defineProperty(this.agent, "abort", {
+				configurable: true,
+				value: () => {
+					const pending = this.abort();
+					void pending.catch((error: unknown) =>
+						this._extensionRunner?.emitError({
+							extensionPath: "<recovery>",
+							event: "abort",
+							error: error instanceof Error ? error.message : String(error),
+						}),
+					);
+					return pending;
+				},
+			});
+		}
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
@@ -856,6 +941,8 @@ export class AgentSession {
 				configurable: true,
 				writable: true,
 				value: (...args: unknown[]) => {
+					if (this.recovery.required && !this._recoveryRawQueueMutation)
+						throw this.recovery.block("RECOVERY_RAW_QUEUE_MUTATION_REFUSED");
 					this._queuedInputRevision++;
 					if (method === "steer" || method === "followUp") {
 						const message = args[0] as AgentMessage;
@@ -910,6 +997,7 @@ export class AgentSession {
 
 		const previousValidateQueuedMessages = this.agent.validateQueuedMessages;
 		this.agent.validateQueuedMessages = (messages, mode) => {
+			if (this.recovery.required && messages.length) throw this.recovery.block("RECOVERY_ROUND_QUEUE_DRAIN_REFUSED");
 			if (this._inputsDisposed) {
 				previousValidateQueuedMessages?.(messages, mode);
 				return;
@@ -945,6 +1033,333 @@ export class AgentSession {
 		this._restoreUnsentInputs();
 		this._restoreMidOutputRetryCount();
 		this.#auditState("session_attached");
+	}
+
+	private _recoveryContext(): SessionRecoveryContext {
+		const epoch = this.recovery.epoch;
+		return Object.freeze({
+			required: this.recovery.required,
+			sessionId: this.sessionId,
+			sessionFile: this.sessionFile ?? "",
+			processIncarnationId: PI_PROCESS_INCARNATION_ID,
+			epoch,
+			deliverAccepted: (input: AcceptedRecoveryInput) => this._startRecoveryOccurrence(epoch, input),
+			resumeAccepted: (input: AcceptedRecoveryInput, entryId: string) =>
+				this._startRecoveryOccurrence(epoch, input, entryId),
+			finalizeAccepted: async (input: AcceptedRecoveryInput, entryId: string) => {
+				this.recovery.assertEpoch(epoch);
+				this._validateRecoveryInputEntry(input, entryId);
+				if (this.recovery.phase === "READY" && this.isIdle) this.recovery.phase = "HELD";
+				this.recovery.select(input, entryId);
+				// No assistant-last provider fallback: only the native post-run decision boundary.
+				this._refreshFinalizedContext();
+				this._lastAssistantMessage = this._findLastAssistantMessage();
+				if (
+					!this._lastAssistantMessage ||
+					this._lastAssistantMessage.stopReason !== "stop" ||
+					this._lastAssistantMessage.content.some((part) => part.type === "toolCall")
+				)
+					throw this.recovery.block("RECOVERY_FINALIZER_NOT_FINAL");
+				if (await this._runBeforeSettleBoundary())
+					throw this.recovery.block("RECOVERY_FINALIZER_CONTINUATION_REQUIRED");
+				await this._finalizeRecoveryInput();
+			},
+			settleFromWitness: async (input: AcceptedRecoveryInput, witnessEntryId: string) => {
+				this.recovery.assertEpoch(epoch);
+				const entry = this.sessionManager.getEntry(witnessEntryId);
+				if (!entry || entry.type !== "custom" || entry.customType !== "pi-recovery-terminal:v1")
+					throw this.recovery.block("RECOVERY_TERMINAL_WITNESS_MISSING");
+				const witness = entry.data as NativeTerminalWitness;
+				this._validateRecoveryInputEntry(input, witness.inputEntryId);
+				if (this.recovery.phase === "READY" && this.isIdle) this.recovery.phase = "HELD";
+				this.recovery.select(input, witness.inputEntryId);
+				if (
+					witness.version !== 1 ||
+					witness.sessionId !== this.sessionId ||
+					witness.originalInputId !== input.originalInputId ||
+					witness.decision !== "settled" ||
+					!witness.runId ||
+					!witness.bootId ||
+					!Array.isArray(witness.finalEntries) ||
+					!witness.finalEntries.length
+				)
+					throw this.recovery.block("RECOVERY_TERMINAL_WITNESS_INVALID");
+				this._releaseRecoveryPersistence();
+				const descriptors = witness.finalEntries.map((reference) => {
+					const descriptor = this._recoveryEntries.get(reference.entryId);
+					if (!descriptor || descriptor.bytesSha256 !== reference.bytesSha256)
+						throw this.recovery.block("RECOVERY_TERMINAL_BYTES_MISSING");
+					return descriptor;
+				});
+				const branch = this.sessionManager.getBranch(witnessEntryId);
+				const inputIndex = branch.findIndex((candidate) => candidate.id === witness.inputEntryId);
+				const finalIds = branch
+					.slice(inputIndex + 1, -1)
+					.filter(
+						(candidate) =>
+							candidate.type === "message" &&
+							(candidate.message.role === "assistant" || candidate.message.role === "toolResult"),
+					)
+					.map((candidate) => candidate.id);
+				if (
+					inputIndex < 0 ||
+					!isDeepStrictEqual(
+						finalIds,
+						witness.finalEntries.map((reference) => reference.entryId),
+					)
+				)
+					throw this.recovery.block("RECOVERY_TERMINAL_WITNESS_INVALID");
+				const validation = await this.recovery.binding!.validateTerminal(input, descriptors);
+				this.recovery.assertEpoch(epoch);
+				if (!validation?.complete) throw this.recovery.block("RECOVERY_TERMINAL_INVENTORY_INCOMPLETE");
+				await this._settleRecoveryWitness(witness, witnessEntryId);
+			},
+		});
+	}
+
+	/** Strict awaited startup, also used after replacement's rebind/withSession has returned. */
+	async completeRecoveryStartup(reason: SessionReadyEvent["reason"] = "startup"): Promise<void> {
+		if (!this.recovery.required || this._recoveryStartupEpoch === this.recovery.epoch) return;
+		const epoch = this.recovery.epoch;
+		if (this._recoveryStartup?.epoch === epoch) return this._recoveryStartup.promise;
+		const promise = Promise.resolve().then(async () => {
+			try {
+				await this._extensionRunner.emit({
+					type: "session_ready",
+					reason,
+					sessionGeneration: this.userMessageSessionGeneration,
+				});
+				this.recovery.assertEpoch(epoch);
+				if (!this.recovery.binding) throw this.recovery.block("RECOVERY_BINDING_REQUIRED");
+				await this.recovery.binding.deliver(this._recoveryContext());
+				this.recovery.assertEpoch(epoch);
+				if (this.recovery.phase === "HELD") this.recovery.phase = "READY";
+				if (this.recovery.phase !== "READY" && this.recovery.phase !== "RUNNING")
+					throw this.recovery.block("RECOVERY_STARTUP_NOT_COMPLETE");
+				this._recoveryStartupEpoch = epoch;
+			} catch (error) {
+				if (epoch === this.recovery.epoch) this.recovery.block("RECOVERY_STARTUP_FAILED", error);
+				throw error;
+			}
+		});
+		this._recoveryStartup = { epoch, promise };
+		return promise;
+	}
+
+	private _validateRecoveryInputEntry(input: AcceptedRecoveryInput, entryId: string): void {
+		const entry = this.sessionManager.getEntry(entryId);
+		if (
+			!entry ||
+			entry.type !== "message" ||
+			entry.message.role !== "user" ||
+			!isDeepStrictEqual(userContentBlocks(entry.message.content), [{ type: "text", text: input.text }]) ||
+			entry.metadataSource?.kind !== "extension" ||
+			entry.metadataSource.extensionPath !== this.recovery.source ||
+			!isDeepStrictEqual(entry.metadata?.piRecovery, input)
+		)
+			throw this.recovery.block("RECOVERY_RETAINED_INPUT_MISMATCH");
+		if (!this.sessionManager.getBranch().some((candidate) => candidate.id === entryId))
+			throw this.recovery.block("RECOVERY_EXECUTION_BRANCH_REQUIRED");
+	}
+
+	private async _startRecoveryOccurrence(
+		epoch: number,
+		input: AcceptedRecoveryInput,
+		entryId?: string,
+	): Promise<RecoveryOccurrence> {
+		this.recovery.assertEpoch(epoch);
+		if (this.recovery.phase === "READY" && this.isIdle) this.recovery.phase = "HELD";
+		if (entryId) this._validateRecoveryInputEntry(input, entryId);
+		this.recovery.select(input, entryId);
+		let resolve!: (carrier: RecoveryCarrier) => void;
+		let reject!: (error: unknown) => void;
+		const carrier = new Promise<RecoveryCarrier>((done, failed) => {
+			resolve = done;
+			reject = failed;
+		});
+		void carrier.catch(() => {});
+		this._recoveryCarrier = { resolve, reject };
+		const scope = { epoch, active: true, admitted: false };
+		let completion: Promise<void>;
+		if (entryId) {
+			this._releaseRecoveryPersistence();
+			const retained = this.sessionManager.getEntry(entryId);
+			if (!retained || retained.type !== "message") throw this.recovery.block("RECOVERY_RETAINED_INPUT_MISSING");
+			completion = this._recoveryScope.run(scope, () => this._runAgentPrompt([]));
+		} else {
+			completion = this._recoveryScope.run(scope, async () => {
+				await this._sendUserMessage(input.text, { expandPromptTemplates: false, metadata: { piRecovery: input } });
+				await this.waitForIdle();
+			});
+		}
+		void completion.catch((error: unknown) => {
+			reject(error);
+			if (epoch === this.recovery.epoch) this.recovery.block("RECOVERY_OCCURRENCE_FAILED", error);
+		});
+		void carrier.then(
+			() => {
+				scope.active = false;
+			},
+			() => {
+				scope.active = false;
+			},
+		);
+		return {
+			carrier,
+			completion,
+			permit: async () => {
+				await carrier;
+				await this.recovery.permit(epoch);
+			},
+		};
+	}
+
+	/** Synchronous native capture only, after the enclosing persistence owner returned. */
+	private _releaseRecoveryPersistence(): void {
+		if (!this.recovery.required) return;
+		for (const entry of this.sessionManager.drainRecoveryAppends()) this._recoveryEntries.set(entry.entryId, entry);
+		const input = this.recovery.input;
+		const entry = this.recovery.inputEntryId ? this._recoveryEntries.get(this.recovery.inputEntryId) : undefined;
+		if (input && entry && this._recoveryCarrier) {
+			this._recoveryCarrier.resolve({ entry, input, persistenceReleased: Promise.resolve() });
+			this._recoveryCarrier = undefined;
+		}
+	}
+
+	private async _beforeRecoveryProvider(signal?: AbortSignal): Promise<void> {
+		this.sessionManager.assertRecoveryExclusion();
+		await this.recovery.beforeProvider(signal);
+		this._releaseRecoveryPersistence();
+		const epoch = this.recovery.epoch;
+		await this.recovery.binding!.commitNativeEntries([...this._recoveryEntries.values()], this.recovery.input!);
+		this.recovery.assertEpoch(epoch);
+		this.sessionManager.assertRecoveryExclusion();
+		await this.recovery.beforeProvider(signal);
+	}
+
+	/** Adapter-original uses the SAME live post-result hook merge and image normalization path. */
+	async transformRecoveryToolResult(
+		message: ToolResultMessage,
+		input: ToolCall["arguments"],
+	): Promise<ToolResultMessage> {
+		if (
+			!this.recovery.required ||
+			!this._extensionRunner.strictRecovery ||
+			!this._extensionRunner.hasHandlers("tool_result")
+		)
+			throw new Error("RECOVERY_STRICT_TOOL_RESULT_UNAVAILABLE");
+		const epoch = this.recovery.epoch;
+		const original = structuredClone(message);
+		const assistantMessage = this._findLastAssistantMessage();
+		if (!assistantMessage) throw this.recovery.block("RECOVERY_TOOL_CALL_CONTEXT_MISSING");
+		const transformed = await this._afterToolCall({
+			assistantMessage,
+			toolCall: { type: "toolCall", id: original.toolCallId, name: original.toolName, arguments: input },
+			args: input,
+			result: { content: original.content, details: original.details, usage: original.usage },
+			isError: original.isError,
+			context: { messages: this.messages, tools: this.agent.state.tools },
+		});
+		this.recovery.assertEpoch(epoch);
+		const transformedDetails = transformed?.details ?? original.details;
+		const details: ToolResultMessage["details"] =
+			transformedDetails === undefined ? undefined : JSON.parse(JSON.stringify(transformedDetails));
+		if (!isDeepStrictEqual(details, transformedDetails)) throw this.recovery.block("RECOVERY_TOOL_RESULT_MALFORMED");
+		return detachedMessage({
+			...original,
+			content: transformed?.content ?? original.content,
+			details,
+			isError: transformed?.isError ?? original.isError,
+			usage: transformed?.usage ?? original.usage,
+		}) as ToolResultMessage;
+	}
+
+	private async _settleRecoveryWitness(witness: NativeTerminalWitness, witnessEntryId: string): Promise<void> {
+		const epoch = this.recovery.epoch;
+		const input = this.recovery.input!;
+		const assertSettling = () => {
+			this.recovery.assertEpoch(epoch);
+			if (
+				this.recovery.input !== input ||
+				(this.recovery.phase !== "RUNNING" && this.recovery.phase !== "DELIVERING")
+			)
+				throw this.recovery.block("RECOVERY_SETTLEMENT_REVOKED");
+		};
+		assertSettling();
+		const descriptor = this._recoveryEntries.get(witnessEntryId);
+		if (!descriptor) throw this.recovery.block("RECOVERY_TERMINAL_FLUSH_MISSING");
+		await this.recovery.binding!.commitNativeEntries([...this._recoveryEntries.values()], input);
+		assertSettling();
+		const result = await this.recovery.binding!.recordInputOutcome({
+			sessionId: this.sessionId,
+			originalInputId: input.originalInputId,
+			requestId: `${input.originalInputId}:settled:${witnessEntryId}`,
+			kind: "settled",
+			at: Date.parse(this.sessionManager.getEntry(witnessEntryId)!.timestamp),
+			bootId: witness.bootId,
+			terminalEvidence: witness,
+			deadlineMs: input.deadlineMs,
+		});
+		assertSettling();
+		if (!result.durable || (result.status === "already-terminal" && result.kind !== "settled"))
+			throw this.recovery.block("RECOVERY_SETTLEMENT_NOT_DURABLE");
+		this.recovery.phase = "READY";
+	}
+
+	private async _finalizeRecoveryInput(): Promise<void> {
+		const input = this.recovery.input;
+		if (!input || !this.recovery.inputEntryId || !this.recovery.runId)
+			throw this.recovery.block("RECOVERY_TERMINAL_UNBOUND");
+		this._releaseRecoveryPersistence();
+		const branch = this.sessionManager.getBranch();
+		const inputIndex = branch.findIndex((entry) => entry.id === this.recovery.inputEntryId);
+		if (inputIndex < 0) throw this.recovery.block("RECOVERY_EXECUTION_BRANCH_REQUIRED");
+		const finalEntries = branch
+			.slice(inputIndex + 1)
+			.filter(
+				(entry) =>
+					entry.type === "message" && (entry.message.role === "assistant" || entry.message.role === "toolResult"),
+			);
+		const last = finalEntries.at(-1);
+		if (
+			!last ||
+			last.type !== "message" ||
+			last.message.role !== "assistant" ||
+			last.message.stopReason !== "stop" ||
+			last.message.content.some((part) => part.type === "toolCall") ||
+			this.agent.hasQueuedMessages() ||
+			this._pendingNextTurnMessages.length
+		)
+			throw this.recovery.block("RECOVERY_TERMINAL_DECISION_INCOMPLETE");
+		const descriptors = finalEntries.map((entry) => {
+			const descriptor = this._recoveryEntries.get(entry.id);
+			if (!descriptor) throw this.recovery.block("RECOVERY_TERMINAL_FLUSH_MISSING");
+			return descriptor;
+		});
+		const epoch = this.recovery.epoch;
+		const validation = await this.recovery.binding!.validateTerminal(input, descriptors);
+		this.recovery.assertEpoch(epoch);
+		if (!validation?.complete) throw this.recovery.block("RECOVERY_TERMINAL_INVENTORY_INCOMPLETE");
+		const witness: NativeTerminalWitness = {
+			version: 1,
+			sessionId: this.sessionId,
+			originalInputId: input.originalInputId,
+			inputEntryId: this.recovery.inputEntryId,
+			runId: this.recovery.runId,
+			bootId: PI_PROCESS_INCARNATION_ID,
+			decision: "settled",
+			finalEntries: descriptors.map((entry) => ({ entryId: entry.entryId, bytesSha256: entry.bytesSha256 })),
+		};
+		let witnessId!: string;
+		await withSessionPersistenceScope(this.sessionManager, async () => {
+			if (this.#ordinaryOwner)
+				await this.#ordinaryOwner.owner.terminal(async () => {
+					witnessId = await appendOwnedTerminalEntry(this.sessionManager, "pi-recovery-terminal:v1", witness);
+				});
+			else witnessId = this.sessionManager.appendCustomEntry("pi-recovery-terminal:v1", witness);
+		});
+		this._releaseRecoveryPersistence();
+		await this._settleRecoveryWitness(witness, witnessId);
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -1001,13 +1416,18 @@ export class AgentSession {
 		env?: Record<string, string>;
 		thinkingLevel: ThinkingLevel;
 	}> {
+		if (this.recovery.required) await this._beforeRecoveryProvider(signal);
 		// Route a virtual model first: summaries size their input and output from the model they get.
 		const { model, thinkingLevel } = isVirtualModel(selectedModel)
-			? await this._modelRuntime.resolveModel(selectedModel, convertToLlm(this.messages), {
-					reason: "direct",
-					thinkingLevel: this.thinkingLevel,
-					signal,
-				})
+			? await this._modelRuntime.resolveModel(
+					selectedModel,
+					convertToLlm(this.recovery.required ? await this.recovery.project(this.messages) : this.messages),
+					{
+						reason: "direct",
+						thinkingLevel: this.thinkingLevel,
+						signal,
+					},
+				)
 			: { model: selectedModel, thinkingLevel: this.thinkingLevel };
 		if (this.agent.streamFunction === streamSimple) {
 			return { ...(await this._getRequiredRequestAuth(model, signal)), thinkingLevel };
@@ -1097,9 +1517,26 @@ export class AgentSession {
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
 	private async _beforeToolCall(
-		{ toolCall, args }: BeforeToolCallContext,
+		{ assistantMessage, toolCall, args }: BeforeToolCallContext,
 		parentToolCallId?: string,
 	): Promise<BeforeToolCallResult | undefined> {
+		if (this.recovery.required) {
+			// Agent awaits message_end listeners, including the enclosing native persistence scope.
+			// B6 registration/barrier is separate and must also precede the real Tool.execute.
+			const entryId = this._entryIdsByMessage.get(assistantMessage);
+			const entry = entryId ? this.sessionManager.getEntry(entryId) : undefined;
+			if (
+				!entryId ||
+				!this._recoveryEntries.has(entryId) ||
+				entry?.type !== "message" ||
+				entry.message.role !== "assistant" ||
+				!entry.message.content.some(
+					(part) => part.type === "toolCall" && part.id === (parentToolCallId ?? toolCall.id),
+				)
+			)
+				throw this.recovery.block("RECOVERY_TOOL_CALL_CARRIER_MISSING");
+			await this._beforeRecoveryProvider();
+		}
 		const runner = this._extensionRunner;
 		if (!runner.hasHandlers("tool_call")) {
 			return undefined;
@@ -1249,7 +1686,7 @@ export class AgentSession {
 			// turning a compaction timeout into an ordinary agent retry.
 			this._stopAfterCompactionFailure = true;
 			this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
-			this.agent.abort();
+			this._rawAgentAbort();
 			throw new Error(
 				`${overflow ? "Context exceeds window: " : ""}Compaction ${outcome} before the next assistant turn`,
 			);
@@ -1267,6 +1704,10 @@ export class AgentSession {
 		let canonicalMessagesDigest: string | undefined;
 		const previousConvertToLlm = this.agent.convertToLlm;
 		this.agent.convertToLlm = async (messages) => {
+			if (this.recovery.required) {
+				await this._beforeRecoveryProvider();
+				messages = await this.recovery.project(messages);
+			}
 			let converted = await previousConvertToLlm(messages);
 			// Admission is after model selection, context transforms and conversion. Raw
 			// transcript size (including !! output) is not the provider-visible input.
@@ -1290,14 +1731,14 @@ export class AgentSession {
 				if (outcome === "failed" || outcome === "aborted") {
 					this._stopAfterCompactionFailure = true;
 					this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
-					this.agent.abort();
+					this._rawAgentAbort();
 					throw new Error(`Context exceeds window: Compaction ${outcome} before the next assistant turn`);
 				}
 				if (this.sessionManager.revision() === revision) throw error;
 				const compacted = this.sessionManager.buildSessionProjection().messages;
 				// Do not rerun request hooks. The admitted input was canonical and the
 				// built-in converter is stateless, so convert the new projection directly.
-				converted = convertToLlm(compacted);
+				converted = convertToLlm(this.recovery.required ? await this.recovery.project(compacted) : compacted);
 				assertContextFitsWindow(converted, requestModel);
 			}
 			return converted;
@@ -1317,6 +1758,7 @@ export class AgentSession {
 			}
 		};
 		this.agent.prepareRequest = async (request, signal) => {
+			if (this.recovery.required) await this._beforeRecoveryProvider(signal);
 			const failed = this._failedResponse;
 			// A mid-output replay repeats the physical request, not a router's or request hook's next selection.
 			const replayRequest =
@@ -1345,6 +1787,8 @@ export class AgentSession {
 					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
 					tools: this.agent.state.tools.slice(),
 				};
+				if (this.recovery.required)
+					canonicalContext.messages = await this.recovery.project(canonicalContext.messages);
 				canonicalMessagesDigest = snapshotMessages(canonicalContext.messages);
 				const previous = await previousPrepareRequest?.(
 					{
@@ -1379,13 +1823,17 @@ export class AgentSession {
 			const lastResponse = context.messages.findLastIndex((message) => message.role === "assistant");
 			const userTurn = context.messages.slice(lastResponse + 1).some((message) => message.role === "user");
 			const state = getVirtualModelState(this.sessionManager.getBranch(), model.provider, model.id);
-			const route = await this._modelRuntime.resolveModel(model, convertToLlm(context.messages), {
-				reason: failed ? "retry" : userTurn ? "user" : "continuation",
-				thinkingLevel,
-				signal,
-				failed,
-				state,
-			});
+			const route = await this._modelRuntime.resolveModel(
+				model,
+				convertToLlm(this.recovery.required ? await this.recovery.project(context.messages) : context.messages),
+				{
+					reason: failed ? "retry" : userTurn ? "user" : "continuation",
+					thinkingLevel,
+					signal,
+					failed,
+					state,
+				},
+			);
 			if (route.state !== undefined && route.state !== state) {
 				const data: VirtualModelStateData = { provider: model.provider, modelId: model.id, state: route.state };
 				const entry = this.sessionManager.getEntry(
@@ -1400,7 +1848,7 @@ export class AgentSession {
 				if (outcome === "failed" || outcome === "aborted") {
 					this._stopAfterCompactionFailure = true;
 					this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
-					this.agent.abort();
+					this._rawAgentAbort();
 					throw new Error(`Compaction ${outcome} before the routed assistant turn`);
 				}
 				// Do not rerun request hooks: they may consume one-shot input. Keep the accepted preparation and
@@ -1409,7 +1857,10 @@ export class AgentSession {
 				if (canReproject) {
 					const messages = this.sessionManager.buildSessionProjection().messages;
 					canonicalMessagesDigest = snapshotMessages(messages);
-					context = { ...context, messages };
+					context = {
+						...context,
+						messages: this.recovery.required ? await this.recovery.project(messages) : messages,
+					};
 				}
 			}
 			requestModel = route.model;
@@ -1919,7 +2370,7 @@ export class AgentSession {
 		}
 
 		// agent_start is awaited before the first request, including reentrant aborts at transfer.
-		if (event.type === "agent_start" && this._agentRunAbortRequested) this.agent.abort();
+		if (event.type === "agent_start" && this._agentRunAbortRequested) void this._rawAgentAbort();
 		// Record the calls a tool made through ctx.executeTool() and their usage on its result message.
 		if (this._nestedToolCalls) {
 			if (event.type === "message_start" && event.message.role === "toolResult") {
@@ -1997,8 +2448,11 @@ export class AgentSession {
 
 		// Listeners still mutate before persistence; their failure cannot discard a finalized result.
 		// Storage and ownership failures remain outside the listener-error catch and propagate normally.
-		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
-		else await this._persistAgentEvent(event);
+		await withSessionPersistenceScope(this.sessionManager, async () => {
+			if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
+			else await this._persistAgentEvent(event);
+		});
+		this._releaseRecoveryPersistence();
 		if (listenerError) throw listenerError.error;
 	}
 
@@ -2047,6 +2501,17 @@ export class AgentSession {
 			if (receipt && transfer) linkUnsentInputTransfer(receipt, transfer);
 			if (submission && persisted.role !== "user") {
 				submission.reject(new Error("User message was replaced without persisting a user entry"));
+			}
+			if (this.recovery.required && persisted.role === "user") {
+				const input = this.recovery.input;
+				if (
+					!input ||
+					this.recovery.inputEntryId ||
+					!isDeepStrictEqual(userContentBlocks(persisted.content), [{ type: "text", text: input.text }]) ||
+					submission?.metadataSource.kind !== "extension" ||
+					submission.metadataSource.extensionPath !== this.recovery.source
+				)
+					throw this.recovery.block("REQUIRED_INPUT_HOOK_PROTOCOL_ERROR");
 			}
 			const metadata = persisted.role === "user" ? (submission?.metadata ?? replay?.metadata) : undefined;
 			const metadataSource =
@@ -2111,6 +2576,7 @@ export class AgentSession {
 				}
 			}
 			if (entryId) {
+				if (this.recovery.required && persisted.role === "user") this.recovery.inputEntryId = entryId;
 				this._entryIdsByMessage.set(event.message, entryId);
 				// Do not insert a throwing public callback between durable append and receipt bookkeeping.
 				if (occurrenceId !== undefined) this._nativeQueuedInputs.delete(occurrenceId);
@@ -2412,12 +2878,13 @@ export class AgentSession {
 			new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "auxiliary operation cancelled by disposal"),
 		);
 		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_DISPOSED"));
+		this.recovery.retire();
 		try {
-			this.abortRetry();
-			this.abortCompaction();
+			this._rawAbortRetry();
+			this._rawAbortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
-			this.#originalAgent.abort();
+			this._rawAgentAbort();
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
 		}
@@ -2998,6 +3465,7 @@ export class AgentSession {
 		// A prompt admitted before the switch may still be finishing async input hooks.
 		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 		const agent = this.#originalAgent;
+		const recoveryEpoch = this.recovery.epoch;
 		if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 		const dispatch = async (continuation = false, fromQueuedMessages = false) => {
 			if (!continuation) this._checkInputAdmission();
@@ -3017,7 +3485,13 @@ export class AgentSession {
 				// A run_start observer may reload synchronously; record the started turn first.
 				transferringAdmission?.transferred?.();
 			}
-			const run = continuation || !messages ? agent.continue({ fromQueuedMessages }) : agent.prompt(messages);
+			this._recoveryNativeDispatch = true;
+			let run: Promise<void>;
+			try {
+				run = continuation || !messages ? agent.continue({ fromQueuedMessages }) : agent.prompt(messages);
+			} finally {
+				this._recoveryNativeDispatch = false;
+			}
 			try {
 				if (!continuation) onInputTransferred?.();
 				if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
@@ -3052,7 +3526,7 @@ export class AgentSession {
 		this._anthropicFallbackRetryUsed = false;
 		this._midstreamOverloadRetryUsed = false;
 		this.#auditState("session_run_start");
-		let runFailed = false;
+		let runFailure: { cause: unknown } | undefined;
 		try {
 			prepared?.();
 			if (automaticEnrollment) await automaticEnrollment(() => dispatch());
@@ -3077,7 +3551,7 @@ export class AgentSession {
 				else await dispatch(true, fromQueuedMessages);
 			}
 		} catch (error) {
-			runFailed = true;
+			runFailure = { cause: error };
 			throw error;
 		} finally {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
@@ -3099,11 +3573,37 @@ export class AgentSession {
 			} catch (error) {
 				persistenceFailure = { cause: error };
 			}
+			if (this.recovery.required && recoveryEpoch !== this.recovery.epoch) {
+				this._agentRunAbortRequested = true;
+				this._lastActivityOutcome = "aborted";
+			}
+			if (this.recovery.required && recoveryEpoch === this.recovery.epoch) {
+				try {
+					if (this._stopAfterCompactionFailure) await this.recovery.interrupt("compaction-failure", true);
+					// biome-ignore lint/correctness/noUnsafeFinally: Caught below so REQUIRED persistence failure blocks finalization and rejects before settlement notification.
+					if (persistenceFailure) throw persistenceFailure.cause;
+					if (!this._agentRunAbortRequested && !this._abortDuringBeforeSettle) {
+						if (runFailure || this._stopAfterCompactionFailure || this._lastActivityOutcome !== "completed")
+							// biome-ignore lint/correctness/noUnsafeFinally: Caught below so REQUIRED incomplete computation cannot persist a settled witness or notify settlement.
+							throw this.recovery.block(
+								"RECOVERY_COMPUTATION_NOT_SETTLED",
+								runFailure ? runFailure.cause : this._findLastAssistantMessage(),
+							);
+						await this._finalizeRecoveryInput();
+					}
+				} catch (error) {
+					this.recovery.block("RECOVERY_TERMINAL_FINALIZATION_FAILED", error);
+					this._isAgentRunActive = false;
+					this._resolveIdleWaitIfIdle();
+					// biome-ignore lint/correctness/noUnsafeFinally: REQUIRED cannot notify successful settlement after a failed durable terminal boundary.
+					throw error;
+				}
+			}
 			try {
 				await this._emitAgentSettled(
 					this._agentRunAbortRequested || this._abortDuringBeforeSettle
 						? "aborted"
-						: runFailed
+						: runFailure
 							? "error"
 							: (this._compactionStopOutcome ?? this._lastActivityOutcome),
 				);
@@ -3395,6 +3895,16 @@ export class AgentSession {
 	 * descendants admit input like any unscoped caller (pi#163). Fire-and-forget like other observers.
 	 */
 	emitSessionReady(reason: SessionReadyEvent["reason"]): void {
+		if (this.recovery.required) {
+			void this.completeRecoveryStartup(reason).catch((error: unknown) =>
+				this._extensionRunner.emitError({
+					extensionPath: "<recovery>",
+					event: "session_ready",
+					error: String(error),
+				}),
+			);
+			return;
+		}
 		if (this._inputsDisposed || this._shutdownCancellation.signal.aborted || this._inputFence) return;
 		if (!this._extensionRunner.hasHandlers("session_ready")) return;
 		const event: SessionReadyEvent = {
@@ -3674,7 +4184,7 @@ export class AgentSession {
 			this._pendingCustomMessages = [];
 			this._unpersistedInputs.clear();
 			this._nativeQueuedInputs.clear();
-			this.clearQueue();
+			this._clearLifecycleQueue();
 			return release;
 		} catch (error) {
 			release();
@@ -3708,12 +4218,12 @@ export class AgentSession {
 					new InputAdmissionError("INPUT_ADMISSION_ABORTED", "settlement cancelled for shutdown"),
 				);
 				this.abortBash();
-				await this.abort();
+				await this.interruptForLifecycle("shutdown-fence");
 				await this._settlementCompletion;
 				const messages = this.agent.getQueuedMessages();
 				if (messages.length > 0) {
 					options.rejectQueuedInput(messages);
-					this.clearQueue();
+					this._clearLifecycleQueue();
 				}
 			}
 			this._assertInputsDrained();
@@ -3775,6 +4285,11 @@ export class AgentSession {
 	private _admitInput(): InputAdmission {
 		// Neither cancelled input nor cancelled dispatch descendants may acquire fresh authority.
 		this._checkInputAdmission();
+		if (this.recovery.required) {
+			const scope = this._recoveryScope.getStore()!;
+			if (scope.admitted) throw this.recovery.block("RECOVERY_OCCURRENCE_ALREADY_ADMITTED");
+			scope.admitted = true;
+		}
 		this._shutdownCancellation.signal.throwIfAborted();
 		const controller = new AbortController();
 		const cancellation = this._dispatchCancellationScope.getStore();
@@ -3807,6 +4322,14 @@ export class AgentSession {
 	}
 
 	private _checkInputAdmission(): void {
+		if (this.recovery.required) {
+			const scope = this._recoveryScope.getStore();
+			if (!scope?.active || scope.epoch !== this.recovery.epoch || this.recovery.phase !== "DELIVERING")
+				throw new InputAdmissionError(
+					"INPUT_ADMISSION_FENCED",
+					"REQUIRED input must use its reserved native occurrence",
+				);
+		}
 		this._dispatchCancellationScope.getStore()?.throwIfAborted();
 		this._inputAdmissionScope.getStore()?.signal.throwIfAborted();
 		this._assertInputsOpen();
@@ -4133,7 +4656,7 @@ export class AgentSession {
 			// Check if we need to compact before sending (catches aborted responses).
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
-			if (lastAssistant) {
+			if (lastAssistant && !this.recovery.required) {
 				const outcome = await this._awaitInput(this._checkCompaction(lastAssistant, false));
 				if (outcome === "failed" || outcome === "aborted") {
 					// Refused receipt ingress cannot leave runnable input behind. Ordinary
@@ -4852,7 +5375,10 @@ export class AgentSession {
 					? snapshotUserMessageMetadata({})
 					: undefined
 				: snapshotUserMessageMetadata(requestedMetadata);
-		const metadataSource = getUserMessageMetadataSource(metadataOptions);
+		const metadataSource: UserMessageMetadataSource =
+			this.recovery.required && this._recoveryScope.getStore()?.active && this.recovery.source
+				? { kind: "extension", extensionPath: this.recovery.source }
+				: getUserMessageMetadataSource(metadataOptions);
 		const options = deliveryOptions;
 		const receipt = captureTerminalTurnReceipt();
 		const admission = this._admitInput();
@@ -4957,6 +5483,16 @@ export class AgentSession {
 		// listener once the shared operation settles. Transferred run lineage is unaffected.
 		if (detachObserver) void operation.then(detachObserver, detachObserver);
 		if (!result) return await operation;
+		if (this.recovery.required && this._recoveryScope.getStore()?.active) {
+			void result.catch(() => {});
+			try {
+				await operation;
+				return await result;
+			} catch (error) {
+				submission?.reject(error);
+				throw error;
+			}
+		}
 		void operation.catch((error: unknown) => {
 			// Compaction failure transfers the exact input into a retained queue. Its receipt
 			// remains pending until recovery persists it or clear/abort/reload/disposal rejects it.
@@ -4996,6 +5532,8 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
+		if (this.recovery.required && !this._recoveryRawQueueMutation)
+			throw new Error("RECOVERY_AWAIT_CANCEL_BEFORE_CLEAR");
 		const steering = [...this._steeringMessages];
 		const followUp = [...this._followUpMessages];
 		this._steeringMessages = [];
@@ -5018,6 +5556,21 @@ export class AgentSession {
 		this._emitQueueUpdate();
 		this._resolveIdleWaitIfIdle();
 		return { steering, followUp };
+	}
+
+	private _clearLifecycleQueue(): { steering: string[]; followUp: string[] } {
+		this._recoveryRawQueueMutation = true;
+		try {
+			return this.clearQueue();
+		} finally {
+			this._recoveryRawQueueMutation = false;
+		}
+	}
+
+	/** Destructive queue removal is authorized only after every captured B5 outcome is durable. */
+	async cancelAndClearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
+		await this.abort();
+		return this._clearLifecycleQueue();
 	}
 
 	/** Number of pending messages (includes both steering and follow-up) */
@@ -5064,8 +5617,19 @@ export class AgentSession {
 		for (const submission of this._pendingUserMessageSubmissions) submission.reject(error);
 	}
 
-	/** Abort current operation and wait for agent to become idle. */
+	/** Explicit user cancellation: REQUIRED persists the outcome before applying stop. */
 	async abort(): Promise<void> {
+		if (this.recovery.required) return this.recovery.cancel(getExtensionExecutionPath() !== undefined);
+		return this._abortOperation();
+	}
+
+	/** Native lifecycle interruption, never a user-cancel outcome. */
+	async interruptForLifecycle(reason: string): Promise<void> {
+		if (!this.recovery.required) return this._abortOperation();
+		await this.recovery.interrupt(reason, getExtensionExecutionPath() !== undefined);
+	}
+
+	private async _abortOperation(): Promise<void> {
 		// Queued inputs have already released admission. Cancel their receipts too,
 		// including inputs retained by failed compaction, without dropping the queues.
 		this._rejectPendingUserMessageSubmissions(
@@ -5080,11 +5644,11 @@ export class AgentSession {
 		this._retainModelSwitchDispatches();
 		// Accepted hook/settlement input is retained too, even if the switch already committed.
 		this._queueTriggeredBehindPreflight();
-		this.abortRetry();
-		this.abortCompaction();
+		this._rawAbortRetry();
+		this._rawAbortCompaction();
 		this.abortBranchSummary();
 		if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;
-		this.#originalAgent.abort();
+		void this._rawAgentAbort();
 		this._resolveIdleWaitIfIdle();
 		await this.waitForIdle();
 		// Deferred work must not join the settlement whose completion it owns.
@@ -5464,6 +6028,18 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private async _prepareRecoveryCompaction(preparation: CompactionPreparation, signal: AbortSignal): Promise<void> {
+		if (!this.recovery.required) return;
+		await this._beforeRecoveryProvider(signal);
+		const epoch = this.recovery.epoch;
+		if (!this.recovery.binding?.validateCompaction)
+			throw this.recovery.block("RECOVERY_COMPACTION_VALIDATOR_REQUIRED");
+		await this.recovery.binding.validateCompaction(this.recovery.input!, preparation);
+		this.recovery.assertEpoch(epoch);
+		preparation.messagesToSummarize = await this.recovery.project(preparation.messagesToSummarize);
+		preparation.turnPrefixMessages = await this.recovery.project(preparation.turnPrefixMessages);
+	}
+
 	/** Generate Pi's built-in compaction summary for manual and automatic compaction. */
 	async #runDefaultCompaction(
 		preparation: CompactionPreparation,
@@ -5478,7 +6054,14 @@ export class AgentSession {
 		const request = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
 		const callbacks = this._summarizationRetryCallbacks({ source: "compaction", reason });
 		const stream = this.agent.streamFunction;
-		const summaryStream: typeof stream = attempt ? (...args) => attempt.request(() => stream(...args)) : stream;
+		const summaryStream: typeof stream = this.recovery.required
+			? async (...args) => {
+					await this._beforeRecoveryProvider(signal);
+					return stream(...args);
+				}
+			: attempt
+				? (...args) => attempt.request(() => stream(...args))
+				: stream;
 		let originalFailure: { cause: unknown } | undefined;
 		try {
 			return await raceWithAbortSignal(
@@ -5547,7 +6130,7 @@ export class AgentSession {
 		const dispatch = this._dispatchCancellationScope.getStore();
 		// An unrelated caller must not abort or compact a session whose lifecycle a replacement fence owns (#132 R1-S3).
 		this._assertInputsOpen();
-		await this.abort();
+		await this.interruptForLifecycle("manual-compaction");
 		// abort() itself ends a caller's held admission (an extension command calling ctx.compact()). Only that
 		// self-abort is exempt: keep the admission's independently inherited revocation (PR #117 R6-2).
 		const revocation = ownsHeldAdmission ? (dispatch === admission.signal ? admission.parent : dispatch) : inherited;
@@ -5609,6 +6192,7 @@ export class AgentSession {
 				throw new Error("Nothing to compact (session too small)");
 			}
 
+			if (this.recovery.required) await this._prepareRecoveryCompaction(preparation, signal);
 			attempt?.check();
 			attempt?.prepare(preparation);
 			let extensionCompaction: CompactionResult | undefined;
@@ -5670,6 +6254,10 @@ export class AgentSession {
 
 			signal.throwIfAborted();
 
+			if (this.recovery.required) {
+				await this.recovery.binding!.validateCompaction!(this.recovery.input!, preparation, firstKeptEntryId);
+				await this._beforeRecoveryProvider(signal);
+			}
 			if (attempt) await attempt.settle();
 			signal.throwIfAborted();
 			attempt?.check();
@@ -5876,7 +6464,12 @@ export class AgentSession {
 	/**
 	 * Cancel in-progress compaction (manual or auto).
 	 */
-	abortCompaction(): void {
+	abortCompaction(): void | Promise<void> {
+		if (this.recovery.required && this.recovery.input) return this.abort();
+		this._rawAbortCompaction();
+	}
+
+	private _rawAbortCompaction(): void {
 		const active =
 			this._compactionAbortController ||
 			this._autoCompactionAbortController ||
@@ -5885,7 +6478,7 @@ export class AgentSession {
 		if (active && this._isAgentRunActive) {
 			this._agentRunAbortRequested = true;
 			this._compactionStopOutcome = "aborted";
-			this.#originalAgent.abort();
+			this._rawAgentAbort();
 		}
 		this._compactionAbortController?.abort();
 		this._autoCompactionAbortController?.abort();
@@ -6097,6 +6690,7 @@ export class AgentSession {
 				return false;
 			}
 
+			if (this.recovery.required) await this._prepareRecoveryCompaction(preparation, signal);
 			signal.throwIfAborted();
 			started = true;
 			this._emit({ type: "compaction_start", reason });
@@ -6155,6 +6749,10 @@ export class AgentSession {
 
 			signal.throwIfAborted();
 
+			if (this.recovery.required) {
+				await this.recovery.binding!.validateCompaction!(this.recovery.input!, preparation, firstKeptEntryId);
+				await this._beforeRecoveryProvider(signal);
+			}
 			const compactionId = this.sessionManager.appendCompaction(
 				summary,
 				firstKeptEntryId,
@@ -6318,12 +6916,22 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
-		await raceWithAbortSignal(this._extensionRunner.emit(this._sessionStartEvent), this._shutdownCancellation.signal);
-		this._extensionRunner.reportUnhandledMcpServers();
-		await raceWithAbortSignal(
-			this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup"),
-			this._shutdownCancellation.signal,
-		);
+		try {
+			await raceWithAbortSignal(
+				this._extensionRunner.emit(this._sessionStartEvent),
+				this._shutdownCancellation.signal,
+			);
+			this._extensionRunner.reportUnhandledMcpServers();
+			await raceWithAbortSignal(
+				this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup"),
+				this._shutdownCancellation.signal,
+			);
+			if (this.recovery.required && !this._inputFence && !this._recoveryDeferStartup)
+				await this.completeRecoveryStartup(this._sessionStartEvent.reason);
+		} catch (error) {
+			if (this.recovery.required) this.recovery.block("RECOVERY_STARTUP_FAILED", error);
+			throw error;
+		}
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
@@ -6526,7 +7134,9 @@ export class AgentSession {
 				}),
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 				getSignal: () => this.agent.signal,
+				getSessionRecovery: () => (this.recovery.required ? this._recoveryContext() : undefined),
 				abort: () => {
+					if (this.recovery.required) return this.abort();
 					if (this._extensionAbortHandler) {
 						this._extensionAbortHandler();
 						return;
@@ -6734,6 +7344,8 @@ export class AgentSession {
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;
 		}
+		this._extensionRunner.strictRecovery = this.recovery.required;
+		if (this.recovery.required) this.recovery.bind(this._extensionRunner.getSessionRecoveryBindings());
 		this._bindExtensionCore(this._extensionRunner);
 		this._applyExtensionBindings(this._extensionRunner);
 
@@ -6749,6 +7361,7 @@ export class AgentSession {
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: reload requires separate receiving");
+		if (this.recovery.required) this.recovery.phase = "HELD";
 		// Fence receipt ingress before hooks can yield: rotate the generation, cancel held admissions
 		// and undelivered ingress follow-ups. Ordinary/custom queues survive. Refuse new ingress until
 		// the new runtime is built; a failed reload stays closed until a later reload succeeds.
@@ -6756,10 +7369,15 @@ export class AgentSession {
 		const suspension = { held: true };
 		try {
 			this._cancelIngressQueuedMessages();
+			if (this.recovery.required) {
+				await this.interruptForLifecycle("reload");
+				this.recovery.close(false);
+			}
 			await this._reloadRuntime(suspension, options);
 		} catch (error) {
 			// Neither the old nor a partially bound runtime may admit ingress. A retry may recover.
 			this._userMessageIngress.setRuntimeAvailable(false);
+			if (this.recovery.required) this.recovery.block("RECOVERY_RELOAD_FAILED", error);
 			this._extensionRunner.invalidate();
 			this._invalidateUserMessageIngress("session_changed");
 			throw error;
@@ -6821,11 +7439,12 @@ export class AgentSession {
 			this._extensionCommandContextActions ||
 			this._extensionShutdownHandler ||
 			this._extensionErrorListener;
-		if (hasBindings) {
+		if (hasBindings || this.recovery.required) {
 			await options?.beforeSessionStart?.();
 			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 			this._extensionRunner.reportUnhandledMcpServers();
 			await this.extendResourcesFromExtensions("reload");
+			if (this.recovery.required) await this.completeRecoveryStartup("reload");
 		}
 	}
 
@@ -7128,7 +7747,12 @@ export class AgentSession {
 	/**
 	 * Cancel in-progress retry.
 	 */
-	abortRetry(): void {
+	abortRetry(): void | Promise<void> {
+		if (this.recovery.required && this.recovery.input) return this.abort();
+		this._rawAbortRetry();
+	}
+
+	private _rawAbortRetry(): void {
 		this._retryAbortController?.abort();
 	}
 

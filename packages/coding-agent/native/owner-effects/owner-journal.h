@@ -44,13 +44,14 @@ static int verify_journal_bytes(Owner *owner, int fd, size_t previous_bytes,
 	return lifecycle_journal_boundary(owner);
 }
 
-/* Shared journal body: caller owns exclusive original-owner serialization.
- * Empty suffix verifies custody only, without creating/writing/fsyncing files
- * or mutating the owner record. No N-API, mutex or JSON encoding occurs here. */
-static int append_journal_bytes(Host *host, Owner *owner, const char *name,
-	size_t previous_bytes, const unsigned char *suffix, size_t suffix_bytes, bool terminal_mode) {
+/* Shared existing writer: caller owns exclusive original-owner serialization.
+ * Only the separate flushJournal capability may flush an unchanged prefix.
+ * Default empty append/verify remains custody-only. No N-API or encoding here. */
+static int persist_journal_bytes(Host *host, Owner *owner, const char *name,
+	size_t previous_bytes, const unsigned char *suffix, size_t suffix_bytes, bool terminal_mode, bool flush_prefix) {
 	if (previous_bytes > host->journal_limit || suffix_bytes > host->journal_limit - previous_bytes ||
-		(suffix_bytes && !suffix)) return EINVAL;
+		(suffix_bytes && !suffix) || (flush_prefix && (!previous_bytes || suffix_bytes || terminal_mode))) return EINVAL;
+	if (flush_prefix && (!owner->active || owner->recovering || host->closing || !allocation_current(owner))) return ESTALE;
 	if ((owner->sealed && !terminal_mode) || owner->uncertain || host->failed || owner->release_started ||
 		(terminal_mode && (!owner->sealed || owner->launch_count || owner->operations))) return ESTALE;
 	if (strcmp(name, owner->journal_name) || previous_bytes != owner->journal_size ||
@@ -78,7 +79,7 @@ static int append_journal_bytes(Host *host, Owner *owner, const char *name,
 		if (publish_owner_record(host, owner) < 0) error = errno;
 		if (!error) error = lifecycle_journal_boundary(owner);
 	}
-	int flags = (suffix_bytes ? O_RDWR : O_RDONLY) | O_CLOEXEC | O_NOFOLLOW;
+	int flags = ((suffix_bytes || flush_prefix) ? O_RDWR : O_RDONLY) | O_CLOEXEC | O_NOFOLLOW;
 	if (!previous_bytes && suffix_bytes) flags |= O_CREAT | O_EXCL;
 	int fd = error ? -1 : openat(owner->directory, name, flags, 0600);
 	if (!error && fd < 0) {
@@ -108,13 +109,13 @@ static int append_journal_bytes(Host *host, Owner *owner, const char *name,
 		written += (size_t)n;
 	}
 	if (!error) error = lifecycle_journal_boundary(owner);
-	if (!error && suffix_bytes && fsync(fd) < 0) error = errno;
+	if (!error && (suffix_bytes || flush_prefix) && fsync(fd) < 0) error = errno;
 	if (!error) error = lifecycle_journal_boundary(owner);
-	if (!error && suffix_bytes && fsync(owner->directory) < 0) error = errno;
+	if (!error && (suffix_bytes || flush_prefix) && fsync(owner->directory) < 0) error = errno;
 	if (!error) error = lifecycle_journal_boundary(owner);
 	struct stat readback = st;
-	if (!error && suffix_bytes && fstat(fd, &readback) < 0) error = errno;
-	if (!error && suffix_bytes) error = verify_journal_bytes(owner, fd, previous_bytes, suffix, suffix_bytes);
+	if (!error && (suffix_bytes || flush_prefix) && fstat(fd, &readback) < 0) error = errno;
+	if (!error && (suffix_bytes || flush_prefix)) error = verify_journal_bytes(owner, fd, previous_bytes, suffix, suffix_bytes);
 	if (!error && (fstat(fd, &verified) < 0 || fstatat(owner->directory, name, &named, AT_SYMLINK_NOFOLLOW) < 0)) error = errno;
 	if (!error && (!journal_stat_matches(&readback, &st, next_bytes) ||
 		!journal_stat_matches(&verified, &st, next_bytes) || !journal_stat_matches(&named, &st, next_bytes) ||
@@ -130,8 +131,43 @@ static int append_journal_bytes(Host *host, Owner *owner, const char *name,
 		if (!error) error = lifecycle_journal_boundary(owner);
 		if (!error) memcpy(owner->journal_bytes + previous_bytes, suffix, suffix_bytes);
 	}
-	if (error && (pending || error == ESTALE || error == EIO || error == ENOENT)) owner->uncertain = owner->sealed = true;
+	if (!error && flush_prefix && owner->record_bytes) {
+		OwnerRecord record;
+		if (read_owner_record(owner, &record) < 0 || owner->record_length != sizeof(record) ||
+			memcmp(&record, owner->record_bytes, sizeof(record))) error = ESTALE;
+	}
+	if (!error && flush_prefix && (!owner->active || owner->sealed || owner->uncertain || owner->recovering ||
+		host->failed || host->closing || owner->release_started || !owner_lock_matches(host, owner) || !allocation_current(owner))) error = ESTALE;
+	if (error && (pending || flush_prefix || error == ESTALE || error == EIO || error == ENOENT)) owner->uncertain = owner->sealed = true;
 	return error;
+}
+
+/* Preserve all existing append/verify/lifecycle callers and their fsync counts. */
+static int append_journal_bytes(Host *host, Owner *owner, const char *name,
+	size_t previous_bytes, const unsigned char *suffix, size_t suffix_bytes, bool terminal_mode) {
+	return persist_journal_bytes(host, owner, name, previous_bytes, suffix, suffix_bytes, terminal_mode, false);
+}
+
+/* Fresh current flush of native-retained bytes, not evidence of a prior flush.
+ * No suffix, empty append, file creation, owner-record update or byte rewrite. */
+static napi_value flush_journal(napi_env env, napi_callback_info info) {
+	size_t argc = 4;
+	napi_value args[4], result;
+	NAPI_CALL(env, napi_get_cb_info(env, info, &argc, args, NULL, NULL));
+	LeaseRef *reference;
+	Owner *owner = argc == 3 ? get_owner(env, args[0], &reference, false) : NULL;
+	char name[192];
+	double length;
+	if (!owner || !get_string(env, args[1], name, sizeof(name)) || !component(name) ||
+		napi_get_value_double(env, args[2], &length) != napi_ok || length != length || length <= 0 ||
+		length > reference->host->journal_limit || length != (size_t)length)
+		return failure(env, "OWNER_FLUSH_ARGUMENT", EINVAL);
+	pthread_mutex_lock(&reference->host->gate);
+	int error = persist_journal_bytes(reference->host, owner, name, (size_t)length, NULL, 0, false, true);
+	pthread_mutex_unlock(&reference->host->gate);
+	if (error) return failure(env, "OWNER_JOURNAL_UNCERTAIN", error);
+	NAPI_CALL(env, napi_create_double(env, length, &result));
+	return result;
 }
 
 /* Full-image compatibility is reserved for initial/import/header callers. It

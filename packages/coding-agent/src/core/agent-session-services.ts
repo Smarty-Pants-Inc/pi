@@ -63,6 +63,7 @@ export interface CreateAgentSessionServicesOptions {
 export interface CreateAgentSessionFromServicesOptions {
 	services: AgentSessionServices;
 	sessionManager: SessionManager;
+	recovery?: CreateAgentSessionOptions["recovery"];
 	sessionStartEvent?: SessionStartEvent;
 	model?: Model<any>;
 	thinkingLevel?: ThinkingLevel;
@@ -266,6 +267,7 @@ export async function createAgentSessionFromServices(
 		excludeTools: options.excludeTools,
 		noTools: options.noTools,
 		customTools: options.customTools,
+		recovery: options.recovery,
 		sessionStartEvent: options.sessionStartEvent,
 	};
 	const result = await createAgentSession(owner ? bindOrdinaryOptions(sessionOptions, owner) : sessionOptions);

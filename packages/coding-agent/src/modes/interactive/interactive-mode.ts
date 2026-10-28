@@ -3947,7 +3947,8 @@ export class InteractiveMode {
 				// Keep editor active; submissions are queued during compaction.
 				this.autoCompactionEscapeHandler = this.defaultEditor.onEscape;
 				this.defaultEditor.onEscape = () => {
-					this.session.abortCompaction();
+					if (this.session.recovery.required) this.restoreQueuedMessagesToEditor({ abort: true });
+					else this.session.abortCompaction();
 				};
 				const colorFn = isEmbeddedStatus(this.editor)
 					? (text: string) =>
@@ -4019,7 +4020,8 @@ export class InteractiveMode {
 				// Set up escape to abort retry
 				this.retryEscapeHandler = this.defaultEditor.onEscape;
 				this.defaultEditor.onEscape = () => {
-					this.session.abortRetry();
+					if (this.session.recovery.required) this.restoreQueuedMessagesToEditor({ abort: true });
+					else this.session.abortRetry();
 				};
 				this.showStatusIndicator(
 					new RetryStatusIndicator(this.ui, event.attempt, event.maxAttempts, event.delayMs, event.waitMessage),
@@ -5322,7 +5324,35 @@ export class InteractiveMode {
 		}
 	}
 
+	private requiredQueueRestore?: Promise<void>;
+
+	private async restoreRequiredQueuedMessages(): Promise<void> {
+		const messages = this.session.agent.getQueuedMessages();
+		const compaction = [...this.compactionQueuedMessages];
+		const { steering, followUp } = await this.session.cancelAndClearQueue();
+		// Do not remove input typed while durability/join was pending.
+		const captured = new Set(compaction);
+		this.compactionQueuedMessages = this.compactionQueuedMessages.filter((message) => !captured.has(message));
+		const queued = [...steering, ...followUp, ...compaction.map((message) => message.input.text)];
+		const imageText = this.recoveryText(messages, true);
+		if (imageText) queued.push(imageText);
+		const current = this.editor.getExpandedText?.() ?? this.editor.getText();
+		if (queued.length) this.editor.setText([...queued, current].filter((text) => text.trim()).join("\n\n"));
+		this.updatePendingMessagesDisplay();
+		this.ui.requestRender();
+	}
+
 	private restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
+		if (this.session.recovery.required) {
+			if (!this.requiredQueueRestore) {
+				this.requiredQueueRestore = this.restoreRequiredQueuedMessages()
+					.catch((error: unknown) => this.showError(error instanceof Error ? error.message : String(error)))
+					.finally(() => {
+						this.requiredQueueRestore = undefined;
+					});
+			}
+			return 0;
+		}
 		// Snapshot complete content before clearQueue destroys the native queues.
 		const messages = this.session.agent.getQueuedMessages();
 		const { steering, followUp } = this.clearAllQueues();
@@ -6312,8 +6342,8 @@ export class InteractiveMode {
 
 					// The user committed to navigating: stop the active response first.
 					if (this.session.isStreaming) {
-						this.restoreQueuedMessagesToEditor();
-						await this.session.abort();
+						if (!this.session.recovery.required) this.restoreQueuedMessagesToEditor();
+						await this.session.interruptForLifecycle("tree-navigation");
 					}
 
 					// Recheck after the dialogs and streaming abort, before replacing another operation's UI.

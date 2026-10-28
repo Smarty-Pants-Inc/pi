@@ -222,6 +222,8 @@ async function runLoop(
 			}
 			let preparedMessages: AgentMessage[] = [];
 			if (lastCompletedTurn) {
+				if (config.assertProviderPermission)
+					await raceSetupAbort(() => config.assertProviderPermission!(signal), signal);
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
 				if (nextTurnSnapshot) {
 					currentContext = nextTurnSnapshot.context ?? currentContext;
@@ -262,6 +264,8 @@ async function runLoop(
 			let requestUpdate: AgentRequestUpdate | undefined;
 			let requestAborted = false;
 			try {
+				if (config.assertProviderPermission)
+					await raceSetupAbort(() => config.assertProviderPermission!(signal), signal);
 				const prepared = await raceSetupAbort(
 					() =>
 						config.prepareRequest?.(
@@ -552,6 +556,13 @@ async function streamAssistantResponse(
 			messages = await raceSetupAbort(() => config.transformContext!(messages, signal), signal);
 		}
 
+		if (config.assertProviderPermission) await raceSetupAbort(() => config.assertProviderPermission!(signal), signal);
+		if (config.projectProviderContext) {
+			messages = await raceSetupAbort(() => config.projectProviderContext!(messages, signal), signal);
+			if (config.assertProviderPermission)
+				await raceSetupAbort(() => config.assertProviderPermission!(signal), signal);
+		}
+
 		// Convert to LLM-compatible messages (AgentMessage[] → Message[]).
 		const llmMessages = await raceSetupAbort(() => config.convertToLlm(messages), signal);
 		const llmContext = normalizeContext({ messages: llmMessages });
@@ -561,16 +572,18 @@ async function streamAssistantResponse(
 			(await raceSetupAbort(() => config.getApiKey?.(config.model.provider), signal)) || config.apiKey;
 		// Register cancellation before invoking StreamFn, and let setup settlement
 		// race it. Do not reinterpret a settled stream or failure at consumption time.
+		const assertProviderPermission = config.assertProviderPermission;
 		response = lazyStream(
 			config.model,
-			() =>
-				Promise.resolve(
-					streamFunction(config.model, llmContext, {
-						...config,
-						apiKey: resolvedApiKey,
-						signal,
-					}),
-				),
+			assertProviderPermission
+				? async () => {
+						await assertProviderPermission(signal);
+						return streamFunction(config.model, llmContext, { ...config, apiKey: resolvedApiKey, signal });
+					}
+				: () =>
+						Promise.resolve(
+							streamFunction(config.model, llmContext, { ...config, apiKey: resolvedApiKey, signal }),
+						),
 			signal,
 		);
 	} catch (error) {

@@ -2207,6 +2207,7 @@ static napi_value init(napi_env env, napi_value exports) {
 		{"appendJournal", NULL, append_journal, NULL, NULL, NULL, napi_default, NULL},
 		{"appendTerminalJournal", NULL, append_journal, NULL, NULL, NULL, napi_default, (void *)2},
 		{"verifyJournal", NULL, append_journal, NULL, NULL, NULL, napi_default, (void *)1},
+		{"flushJournal", NULL, flush_journal, NULL, NULL, NULL, napi_default, NULL},
 		{"prepareLaunch", NULL, prepare_launch, NULL, NULL, NULL, napi_default, NULL},
 		{"dispatchLaunch", NULL, dispatch_launch, NULL, NULL, NULL, napi_default, NULL},
 		{"stopLaunch", NULL, stop_launch, NULL, NULL, NULL, napi_default, NULL},
@@ -2241,6 +2242,7 @@ static napi_value init(napi_env env, napi_value exports) {
 	NAPI_CALL(env, napi_set_named_property(env, exports, "resourceAbi", abi));
 	NAPI_CALL(env, napi_set_named_property(env, exports, "permissionAbi", abi));
 	NAPI_CALL(env, napi_set_named_property(env, exports, "hMeterAbi", abi));
+	NAPI_CALL(env, napi_set_named_property(env, exports, "journalFlushAbi", abi));
 	return exports;
 }
 

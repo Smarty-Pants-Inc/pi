@@ -410,6 +410,11 @@ function createExtensionAPI(
 
 	const api = {
 		// Registration methods - write to extension
+		registerSessionRecovery(recovery: NonNullable<Extension["sessionRecovery"]>): void {
+			assertRegistration();
+			if (extension.sessionRecovery) throw new Error("RECOVERY_BINDING_DUPLICATE");
+			extension.sessionRecovery = recovery;
+		},
 		on(event: string, handler: HandlerFn): () => void {
 			assertRegistration();
 			const registeredHandler = bindExtensionMetadataCallback(extension.path, handler);
