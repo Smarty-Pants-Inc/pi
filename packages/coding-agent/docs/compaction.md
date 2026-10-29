@@ -127,17 +127,21 @@ For split user-message spans, Pi generates two summaries and merges them:
 
 ### Failures, Cancellation, and Deadline
 
-Manual and automatic session compaction have a **20-minute total deadline**, starting before compaction authentication and extension preparation. History and turn-prefix summaries, retries, and retry backoff share that deadline. It is not reset when a request completes or a retry starts. Expiry reports a compaction failure; explicit cancellation reports an aborted compaction. Late summary results cannot append a checkpoint.
+Manual and automatic session compaction use a **five-minute primary phase and a four-minute fallback phase** by default. Preparation hooks, authentication, history and turn-prefix summaries, retries, and retry backoff share the primary phase; finishing a request or starting a retry does not reset it. The configured phases together cannot exceed nine minutes. Expiry reports a compaction failure; explicit cancellation reports an aborted compaction. Late summary results cannot append a checkpoint.
 
 Built-in manual and automatic compaction allow **two transient retries shared across history and turn-prefix summaries**, in addition to each summary's initial call. A one-summary compaction therefore makes at most three attempts. A split compaction that needs both summaries starts with two initial calls and can use up to two additional retry calls across them. Retries use the existing classifier and exponential backoff per summary: two retries on one summary wait 2s then 4s, while one retry in each summary waits 2s for each. Failed partial text or thinking can be discarded and retried for tool-free summaries; failed partial summaries never become checkpoints. This does not permit ordinary assistant turns or tool-call output to replay. Non-retryable failures and cancellation are not retried. Ordinary agent and branch-summary requests still use `settings.retry`; changing that setting does not change compaction's allowance.
 
-Why 20 minutes: a split compaction can require two serial summary requests. The default allows two ten-minute SDK request windows in total, with retries using the remaining time rather than adding more windows. Ten minutes is the existing OpenAI SDK request-timeout precedent, not a measured bound for every provider. The normal history-summary output allowance remains 13,107 tokens with the default reserve, and reasoning effort is unchanged. This limit bounds an operation that could otherwise wait indefinitely; it does not guarantee that every model or long history can finish within it.
+After an eligible retryable primary failure or primary deadline expiry, Pi allows **one fallback-model request for the entire operation**, with no fallback retry. For a split compaction, that request sees the original history, original turn prefix, and previous summary together. It does not repeat preparation or substitute a partial summary for the original input. The fallback budget includes its model/authentication setup. The selected main model and its model-change history do not change. Unknown, denied, or unauthenticated fallback models fail visibly; deterministic provider errors, incomplete length-capped summaries, and operator cancellation do not admit fallback.
+
+`compaction.maxSummaryTokens` defaults to 8000 independently of compaction reserves and triggers. Split primary summaries share that allowance, including their merge markers and exact file-operation suffix. Primary and fallback prompts request concise goal, state, open items, file paths, and next steps while preserving active requirements and references. Provider output limits are requested, but a gateway may strip them: **prompt caps do not bound latency**. Before append, Pi rejects a checkpoint whose `ceil(summary.length / 4)` estimate exceeds the allowance, without truncating it. This is a character-based estimate, not exact model tokenization or a mechanical proof of semantic completeness.
 
 If compaction fails or is cancelled before a new prompt, `prompt()` rejects without appending or sending that prompt. The processed text and attachments stay in the existing steering queue, or the follow-up queue when requested. `preflightResult` receives `false`. Recover the queued input before resubmitting it to avoid duplicates. A failed between-turn compaction also stops continuation rather than sending unchanged oversized context.
 
 Interactive input queued during compaction is only submitted after a successful, non-aborted result. When compaction ran before a new prompt, that queued input joins the new prompt's run as steering or follow-up input instead of racing it. If the new prompt then fails before its run starts, the queued input starts its own run. Failure and cancellation leave its text and steering/follow-up modes unchanged. These queues are in memory, not durable storage; process loss can still lose them.
 
-The deadline aborts requests and stops Pi's waits. It cannot force an extension or provider that ignores its signal to stop remote work; their late promises remain observed, but their results do not restart compaction or publish a summary.
+The phase deadlines abort requests and stop the native compaction phase waits. They are **not yet a whole-call wall-time guarantee**: manual entry first waits for the prior operation to abort, and external ownership joins, enclosing settlement/disposal, and already-dispatched failure notifications can outlive the phase. Timers also cannot preempt synchronous JavaScript. An extension or provider that ignores cancellation can continue remote work; late promises remain observed, but their results cannot restart compaction or append a checkpoint.
+
+Print mode observes the existing terminal `compaction_end` event. A non-aborted failure exits nonzero even when the last ordinary assistant response succeeded or an extension caught the compaction error. Later print prompts are not submitted; existing `input_rejected` records return their text and attachments. JSON mode does not add a new terminal event type. Fabric's optional `fabric.session.compaction_failed` alarm is best-effort mesh publication, not a watchdog-delivery receipt; it does not start another compaction.
 
 ### Cut Point Rules
 
@@ -173,8 +177,13 @@ interface CompactionEntry<T = unknown> {
 interface CompactionDetails {
   readFiles: string[];
   modifiedFiles: string[];
+  durationMs?: number;           // Native summary operation, including auth/retries/fallback
+  summaryChars?: number;         // Final summary UTF-16 length, including file-operation suffix
+  summaryTokensEstimate?: number; // ceil(summaryChars / 4), not exact tokenizer count
 }
 ```
+
+Successful native compactions persist these measurements in the existing session JSONL entry's `details`. `durationMs` excludes preparation, checkpoint append, ownership settlement, and extension hooks. Provider `usage.output` remains separate: it can include thinking and multiple successful summary calls, so it is not final-summary length. Failed operations append no checkpoint or checkpoint metrics. These fields are recorded for every successful native compaction, not only the first 20.
 
 Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure. Generated and extension-provided summaries store their LLM `usage` when available so session totals include summarization work.
 
@@ -441,7 +450,11 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
-    "keepRecentTokens": 20000
+    "keepRecentTokens": 20000,
+    "maxSummaryTokens": 8000,
+    "primaryTimeoutMs": 300000,
+    "fallbackTimeoutMs": 240000,
+    "fallbackModel": "cliproxyapi-anthropic/claude-opus-5-5"
   }
 }
 ```
@@ -451,6 +464,12 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | `enabled` | `true` | Enable auto-compaction |
 | `reserveTokens` | `16384` | Tokens to reserve for LLM response |
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
+| `maxSummaryTokens` | `8000` | Shared checkpoint output allowance, an integer from 1 to 8000 |
+| `primaryTimeoutMs` | `300000` | Shared primary phase budget in milliseconds |
+| `fallbackTimeoutMs` | `240000` | Single fallback phase budget in milliseconds |
+| `fallbackModel` | `cliproxyapi-anthropic/claude-opus-5-5` | Exact provider/model ID used only for compaction fallback |
+
+Timeout settings must be positive safe integers whose sum is at most 540000 milliseconds. They bound native waits, not remote computation or billing when a provider ignores cancellation.
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.
 
@@ -472,7 +491,7 @@ Use `compaction.modelOverrides` to tune token budgets for different models:
 }
 ```
 
-For a model with a 1M context window, this override triggers compaction above 600K tokens and keeps the ordinary 20000 recent tokens. Other models retain the ordinary 16384-token reserve. `reserveTokens` also influences summarization output limits, capped by the model's maximum output tokens; it is not solely a trigger threshold.
+For a model with a 1M context window, this override triggers compaction above 600K tokens and keeps the ordinary 20000 recent tokens. Other models retain the ordinary 16384-token reserve. Native compaction output instead uses the independent shared `maxSummaryTokens` allowance, capped per request by the model's maximum output tokens. Direct summarization helpers that do not receive native output limits retain their reserve-derived defaults.
 
 Keys are exact, case-sensitive `provider/modelId` values, including any slashes within the model ID. Each `reserveTokens` and `keepRecentTokens` value falls back independently from the model override to the ordinary setting to the built-in default. Values must be non-negative safe integers. Invalid values in the matching model override produce an error when read; only omitted fields fall back to the ordinary setting. Model override entries must be objects. Invalid ordinary token settings produce an error when read, even if the active model has a valid override. Only omitted ordinary values use built-in defaults. `enabled` remains global, not model-specific.
 

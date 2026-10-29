@@ -19,6 +19,41 @@ const CompactionSettingsSchema = Type.Object({
 	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
 	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
+	maxSummaryTokens: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: 8000,
+			default: SETTINGS_DEFAULTS.compaction.maxSummaryTokens,
+			description:
+				"Output allowance for one complete compaction checkpoint, shared across history and turn-prefix summaries; independent of reserves and triggering. Provider enforcement is not guaranteed.",
+		}),
+	),
+	primaryTimeoutMs: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: 539999,
+			default: SETTINGS_DEFAULTS.compaction.primaryTimeoutMs,
+			description:
+				"Shared primary compaction deadline in milliseconds, including preparation, hooks, auth and retries. The effective primaryTimeoutMs + fallbackTimeoutMs must not exceed 540000; validated at runtime.",
+		}),
+	),
+	fallbackTimeoutMs: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: 539999,
+			default: SETTINGS_DEFAULTS.compaction.fallbackTimeoutMs,
+			description:
+				"Deadline for the single fallback phase, including auth and completion observers. The effective primaryTimeoutMs + fallbackTimeoutMs must not exceed 540000; validated at runtime.",
+		}),
+	),
+	fallbackModel: Type.Optional(
+		Type.String({
+			description:
+				"Exact provider/modelId used for one compaction-only request after primary transient retries or deadline exhaustion. Does not change the selected main model.",
+			pattern: "^[^/\\s]+/\\S+$",
+			default: SETTINGS_DEFAULTS.compaction.fallbackModel,
+		}),
+	),
 	modelOverrides: Type.Optional(
 		Type.Record(Type.String(), CompactionModelOverrideSchema, {
 			description: 'Per-model overrides keyed by exact "provider/modelId" strings.',

@@ -96,6 +96,7 @@ import {
 	estimateProjectedContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	isCompactionTimeout,
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
@@ -516,9 +517,6 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
-// A split compaction has two serial summaries. Their requests, retries, and
-// retry backoff share one 20-minute deadline, not a window per attempt.
-const COMPACTION_TIMEOUT_MS = 20 * 60_000;
 // Share two transient retries across both summaries, with 2s-based exponential backoff.
 const COMPACTION_RETRY_POLICY: RetryPolicy = { enabled: true, maxRetries: 2, baseDelayMs: 2000 };
 const ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT = 3;
@@ -558,10 +556,41 @@ interface InputAdmission {
 	transferred?: () => void;
 }
 
-function startCompactionDeadline(controller: AbortController): ReturnType<typeof setTimeout> {
-	return setTimeout(() => {
-		controller.abort(new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
-	}, COMPACTION_TIMEOUT_MS);
+/** Separate phase deadlines from operator cancellation so primary expiry can admit fallback. */
+function createCompactionBudget(
+	cancellation: AbortSignal,
+	settings: { primaryTimeoutMs: number; fallbackTimeoutMs: number },
+) {
+	let controller = new AbortController();
+	let signal = AbortSignal.any([cancellation, controller.signal]);
+	let fallbackStarted = false;
+	const startDeadline = (phase: AbortController, milliseconds: number, label: string) =>
+		setTimeout(() => phase.abort(new DOMException(label, "TimeoutError")), milliseconds);
+	let timeout = startDeadline(
+		controller,
+		settings.primaryTimeoutMs,
+		`Primary compaction exceeded its ${settings.primaryTimeoutMs}ms deadline`,
+	);
+	return {
+		get signal() {
+			return signal;
+		},
+		startFallback: () => {
+			cancellation.throwIfAborted();
+			if (fallbackStarted) throw new Error("Compaction fallback allowance already spent");
+			fallbackStarted = true;
+			clearTimeout(timeout);
+			controller = new AbortController();
+			signal = AbortSignal.any([cancellation, controller.signal]);
+			timeout = startDeadline(
+				controller,
+				settings.fallbackTimeoutMs,
+				`Fallback compaction exceeded its ${settings.fallbackTimeoutMs}ms deadline`,
+			);
+			return signal;
+		},
+		clear: () => clearTimeout(timeout),
+	};
 }
 
 /** Explicit cancellation aborts the signal. Deadline expiry and error text alone are failures. */
@@ -995,6 +1024,7 @@ export class AgentSession {
 	private async _getSummarizationRequestAuth(
 		selectedModel: Model<any>,
 		signal?: AbortSignal,
+		requireAuth = false,
 	): Promise<{
 		model: Model<any>;
 		apiKey?: string;
@@ -1010,7 +1040,9 @@ export class AgentSession {
 					signal,
 				})
 			: { model: selectedModel, thinkingLevel: this.thinkingLevel };
-		if (this.agent.streamFunction === streamSimple) {
+		// An abandoned virtual route must not begin a fresh auth lookup after its phase ends.
+		signal?.throwIfAborted();
+		if (requireAuth || this.agent.streamFunction === streamSimple) {
 			return { ...(await this._getRequiredRequestAuth(model, signal)), thinkingLevel };
 		}
 
@@ -5472,33 +5504,76 @@ export class AgentSession {
 		customInstructions: string | undefined,
 		signal: AbortSignal,
 		reason: "manual" | "threshold" | "overflow",
+		budget: ReturnType<typeof createCompactionBudget>,
 		attempt?: OriginalCompactionAttempt,
 	): Promise<CompactionResult> {
 		this.#ordinaryOwner?.requestProvenance.interrupt(new Error("OWNER_REQUEST_CAPTURE_AUXILIARY"));
+		const startedAt = performance.now();
 		// Resolve only for Pi's own summary, within the operation-wide deadline.
-		const request = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
+		const primarySignal = budget.signal;
+		let request: Awaited<ReturnType<AgentSession["_getSummarizationRequestAuth"]>>;
+		try {
+			primarySignal.throwIfAborted();
+			request = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, primarySignal), primarySignal);
+		} catch (error) {
+			if (!isCompactionTimeout(error, primarySignal)) throw error;
+			// Expired primary auth cannot issue a late primary request. compact() admits
+			// the same single fallback before invoking the already-expired primary.
+			request = { model, thinkingLevel: this.thinkingLevel };
+		}
 		const callbacks = this._summarizationRetryCallbacks({ source: "compaction", reason });
 		const stream = this.agent.streamFunction;
 		const summaryStream: typeof stream = attempt ? (...args) => attempt.request(() => stream(...args)) : stream;
 		let originalFailure: { cause: unknown } | undefined;
 		try {
-			return await raceWithAbortSignal(
+			const result = await raceWithAbortSignal(
 				compact(
 					preparation,
 					request.model,
 					request.apiKey,
 					request.headers,
 					customInstructions,
-					signal,
+					primarySignal,
 					request.thinkingLevel,
 					summaryStream,
 					request.env,
 					COMPACTION_RETRY_POLICY,
 					callbacks,
 					undefined, // sessionId
+					{
+						signal,
+						start: budget.startFallback,
+						resolve: async (fallbackSignal) => {
+							const reference = this.settingsManager.getCompactionFallbackModel();
+							const slash = reference.indexOf("/");
+							const fallback = this._modelRuntime.getModel(
+								reference.slice(0, slash),
+								reference.slice(slash + 1),
+							);
+							if (!fallback) throw new Error(`Unknown compaction fallback model: ${reference}`);
+							if (
+								!this.settingsManager.isModelAllowed(fallback) ||
+								!this._modelRuntime.isModelAllowed(fallback)
+							) {
+								throw new Error(`Compaction fallback model denied by model policy: ${reference}`);
+							}
+							const request = await this._getSummarizationRequestAuth(fallback, fallbackSignal, true);
+							if (
+								!this.settingsManager.isModelAllowed(request.model) ||
+								!this._modelRuntime.isModelAllowed(request.model)
+							) {
+								throw new Error(
+									`Resolved compaction fallback model denied by model policy: ${request.model.provider}/${request.model.id}`,
+								);
+							}
+							return request;
+						},
+					},
 				),
 				signal,
 			);
+			if (result.details) result.details.durationMs = performance.now() - startedAt;
+			return result;
 		} catch (cause) {
 			originalFailure = { cause };
 			throw cause;
@@ -5506,7 +5581,8 @@ export class AgentSession {
 			// Also clear a retry indicator when abort wins over an uncooperative
 			// provider. The callback is idempotent and does not restart work.
 			try {
-				await callbacks.onRetryFinished?.(false, 0);
+				const pending = callbacks.onRetryFinished?.(false, 0);
+				if (pending) await raceWithAbortSignal(pending, budget.signal);
 			} catch (cleanup) {
 				if (attempt && originalFailure)
 					// biome-ignore lint/correctness/noUnsafeFinally: Cleanup failure must reject; the original failure is retained as the first cause.
@@ -5574,13 +5650,14 @@ export class AgentSession {
 		attempt?: OriginalCompactionAttempt,
 		inherited?: AbortSignal,
 	): Promise<CompactionResult> {
+		const timeouts = this.settingsManager.getCompactionTimeouts();
 		const controller = new AbortController();
 		this._compactionAbortController = controller;
 		const signals = [controller.signal, attempt?.signal, inherited].filter(
 			(item): item is AbortSignal => item !== undefined,
 		);
 		const signal = signals.length > 1 ? AbortSignal.any(signals) : controller.signal;
-		const timeout = startCompactionDeadline(controller);
+		const budget = createCompactionBudget(signal, timeouts);
 		let fromExtension = false;
 		let cancelledByExtension = false;
 		let originalStateCleared = false;
@@ -5615,18 +5692,24 @@ export class AgentSession {
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (!attempt && this._extensionRunner.hasHandlers("session_before_compact")) {
-				const result = (await this._emitCompactionHook(
-					{
-						type: "session_before_compact",
-						preparation,
-						branchEntries: pathEntries,
-						customInstructions,
-						reason: "manual",
-						willRetry: false,
-						signal,
-					},
-					signal,
-				)) as SessionBeforeCompactResult | undefined;
+				let result: SessionBeforeCompactResult | undefined;
+				try {
+					result = await this._emitCompactionHook(
+						{
+							type: "session_before_compact",
+							preparation,
+							branchEntries: pathEntries,
+							customInstructions,
+							reason: "manual",
+							willRetry: false,
+							signal: budget.signal,
+						},
+						budget.signal,
+					);
+				} catch (error) {
+					if (!isCompactionTimeout(error, budget.signal)) throw error;
+					// Runner drafts are detached. Ignore late results; never replay the hook.
+				}
 
 				if (result?.cancel) {
 					cancelledByExtension = true;
@@ -5660,6 +5743,7 @@ export class AgentSession {
 					customInstructions,
 					signal,
 					"manual",
+					budget,
 					attempt,
 				);
 				summary = result.summary;
@@ -5669,10 +5753,10 @@ export class AgentSession {
 				details = result.details;
 			}
 
-			signal.throwIfAborted();
+			budget.signal.throwIfAborted();
 
-			if (attempt) await attempt.settle();
-			signal.throwIfAborted();
+			if (attempt) await raceWithAbortSignal(attempt.settle(), budget.signal);
+			budget.signal.throwIfAborted();
 			attempt?.check();
 			let compactionId: string;
 			if (attempt) {
@@ -5726,7 +5810,7 @@ export class AgentSession {
 						reason: "manual",
 						willRetry: false,
 					},
-					signal,
+					budget.signal,
 				);
 			}
 
@@ -5741,7 +5825,6 @@ export class AgentSession {
 			attempt?.check();
 			// Manual listeners may submit queued prompts. The selected operation's
 			// separate owner fence remains active through all completion hooks.
-			clearTimeout(timeout);
 			this._completingCompaction = controller;
 			clearManualState();
 			this._emit({
@@ -5751,6 +5834,8 @@ export class AgentSession {
 				aborted: false,
 				willRetry: false,
 			});
+			// A throwing terminal listener still enters phase-bounded failure notification.
+			budget.clear();
 			return compactionResult;
 		} catch (error) {
 			if (attempt) {
@@ -5767,7 +5852,7 @@ export class AgentSession {
 				try {
 					await this._emitSessionCompactFailed(
 						{ reason: "manual", errorMessage, aborted, willRetry: false, fromExtension },
-						signal,
+						budget.signal,
 						true,
 						() => {
 							try {
@@ -5801,7 +5886,7 @@ export class AgentSession {
 			const errorMessage = aborted ? undefined : `Compaction failed: ${message}`;
 			await this._emitSessionCompactFailed(
 				{ reason: "manual", errorMessage, aborted, willRetry: false, fromExtension },
-				signal,
+				budget.signal,
 				false,
 				() => {
 					clearManualState();
@@ -5817,7 +5902,7 @@ export class AgentSession {
 			);
 			throw aborted ? new Error("Compaction cancelled", { cause: error }) : error;
 		} finally {
-			clearTimeout(timeout);
+			budget.clear();
 			clearManualState();
 			if (this._completingCompaction === controller) this._completingCompaction = undefined;
 		}
@@ -6082,7 +6167,7 @@ export class AgentSession {
 		this._autoCompactionAbortController = controller;
 		this.#auditState("auto_compaction_preparing");
 		const signal = controller.signal;
-		const timeout = startCompactionDeadline(controller);
+		const budget = createCompactionBudget(signal, settings);
 		let started = false;
 		let fromExtension = false;
 		let cancelledByExtension = false;
@@ -6106,18 +6191,24 @@ export class AgentSession {
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
-				const extensionResult = (await this._emitCompactionHook(
-					{
-						type: "session_before_compact",
-						preparation,
-						branchEntries: pathEntries,
-						customInstructions: undefined,
-						reason,
-						willRetry,
-						signal,
-					},
-					signal,
-				)) as SessionBeforeCompactResult | undefined;
+				let extensionResult: SessionBeforeCompactResult | undefined;
+				try {
+					extensionResult = await this._emitCompactionHook(
+						{
+							type: "session_before_compact",
+							preparation,
+							branchEntries: pathEntries,
+							customInstructions: undefined,
+							reason,
+							willRetry,
+							signal: budget.signal,
+						},
+						budget.signal,
+					);
+				} catch (error) {
+					if (!isCompactionTimeout(error, budget.signal)) throw error;
+					// Detached hook drafts/results cannot alter fallback's original input.
+				}
 
 				if (extensionResult?.cancel) {
 					cancelledByExtension = true;
@@ -6129,7 +6220,6 @@ export class AgentSession {
 					fromExtension = true;
 				}
 			}
-			signal.throwIfAborted();
 
 			let summary: string;
 			let firstKeptEntryId: string;
@@ -6146,7 +6236,14 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Shared default summary generator, also used by manual compaction.
-				const compactResult = await this.#runDefaultCompaction(preparation, model, undefined, signal, reason);
+				const compactResult = await this.#runDefaultCompaction(
+					preparation,
+					model,
+					undefined,
+					signal,
+					reason,
+					budget,
+				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
 				tokensBefore = compactResult.tokensBefore;
@@ -6154,7 +6251,7 @@ export class AgentSession {
 				details = compactResult.details;
 			}
 
-			signal.throwIfAborted();
+			budget.signal.throwIfAborted();
 
 			const compactionId = this.sessionManager.appendCompaction(
 				summary,
@@ -6179,7 +6276,7 @@ export class AgentSession {
 						reason,
 						willRetry,
 					},
-					signal,
+					budget.signal,
 				);
 			}
 
@@ -6191,10 +6288,10 @@ export class AgentSession {
 				usage,
 				details,
 			};
-			clearTimeout(timeout);
 			this._completingCompaction = controller;
 			if (this._autoCompactionAbortController === controller) this._autoCompactionAbortController = undefined;
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			budget.clear();
 			if (signal.aborted) return "aborted";
 
 			if (willRetry) return true;
@@ -6213,7 +6310,7 @@ export class AgentSession {
 			if (started || signal.aborted) {
 				await this._emitSessionCompactFailed(
 					{ reason, errorMessage, aborted, willRetry: false, fromExtension },
-					signal,
+					budget.signal,
 					false,
 					() =>
 						this._emit({
@@ -6228,7 +6325,7 @@ export class AgentSession {
 			}
 			return aborted ? "aborted" : "failed";
 		} finally {
-			clearTimeout(timeout);
+			budget.clear();
 			if (this._autoCompactionAbortController === controller) this._autoCompactionAbortController = undefined;
 			if (this._completingCompaction === controller) this._completingCompaction = undefined;
 			this.#auditState("auto_compaction_settled");

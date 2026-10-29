@@ -35,6 +35,7 @@ import {
 	type SessionProjection,
 	sessionEntryToContextMessages,
 } from "../session-manager.ts";
+import { SETTINGS_DEFAULTS } from "../settings-defaults.ts";
 import { combineUsage } from "../usage-totals.ts";
 import {
 	computeFileLists,
@@ -54,6 +55,12 @@ import {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/** Native summary-operation time including auth/retries/fallback; excludes checkpoint append and hooks. */
+	durationMs?: number;
+	/** Final checkpoint text UTF-16 code units, including the file-operation suffix. */
+	summaryChars?: number;
+	/** ceil(summaryChars / 4), not exact tokenizer count or provider output usage. */
+	summaryTokensEstimate?: number;
 }
 
 /**
@@ -119,16 +126,36 @@ export interface CompactionResult<T = unknown> {
 // Types
 // ============================================================================
 
+/** Lazy native fallback admission. One request covers the entire prepared operation. */
+export interface CompactionFallbackOptions {
+	/** Operator/inherited cancellation, independent of the primary request deadline. */
+	signal: AbortSignal;
+	/** Start the single bounded fallback phase; its deadline survives through settlement hooks. */
+	start: () => AbortSignal;
+	resolve: (signal: AbortSignal) => Promise<{
+		model: Model<string>;
+		apiKey?: string;
+		headers?: Record<string, string>;
+		env?: Record<string, string>;
+		thinkingLevel?: ThinkingLevel;
+	}>;
+}
+
 export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	/** One candidate-checkpoint output allowance, shared by split summaries. */
+	maxSummaryTokens?: number;
+	primaryTimeoutMs?: number;
+	fallbackTimeoutMs?: number;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
+	maxSummaryTokens: SETTINGS_DEFAULTS.compaction.maxSummaryTokens,
 };
 
 // ============================================================================
@@ -557,10 +584,10 @@ Use this EXACT format:
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise. Preserve every active requirement, unresolved decision, pending/in-flight task ID, exact evidence path, function name, error message, and next step. Consolidate repeated completed history with retained source references rather than repeating its narrative.`;
 
 const UPDATE_SUMMARIZATION_INSTRUCTIONS = `Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
+- PRESERVE every active requirement, unresolved decision, pending/in-flight task ID, exact evidence path, and next step from the previous summary
 - ADD new progress, decisions, and context from the new messages
 - UPDATE the Progress section: move items from "In Progress" to "Done" when completed
 - UPDATE "Next Steps" based on what was accomplished
@@ -577,7 +604,7 @@ Use this EXACT format:
 
 ## Progress
 ### Done
-- [x] [Include previously done items AND newly completed items]
+- [x] [Consolidate repeated completed history with retained source references; include newly completed items]
 
 ### In Progress
 - [ ] [Current work - update based on progress]
@@ -614,6 +641,19 @@ export function getSummarizationFailure(response: AssistantMessage, label: strin
 	return undefined;
 }
 
+/** Retain the terminal response and its usage; never classify the formatted error text. */
+class SummarizationError extends Error {
+	readonly response: AssistantMessage;
+
+	constructor(message: string, response: AssistantMessage) {
+		super(message, { cause: response });
+		this.response = response;
+	}
+}
+
+/** Native checkpoint allocation/validation failure, not a provider or observer error. */
+class CompactionBudgetError extends Error {}
+
 function createSummarizationOptions(
 	model: Model<any>,
 	maxTokens: number,
@@ -631,6 +671,16 @@ function createSummarizationOptions(
 	return options;
 }
 
+interface SummarizationLimits {
+	maxTokens?: number;
+	requestTimeoutMs?: number;
+}
+
+/** Only expiry of this phase, not an observer/auth refusal that coincides with it, admits fallback. */
+export function isCompactionTimeout(error: unknown, signal: AbortSignal): boolean {
+	return signal.aborted && error === signal.reason && error instanceof DOMException && error.name === "TimeoutError";
+}
+
 /**
  * Shared choke point for every compaction/branch-summary summarization call. Wraps the
  * single LLM call in {@link retryAssistantCall} so transient stream drops (e.g.
@@ -645,6 +695,7 @@ export async function completeSummarization(
 	streamFn?: StreamFn,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	requestTimeoutMs?: number,
 ): Promise<AssistantMessage> {
 	assertContextFitsWindow(context.messages, model);
 	// Avoid cache writes for one-off summaries. Reuse caller-supplied routing when available;
@@ -655,29 +706,36 @@ export async function completeSummarization(
 		sessionId: options.sessionId ?? uuidv7(),
 	};
 	const produce = async (): Promise<AssistantMessage> => {
+		const deadline = requestTimeoutMs === undefined ? undefined : new AbortController();
+		const signal = deadline
+			? AbortSignal.any([deadline.signal, ...(requestOptions.signal ? [requestOptions.signal] : [])])
+			: requestOptions.signal;
+		const attemptOptions = { ...requestOptions, signal };
+		const timeout = deadline ? setTimeout(() => deadline.abort(), requestTimeoutMs) : undefined;
 		// Custom streams may ignore cancellation during setup or never publish a terminal event.
 		// The owner must still settle, without accepting a late result or starting another retry.
 		try {
-			requestOptions.signal?.throwIfAborted();
+			signal?.throwIfAborted();
 			if (streamFn) {
-				const stream = await raceWithAbortSignal(
-					Promise.resolve(streamFn(model, context, requestOptions)),
-					requestOptions.signal,
-				);
-				return await raceWithAbortSignal(stream.result(), requestOptions.signal);
+				const stream = await raceWithAbortSignal(Promise.resolve(streamFn(model, context, attemptOptions)), signal);
+				return await raceWithAbortSignal(stream.result(), signal);
 			}
-			return await raceWithAbortSignal(completeSimple(model, context, requestOptions), requestOptions.signal);
+			return await raceWithAbortSignal(completeSimple(model, context, attemptOptions), signal);
 		} catch (error) {
-			if (!requestOptions.signal?.aborted || error !== requestOptions.signal.reason) throw error;
-			// Preserve retryAssistantCall's aborted-response contract, including retry-indicator cleanup.
+			if (!signal?.aborted || error !== signal.reason) throw error;
+			const timedOut = deadline?.signal.aborted && !requestOptions.signal?.aborted;
+			// A request deadline is a retryable summary failure, not operator cancellation.
+			// Optional caller bounds are separate from native phase deadlines; ordinary-turn policies are unchanged.
 			return {
 				role: "assistant",
 				content: [],
 				api: model.api,
 				provider: model.provider,
 				model: model.id,
-				stopReason: "aborted",
-				errorMessage: "Summarization cancelled",
+				stopReason: timedOut ? "error" : "aborted",
+				errorMessage: timedOut
+					? `Summarization request timed out after ${requestTimeoutMs}ms`
+					: "Summarization cancelled",
 				usage: {
 					input: 0,
 					output: 0,
@@ -688,6 +746,8 @@ export async function completeSummarization(
 				},
 				timestamp: Date.now(),
 			};
+		} finally {
+			clearTimeout(timeout);
 		}
 	};
 	// Failed summaries are never persisted or replayed as context, so their partial text/thinking
@@ -698,7 +758,22 @@ export async function completeSummarization(
 			(message.role !== "system" || !message.toolsAdded?.length) &&
 			(message.role !== "assistant" || message.content.every((block) => block.type !== "toolCall")),
 	);
-	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks, (response) =>
+	// Callback failures are not provider failures, even if their text looks transient.
+	// Observe late settlement, but do not spend fallback on an unresponsive observer.
+	const observe = async (invoke: () => void | Promise<void>): Promise<void> => {
+		try {
+			const pending = invoke();
+			if (pending) await raceWithAbortSignal(pending, requestOptions.signal);
+		} catch (cause) {
+			throw new Error("Summarization observer failed", { cause });
+		}
+	};
+	const observers: RetryCallbacks | undefined = callbacks && {
+		onRetryScheduled: (...args) => observe(() => callbacks.onRetryScheduled?.(...args)),
+		onRetryAttemptStart: () => observe(() => callbacks.onRetryAttemptStart?.()),
+		onRetryFinished: (...args) => observe(() => callbacks.onRetryFinished?.(...args)),
+	};
+	return retryAssistantCall(produce, retry, requestOptions.signal, observers, (response) =>
 		isRetryableAssistantError(response, undefined, { discardPartialOutput }),
 	);
 }
@@ -773,9 +848,10 @@ export async function generateSummaryWithUsage(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	limits?: SummarizationLimits,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
+		limits?.maxTokens ?? Math.floor(0.8 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
 
@@ -783,6 +859,9 @@ export async function generateSummaryWithUsage(
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
+	}
+	if (limits?.maxTokens !== undefined) {
+		basePrompt += `\n\nCheckpoint output allowance: at most ${maxTokens} tokens for this part. Preserve all active requirements and exact continuation references; consolidate completed history. This is a prompt target, not a guaranteed tokenizer bound.`;
 	}
 
 	// Serialize conversation to text so model doesn't try to continue it
@@ -815,12 +894,16 @@ export async function generateSummaryWithUsage(
 		streamFn,
 		retry,
 		callbacks,
+		limits?.requestTimeoutMs,
 	);
 
-	if (response.stopReason === "aborted") throw new DOMException("Compaction cancelled", "AbortError");
+	if (response.stopReason === "aborted") {
+		signal?.throwIfAborted();
+		throw new DOMException("Compaction cancelled", "AbortError");
+	}
 	const failure = getSummarizationFailure(response, "Summarization");
 	if (failure) {
-		throw new Error(failure);
+		throw new SummarizationError(failure, response);
 	}
 	if (response.content.some((block) => block.type === "toolCall")) {
 		throw new Error("Summarization attempted to call a tool");
@@ -1005,6 +1088,11 @@ export function prepareCompaction(
 // Main compaction function
 // ============================================================================
 
+const FALLBACK_SUMMARIZATION_INSTRUCTIONS = `Create a continuation checkpoint targeting approximately 6000 summary tokens. This target is advisory, not a completeness guarantee or a hard cap.
+Preserve EVERY active requirement, unresolved decision, pending/in-flight task ID, exact evidence path, and next step.
+Consolidate repeated completed history using retained source references rather than repeating its narrative. For completed history this consolidation takes precedence over the earlier instruction to preserve all existing information.
+Later retained messages are stored separately. Do not infer, reconstruct, or summarize those later messages.`;
+
 const TURN_PREFIX_SUMMARIZATION_PROMPT = `The messages above are earlier context from an ongoing conversation. Later messages are stored separately and do not need to be reconstructed.
 
 Create a concise checkpoint of the user's request and the progress shown above. This checkpoint will be placed before the later messages so the conversation can continue with the necessary context.
@@ -1041,7 +1129,9 @@ export async function compact(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
-): Promise<CompactionResult> {
+	fallback?: CompactionFallbackOptions,
+): Promise<CompactionResult<CompactionDetails>> {
+	const startedAt = performance.now();
 	const {
 		firstKeptEntryId,
 		messagesToSummarize,
@@ -1052,6 +1142,34 @@ export async function compact(
 		fileOps,
 		settings,
 	} = preparation;
+
+	const maxSummaryTokens = settings.maxSummaryTokens ?? SETTINGS_DEFAULTS.compaction.maxSummaryTokens;
+	if (!Number.isSafeInteger(maxSummaryTokens) || maxSummaryTokens < 1 || maxSummaryTokens > 8000) {
+		throw new Error("Invalid compaction.maxSummaryTokens: expected an integer from 1 to 8000");
+	}
+	const fileLists = computeFileLists(fileOps);
+	const { readFiles, modifiedFiles } = fileLists;
+	const fileSuffix = formatFileOperations(fileLists);
+	const turnSeparator = "\n\n---\n\n**Turn Context (split turn):**\n\n";
+	const hasPrefix = isSplitTurn && turnPrefixMessages.length > 0;
+	// A prior checkpoint is history too, even when the kept boundary starts this turn.
+	const split = hasPrefix && (messagesToSummarize.length > 0 || previousSummary !== undefined);
+	const fixedHistory = hasPrefix && !split ? "No prior history." : "";
+	const suffixTokens = Math.ceil(fileSuffix.length / 4);
+	const outputBudget =
+		maxSummaryTokens - suffixTokens - Math.ceil((fixedHistory.length + (hasPrefix ? turnSeparator.length : 0)) / 4);
+	const historyBudget = split ? Math.floor((outputBudget * 2) / 3) : outputBudget;
+	const prefixBudget = split ? outputBudget - historyBudget : outputBudget;
+	const validateSummary = (text: string): string => {
+		const checkpoint = text + fileSuffix;
+		const estimate = Math.ceil(checkpoint.length / 4);
+		if (estimate > maxSummaryTokens) {
+			throw new CompactionBudgetError(
+				`Compaction summary estimate ${estimate} exceeds maxSummaryTokens ${maxSummaryTokens}; checkpoint was not saved`,
+			);
+		}
+		return checkpoint;
+	};
 
 	// One retry allowance for the operation, not a fresh allowance for each
 	// split summary. Do not mutate the caller's policy or retry ordinary turns.
@@ -1073,17 +1191,66 @@ export async function compact(
 			},
 		};
 	}
-	signal?.throwIfAborted();
 
 	// Generate summaries and merge into one
 	let summary: string;
 	let summaryUsage: Usage;
+	let completedPrimaryUsage: Usage | undefined;
 
-	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		let historyText = previousSummary ?? "No prior history.";
-		let historyUsage: Usage | undefined;
-		if (messagesToSummarize.length > 0) {
-			const historyResult = await generateSummaryWithUsage(
+	try {
+		signal?.throwIfAborted();
+		if (outputBudget < (split ? 2 : 1)) {
+			throw new CompactionBudgetError(
+				"Compaction output allowance cannot fit the retained references and split summary",
+			);
+		}
+		if (hasPrefix) {
+			let historyText = previousSummary ?? "No prior history.";
+			let historyUsage: Usage | undefined;
+			if (split) {
+				const historyResult = await generateSummaryWithUsage(
+					messagesToSummarize,
+					model,
+					settings.reserveTokens,
+					apiKey,
+					headers,
+					signal,
+					customInstructions,
+					previousSummary,
+					thinkingLevel,
+					streamFn,
+					env,
+					retry,
+					callbacks,
+					sessionId,
+					{ maxTokens: historyBudget },
+				);
+				historyText = historyResult.text;
+				historyUsage = historyResult.usage;
+				completedPrimaryUsage = historyUsage;
+			}
+			signal?.throwIfAborted();
+			const turnPrefixResult = await generateTurnPrefixSummary(
+				turnPrefixMessages,
+				model,
+				settings.reserveTokens,
+				apiKey,
+				headers,
+				env,
+				signal,
+				thinkingLevel,
+				streamFn,
+				retry,
+				callbacks,
+				sessionId,
+				{ maxTokens: prefixBudget },
+			);
+			// Merge into single summary
+			summary = `${historyText}${turnSeparator}${turnPrefixResult.text}`;
+			summaryUsage = historyUsage ? combineUsage(historyUsage, turnPrefixResult.usage) : turnPrefixResult.usage;
+		} else {
+			// Just generate history summary
+			const result = await generateSummaryWithUsage(
 				messagesToSummarize,
 				model,
 				settings.reserveTokens,
@@ -1098,55 +1265,76 @@ export async function compact(
 				retry,
 				callbacks,
 				sessionId,
+				{ maxTokens: outputBudget },
 			);
-			historyText = historyResult.text;
-			historyUsage = historyResult.usage;
+			summary = result.text;
+			summaryUsage = result.usage;
 		}
-		signal?.throwIfAborted();
-		const turnPrefixResult = await generateTurnPrefixSummary(
-			turnPrefixMessages,
-			model,
-			settings.reserveTokens,
-			apiKey,
-			headers,
-			env,
-			signal,
-			thinkingLevel,
-			streamFn,
-			retry,
-			callbacks,
-			sessionId,
-		);
-		// Merge into single summary
-		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
-		summaryUsage = historyUsage ? combineUsage(historyUsage, turnPrefixResult.usage) : turnPrefixResult.usage;
-	} else {
-		// Just generate history summary
-		const result = await generateSummaryWithUsage(
-			messagesToSummarize,
-			model,
-			settings.reserveTokens,
-			apiKey,
-			headers,
-			signal,
-			customInstructions,
-			previousSummary,
-			thinkingLevel,
-			streamFn,
-			env,
-			retry,
-			callbacks,
-			sessionId,
-		);
-		summary = result.text;
-		summaryUsage = result.usage;
+		completedPrimaryUsage = summaryUsage;
+		summary = validateSummary(summary);
+	} catch (error) {
+		fallback?.signal.throwIfAborted();
+		const deadlineExpired = signal !== undefined && isCompactionTimeout(error, signal);
+		const primaryError = deadlineExpired ? signal.reason : error;
+		const eligible =
+			deadlineExpired ||
+			error instanceof CompactionBudgetError ||
+			(error instanceof SummarizationError &&
+				isRetryableAssistantError(error.response, undefined, { discardPartialOutput: true }));
+		if (!fallback || !eligible) throw primaryError;
+		// Discard partial summaries, not original input. A split operation gets ONE
+		// coalesced request, including previous history and the original turn prefix.
+		const fallbackSignal = fallback.start();
+		try {
+			fallbackSignal.throwIfAborted();
+			if (maxSummaryTokens - suffixTokens < 1) {
+				throw new CompactionBudgetError("Compaction output allowance cannot fit the retained file references");
+			}
+			const request = await raceWithAbortSignal(fallback.resolve(fallbackSignal), fallbackSignal);
+			fallbackSignal.throwIfAborted();
+			const instructions = [
+				customInstructions,
+				FALLBACK_SUMMARIZATION_INSTRUCTIONS,
+				isSplitTurn
+					? "The conversation includes an earlier prefix of an ongoing turn. Preserve its original request, progress, and context needed to understand the later retained messages; do not reconstruct those later messages."
+					: undefined,
+			]
+				.filter(Boolean)
+				.join("\n\n");
+			const result = await raceWithAbortSignal(
+				generateSummaryWithUsage(
+					[...messagesToSummarize, ...turnPrefixMessages],
+					request.model,
+					settings.reserveTokens,
+					request.apiKey,
+					request.headers,
+					fallbackSignal,
+					instructions,
+					previousSummary,
+					request.thinkingLevel,
+					streamFn,
+					request.env,
+					undefined,
+					undefined,
+					sessionId,
+					{ maxTokens: maxSummaryTokens - suffixTokens },
+				),
+				fallbackSignal,
+			);
+			fallbackSignal.throwIfAborted();
+			summary = validateSummary(result.text);
+			summaryUsage = completedPrimaryUsage ? combineUsage(completedPrimaryUsage, result.usage) : result.usage;
+		} catch (fallbackError) {
+			const failure = fallbackSignal.aborted ? fallbackSignal.reason : fallbackError;
+			throw new AggregateError(
+				[primaryError, failure],
+				`Primary compaction failed: ${primaryError instanceof Error ? primaryError.message : String(primaryError)}; fallback compaction failed: ${failure instanceof Error ? failure.message : String(failure)}`,
+				{ cause: primaryError },
+			);
+		}
 	}
 
-	signal?.throwIfAborted();
-	// Compute file lists and append to summary
-	const fileLists = computeFileLists(fileOps);
-	const { readFiles, modifiedFiles } = fileLists;
-	summary += formatFileOperations(fileLists);
+	(fallback?.signal ?? signal)?.throwIfAborted();
 
 	if (!firstKeptEntryId) {
 		throw new Error("First kept entry has no UUID - session may need migration");
@@ -1157,7 +1345,13 @@ export async function compact(
 		firstKeptEntryId,
 		tokensBefore,
 		usage: summaryUsage,
-		details: { readFiles, modifiedFiles } as CompactionDetails,
+		details: {
+			readFiles,
+			modifiedFiles,
+			durationMs: performance.now() - startedAt,
+			summaryChars: summary.length,
+			summaryTokensEstimate: Math.ceil(summary.length / 4),
+		},
 	};
 }
 
@@ -1177,14 +1371,19 @@ async function generateTurnPrefixSummary(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	limits?: SummarizationLimits,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
-		Math.floor(0.5 * reserveTokens),
+		limits?.maxTokens ?? Math.floor(0.5 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	); // Smaller budget for turn prefix
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
-	const promptText = `# Conversation\n${conversationText}\n\n# Instructions\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
+	const allowance =
+		limits?.maxTokens === undefined
+			? ""
+			: `\n\nCheckpoint output allowance: at most ${maxTokens} tokens for this part. Preserve all active requirements, pending/in-flight task IDs, exact file/evidence paths and the next step; consolidate repeated completed history. This is a prompt target, not a guaranteed tokenizer bound.`;
+	const promptText = `# Conversation\n${conversationText}\n\n# Instructions\n${TURN_PREFIX_SUMMARIZATION_PROMPT}${allowance}`;
 
 	const response = await completeSummarization(
 		model,
@@ -1193,12 +1392,16 @@ async function generateTurnPrefixSummary(
 		streamFn,
 		retry,
 		callbacks,
+		limits?.requestTimeoutMs,
 	);
 
-	if (response.stopReason === "aborted") throw new DOMException("Compaction cancelled", "AbortError");
+	if (response.stopReason === "aborted") {
+		signal?.throwIfAborted();
+		throw new DOMException("Compaction cancelled", "AbortError");
+	}
 	const failure = getSummarizationFailure(response, "Turn prefix summarization");
 	if (failure) {
-		throw new Error(failure);
+		throw new SummarizationError(failure, response);
 	}
 	if (response.content.some((block) => block.type === "toolCall")) {
 		throw new Error("Turn prefix summarization attempted to call a tool");
