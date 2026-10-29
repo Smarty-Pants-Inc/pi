@@ -98,6 +98,33 @@
           "maximum": 9007199254740991,
           "default": 20000
         },
+        "maxSummaryTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8000,
+          "default": 8000,
+          "description": "Output allowance for one complete compaction checkpoint, shared across history and turn-prefix summaries; independent of reserves and triggering. Provider enforcement is not guaranteed."
+        },
+        "primaryTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 539999,
+          "default": 300000,
+          "description": "Shared primary compaction deadline in milliseconds, including preparation, hooks, auth and retries. The effective primaryTimeoutMs + fallbackTimeoutMs must not exceed 540000; validated at runtime."
+        },
+        "fallbackTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 539999,
+          "default": 240000,
+          "description": "Deadline for the single fallback phase, including auth and completion observers. The effective primaryTimeoutMs + fallbackTimeoutMs must not exceed 540000; validated at runtime."
+        },
+        "fallbackModel": {
+          "type": "string",
+          "description": "Exact provider/modelId used for one compaction-only request after primary transient retries or deadline exhaustion. Does not change the selected main model.",
+          "pattern": "^[^/\\s]+/\\S+$",
+          "default": "cliproxyapi-anthropic/claude-opus-5-5"
+        },
         "modelOverrides": {
           "type": "object",
           "patternProperties": {

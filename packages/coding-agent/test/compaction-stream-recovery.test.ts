@@ -126,9 +126,9 @@ async function localSse(failure: Failure, failureCount: number, partial = true) 
 	return fixture;
 }
 
-function localModel(baseUrl: string): Model<"openai-responses"> {
+function localModel(baseUrl: string, id = "local-compaction-probe"): Model<"openai-responses"> {
 	return {
-		id: "local-compaction-probe",
+		id,
 		name: "Local compaction probe",
 		api: "openai-responses",
 		provider: "openai",
@@ -159,9 +159,22 @@ async function compactableSession(fixture: Awaited<ReturnType<typeof localSse>>)
 	};
 	const auth = AuthStorage.inMemory({ openai: { type: "api_key", key: "local-fixture-key" } });
 	const registry = await createInMemoryModelRegistry(auth);
+	const fallback = localModel(fixture.baseUrl, "local-compaction-fallback-probe");
+	// #17478: both summary models use a declared real adapter and the same loopback-only endpoint.
+	registry.registerProvider(model.provider, {
+		baseUrl: fixture.baseUrl,
+		api: model.api,
+		apiKey: "local-fixture-key",
+		models: [model, fallback],
+	});
 	const manager = SessionManager.inMemory();
 	const settings = SettingsManager.inMemory({
-		compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 1024 },
+		compaction: {
+			enabled: true,
+			keepRecentTokens: 1,
+			reserveTokens: 1024,
+			fallbackModel: `${fallback.provider}/${fallback.id}`,
+		},
 		retry: { enabled: false, maxRetries: 7, baseDelayMs: 0 },
 	});
 	const session = new AgentSession({
@@ -277,6 +290,34 @@ describe("compaction recovery across the real local Responses SSE boundary", () 
 		expect(JSON.stringify(manager.getEntries())).not.toContain(partialText);
 	});
 
+	// #17478: primary exhaustion crosses the real SDK/SSE boundary before compaction-only fallback.
+	it.each(["manual", "auto"] as const)("uses one fallback after %s primary exhaustion", async (path) => {
+		const fixture = await localSse("eof", 3);
+		const { session, manager, events, model } = await compactableSession(fixture);
+		if (path === "manual") {
+			await expect(session.compact()).resolves.toMatchObject({ summary: expect.stringContaining(recoveredText) });
+		} else {
+			await session.prompt(triggeringText);
+			await session.waitForIdle();
+		}
+		expect(fixture.errors).toEqual([]);
+		expect(fixture.requests.map((request) => request.model)).toEqual([
+			model.id,
+			model.id,
+			model.id,
+			"local-compaction-fallback-probe",
+			...(path === "auto" ? [model.id] : []),
+		]);
+		expect(session.model).toBe(model);
+		expect(events.filter((event) => event.type === "summarization_retry_scheduled")).toHaveLength(2);
+		const checkpoints = manager.getEntries().filter((entry) => entry.type === "compaction");
+		expect(checkpoints).toHaveLength(1);
+		expect(checkpoints[0]?.summary).toContain(recoveredText);
+		expect(JSON.stringify(manager.getEntries())).not.toContain(partialText);
+		expect(manager.getEntries().filter((entry) => entry.type === "model_change")).toEqual([]);
+		expect(events.filter((event) => event.type === "agent_start")).toHaveLength(path === "auto" ? 1 : 0);
+	});
+
 	it.each(failures)("keeps follow-ups through %s failure and recovery", async (failure) => {
 		const fixture = await localSse(failure, Number.POSITIVE_INFINITY);
 		const { session, manager, events, settings } = await compactableSession(fixture);
@@ -317,10 +358,14 @@ describe("compaction recovery across the real local Responses SSE boundary", () 
 				retryQueues,
 			}),
 		);
-		// Two operation-wide retries, independent of disabled ordinary settings.retry.
-		// Soft assertions let the original-source probe also verify recovery and queue delivery.
-		expect.soft(fixture.requests).toHaveLength(3);
-		expect.soft(retryQueues).toEqual([
+		// Two primary retries plus one fallback request, independent of ordinary settings.retry.
+		expect(fixture.requests.map((request) => request.model)).toEqual([
+			"local-compaction-probe",
+			"local-compaction-probe",
+			"local-compaction-probe",
+			"local-compaction-fallback-probe",
+		]);
+		expect(retryQueues).toEqual([
 			{ steering: [steeringText], followUps: [queuedText] },
 			{ steering: [steeringText], followUps: [queuedText] },
 		]);

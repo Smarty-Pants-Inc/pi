@@ -41,10 +41,13 @@ export interface PrintModeOptions {
 export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise<number> {
 	const { mode, messages = [], initialMessage, initialImages, maxProviderRequests } = options;
 	const inputPlan = takeModeInputPlan(options, initialMessage, initialImages, messages);
+	const pendingInputs = [...(inputPlan.initial ? [inputPlan.initial] : []), ...inputPlan.remaining];
+	let nextInputIndex = 0;
 	let exitCode = 0;
 	let providerRequests = 0;
 	let requestLimitError: Error | undefined;
 	let limitReported = false;
+	let compactionError: string | undefined;
 	const requestLimitCancellation = new AbortController();
 	const requestGuard =
 		maxProviderRequests === undefined
@@ -75,6 +78,30 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			// remains subscribed until final events have been persisted and emitted.
 			outputCancellation.abort(new Error("Print transport cancelled for terminal shutdown"));
 			try {
+				// These occurrences never reached native admission. Return their raw
+				// payloads separately; native disposal rejects its own retained queues.
+				if (nextInputIndex < pendingInputs.length) {
+					const unsubmitted = pendingInputs.slice(nextInputIndex);
+					const rejection: RpcInputRejectedEvent = {
+						type: "input_rejected",
+						reason: "shutdown",
+						sessionId: session.sessionId,
+						error: "INPUT_ADMISSION_SHUTDOWN: remaining print input was not submitted",
+						messages: unsubmitted.map((input) => ({
+							role: "user",
+							content: [{ type: "text", text: input.text }, ...(input.images ?? [])],
+							timestamp: Date.now(),
+						})),
+					};
+					if (mode === "json") writeRawStdout(`${JSON.stringify(rejection)}\n`);
+					else
+						console.error(
+							"Print input delivery incomplete: remaining prompts were not submitted",
+							JSON.stringify(rejection.messages),
+						);
+					nextInputIndex = pendingInputs.length;
+					exitCode = 1;
+				}
 				await runtimeHost.dispose({
 					terminal: true,
 					rejectQueuedInput: (messages, owner) => {
@@ -153,6 +180,30 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		session = runtimeHost.session;
 		if (requestGuard) session.modelRuntime.providerRequestGuard = requestGuard;
 		settledOutcome = undefined;
+		compactionError = undefined;
+		unsubscribe?.();
+		unsubscribeBackpressure?.();
+		unsubscribe = session.subscribe((event) => {
+			if (event.type === "agent_settled") settledOutcome = event.outcome;
+			if (event.type === "compaction_end") {
+				if (event.result) compactionError = undefined;
+				else if (!event.aborted) compactionError = event.errorMessage ?? "Compaction failed";
+			}
+			writeRetryNotice(event);
+			if (mode === "json") {
+				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
+			}
+		});
+		unsubscribeBackpressure =
+			mode === "json"
+				? session.agent.subscribe(async () => {
+						try {
+							await raceWithAbortSignal(waitForRawStdoutBackpressure(), outputCancellation.signal);
+						} catch (cause) {
+							if (!outputCancellation.signal.aborted || cause !== outputCancellation.signal.reason) throw cause;
+						}
+					})
+				: undefined;
 		await session.bindExtensions({
 			mode: mode === "json" ? "json" : "print",
 			commandContextActions: {
@@ -182,26 +233,6 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				console.error(`Extension error (${err.extensionPath}): ${err.error}`);
 			},
 		});
-
-		unsubscribe?.();
-		unsubscribeBackpressure?.();
-		unsubscribe = session.subscribe((event) => {
-			if (event.type === "agent_settled") settledOutcome = event.outcome;
-			writeRetryNotice(event);
-			if (mode === "json") {
-				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
-			}
-		});
-		unsubscribeBackpressure =
-			mode === "json"
-				? session.agent.subscribe(async () => {
-						try {
-							await raceWithAbortSignal(waitForRawStdoutBackpressure(), outputCancellation.signal);
-						} catch (cause) {
-							if (!outputCancellation.signal.aborted || cause !== outputCancellation.signal.reason) throw cause;
-						}
-					})
-				: undefined;
 	};
 
 	try {
@@ -219,15 +250,20 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		}
 
 		await rebindSession();
+		if (compactionError) throw new Error(compactionError);
 
-		if (inputPlan.initial) {
-			await promptReceived(session, inputPlan.initial);
-			if (requestLimitError) throw requestLimitError;
-		}
-
-		for (const input of inputPlan.remaining) {
+		while (nextInputIndex < pendingInputs.length) {
+			// Attempted input follows native admission/retention semantics, including
+			// late pre-prompt retention. Reject only untouched mode inputs below.
+			const input = pendingInputs[nextInputIndex++];
 			await promptReceived(session, input);
 			if (requestLimitError) throw requestLimitError;
+			if (compactionError) throw new Error(compactionError);
+		}
+
+		if (mode === "json" && (settledOutcome === "error" || settledOutcome === "aborted")) {
+			const lastAssistant = session.state.messages.findLast((message) => message.role === "assistant");
+			throw new Error(lastAssistant?.errorMessage || `Request ${settledOutcome}`);
 		}
 
 		if (mode === "text") {
@@ -263,7 +299,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		// A signal still runs disposeRuntime() with its bounded drainage.
 		await flushRawStdout();
 	} catch (error: unknown) {
-		console.error(requestLimitError?.message ?? (error instanceof Error ? error.message : String(error)));
+		console.error(
+			requestLimitError?.message ?? compactionError ?? (error instanceof Error ? error.message : String(error)),
+		);
 		limitReported = requestLimitError !== undefined;
 		exitCode = 1;
 	} finally {

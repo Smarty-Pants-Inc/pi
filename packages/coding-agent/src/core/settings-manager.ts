@@ -893,16 +893,61 @@ export class SettingsManager {
 		return this.getCompactionTokenSetting("keepRecentTokens", model);
 	}
 
-	/** Resolve each token setting through model override, ordinary setting, then built-in default. */
+	/** Resolve lazily so invalid fallback configuration cannot break a successful primary summary. */
+	getCompactionFallbackModel(): string {
+		const reference = this.settings.compaction?.fallbackModel ?? SETTINGS_DEFAULTS.compaction.fallbackModel;
+		if (typeof reference !== "string" || !/^[^/\s]+\/\S+$/.test(reference)) {
+			throw new Error(`Invalid compaction.fallbackModel setting: ${String(reference)}. Expected provider/modelId.`);
+		}
+		return reference;
+	}
+
+	getCompactionMaxSummaryTokens(): number {
+		const value = this.settings.compaction?.maxSummaryTokens ?? SETTINGS_DEFAULTS.compaction.maxSummaryTokens;
+		if (!Number.isSafeInteger(value) || value < 1 || value > 8000) {
+			throw new Error(
+				`Invalid compaction.maxSummaryTokens setting: ${String(value)}. Expected an integer from 1 to 8000.`,
+			);
+		}
+		return value;
+	}
+
+	getCompactionTimeouts(): { primaryTimeoutMs: number; fallbackTimeoutMs: number } {
+		const timeouts = {
+			primaryTimeoutMs: SETTINGS_DEFAULTS.compaction.primaryTimeoutMs as number,
+			fallbackTimeoutMs: SETTINGS_DEFAULTS.compaction.fallbackTimeoutMs as number,
+		};
+		for (const field of ["primaryTimeoutMs", "fallbackTimeoutMs"] as const) {
+			const value = this.settings.compaction?.[field];
+			if (value === undefined) continue;
+			if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+				throw new Error(
+					`Invalid compaction.${field} setting: ${String(value)}. Expected a positive finite integer.`,
+				);
+			}
+			timeouts[field] = value;
+		}
+		if (timeouts.primaryTimeoutMs + timeouts.fallbackTimeoutMs > 540000) {
+			throw new Error("Invalid compaction timeouts: primaryTimeoutMs + fallbackTimeoutMs must not exceed 540000ms.");
+		}
+		return timeouts;
+	}
+
+	/** Resolve token overrides independently; phase budgets are shared across models. */
 	getCompactionSettings(model?: Pick<Model<string>, "provider" | "id">): {
 		enabled: boolean;
 		reserveTokens: number;
 		keepRecentTokens: number;
+		maxSummaryTokens: number;
+		primaryTimeoutMs: number;
+		fallbackTimeoutMs: number;
 	} {
 		return {
+			...this.getCompactionTimeouts(),
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(model),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
+			maxSummaryTokens: this.getCompactionMaxSummaryTokens(),
 		};
 	}
 
