@@ -539,17 +539,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 	});
 
-	// Restore missing settings metadata for older sessions.
-	if (hasExistingSession) {
-		if (!hasThinkingEntry) {
+	// A held maintenance projection is not proof of a fresh session. The native
+	// startup pass must authenticate retained records before any metadata append;
+	// it also restores the authenticated model/thinking selection into agent state.
+	const retainedMaintenance =
+		options.recovery?.required &&
+		sessionManager
+			.getEntries()
+			.some((entry) => entry.type === "custom" && entry.customType.startsWith("pi-maintenance:"));
+	if (!retainedMaintenance) {
+		// Restore missing settings metadata for older sessions.
+		if (hasExistingSession) {
+			if (!hasThinkingEntry) {
+				sessionManager.appendThinkingLevelChange(thinkingLevel);
+			}
+		} else {
+			// Save initial model and thinking level for new sessions so they can be restored on resume
+			if (model) {
+				sessionManager.appendModelChange(model.provider, model.id);
+			}
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
-	} else {
-		// Save initial model and thinking level for new sessions so they can be restored on resume
-		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
-		}
-		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
 
 	const sessionConfig = {

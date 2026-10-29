@@ -442,10 +442,8 @@ async function lifecycleFixture(required: boolean, extension?: (pi: any) => void
 			manager.getEntries().some((entry) => entry.type === "custom" && entry.customType.startsWith("pi-maintenance:"))
 		)
 			expect(() => manager.getSemanticLeafId()).toThrow("RECOVERY_MAINTENANCE_UNCERTAIN");
-		const reopenSdk = process.env.B3_PATCHED_SDK
-			? (await import(/* @vite-ignore */ pathToFileURL(process.env.B3_PATCHED_SDK).href)).createAgentSession
-			: createAgentSession;
-		const opened = await reopenSdk({
+		const beforeSdk = readFileSync(file);
+		const opened = await createAgentSession({
 			cwd: h.tempDir,
 			agentDir: h.tempDir,
 			model: h.getModel(),
@@ -458,6 +456,9 @@ async function lifecycleFixture(required: boolean, extension?: (pi: any) => void
 		});
 		session = opened.session;
 		sessions.push(session);
+		// Data-safety regression: the original SDK must not append metadata while
+		// the retained native checkpoint is still unauthenticated.
+		expect(readFileSync(file).equals(beforeSdk)).toBe(true);
 		await session.bindExtensions({});
 		return session;
 	};
@@ -587,22 +588,18 @@ describe.skipIf(!realAvailable)("native maintenance with real B5/B6/B3", () => {
 			value: { records: [] },
 		});
 	});
-	// Known factory prerequisite outside this task's named source ownership. The
-	// kept SDK guard is opt-in; without it this is an honest expected RED, not reopen qualification.
-	(process.env.B3_PATCHED_SDK ? it : it.fails)(
-		"reopen authenticates a consumed checkpoint (requires caller SDK metadata guard)",
-		async () => {
-			const f = await lifecycleFixture(true);
-			f.h.setResponses(Array.from({ length: 4 }, () => fauxAssistantMessage("saved summary")));
-			await f.session.compact();
-			const expectedLeaf = f.session.sessionManager.getSemanticLeafId();
-			const physicalCalls = f.h.faux.state.callCount;
-			const reopened = await f.reopen();
-			expect(reopened.sessionManager.getSemanticLeafId()).toBe(expectedLeaf);
-			expect(reopened.recovery.phase).toBe("READY");
-			expect(f.h.faux.state.callCount).toBe(physicalCalls); // Never a successor summary.
-		},
-	);
+	// RECOVERY-LIFECYCLE-001: real SDK reopen, no patched SDK copy or expected-failure waiver.
+	it("reopen authenticates a consumed checkpoint without initial metadata writes", async () => {
+		const f = await lifecycleFixture(true);
+		f.h.setResponses(Array.from({ length: 4 }, () => fauxAssistantMessage("saved summary")));
+		await f.session.compact();
+		const expectedLeaf = f.session.sessionManager.getSemanticLeafId();
+		const physicalCalls = f.h.faux.state.callCount;
+		const reopened = await f.reopen();
+		expect(reopened.sessionManager.getSemanticLeafId()).toBe(expectedLeaf);
+		expect(reopened.recovery.phase).toBe("READY");
+		expect(f.h.faux.state.callCount).toBe(physicalCalls); // Never a successor summary.
+	});
 	it("inference deadline expiry still consumes its failure plan using separate B5/B6 recovery I/O budgets", async () => {
 		const f = await lifecycleFixture(true),
 			realNow = Date.now.bind(Date),
@@ -764,7 +761,7 @@ describe.skipIf(!realAvailable)("native maintenance with real B5/B6/B3", () => {
 		expect(mutations.some((entry: any) => entry.type === "model_change" && entry.modelId === "target-small")).toBe(
 			true,
 		);
-		if (process.env.B3_PATCHED_SDK) expect((await f.reopen()).model?.id).toBe("target-small");
+		expect((await f.reopen()).model?.id).toBe("target-small");
 	});
 	it("forks omit reserved controls and relink the retained path", async () => {
 		const f = await lifecycleFixture(true);
@@ -798,38 +795,33 @@ describe.skipIf(!realAvailable)("native maintenance with real B5/B6/B3", () => {
 		await next.occurrence.completion;
 		await f.b5.releaseRecoveryInputAfterJoin(next.selected, next.occurrence.completion, async () => {});
 		const latest = f.session.sessionManager.getLeafId();
-		if (process.env.B3_PATCHED_SDK) {
-			const reopened = await f.reopen();
-			expect(reopened.sessionManager.getLeafId()).toBe(latest);
-			expect(reopened.messages.filter((message: any) => message.role === "user")).toMatchObject([
-				{ content: [{ type: "text", text: "later genuine original" }] },
-			]);
-		}
+		const reopened = await f.reopen();
+		expect(reopened.sessionManager.getLeafId()).toBe(latest);
+		expect(reopened.messages.filter((message: any) => message.role === "user")).toMatchObject([
+			{ content: [{ type: "text", text: "later genuine original" }] },
+		]);
 	});
-	it.runIf(Boolean(process.env.B3_PATCHED_SDK))(
-		"raw orphan reserved records cannot create an effective leaf even with the SDK guard",
-		async () => {
-			const f = await lifecycleFixture(true),
-				file = f.session.sessionFile!;
-			writeFileSync(
-				file,
-				Buffer.concat([
-					readFileSync(file),
-					Buffer.from(
-						JSON.stringify({
-							id: "forged-checkpoint",
-							parentId: f.session.sessionManager.getLeafId(),
-							type: "custom",
-							timestamp: "2026-10-28T00:00:00Z",
-							customType: "pi-maintenance:checkpoint:v1",
-							data: { requestId: "no-ledger-admission", finalLeafId: null },
-						}) + "\n",
-					),
-				]),
-			);
-			await expect(f.reopen()).rejects.toThrow("RECOVERY_MAINTENANCE_UNCERTAIN");
-		},
-	);
+	it("raw orphan reserved records cannot create an effective leaf through SDK reopen", async () => {
+		const f = await lifecycleFixture(true),
+			file = f.session.sessionFile!;
+		writeFileSync(
+			file,
+			Buffer.concat([
+				readFileSync(file),
+				Buffer.from(
+					JSON.stringify({
+						id: "forged-checkpoint",
+						parentId: f.session.sessionManager.getLeafId(),
+						type: "custom",
+						timestamp: "2026-10-28T00:00:00Z",
+						customType: "pi-maintenance:checkpoint:v1",
+						data: { requestId: "no-ledger-admission", finalLeafId: null },
+					}) + "\n",
+				),
+			]),
+		);
+		await expect(f.reopen()).rejects.toThrow("RECOVERY_MAINTENANCE_UNCERTAIN");
+	});
 	it("E after durable prepare completes the existing plan and cancels only queued originals", async () => {
 		const f = await lifecycleFixture(true),
 			entered = deferred(),
@@ -882,7 +874,7 @@ describe.skipIf(!realAvailable)("native maintenance with real B5/B6/B3", () => {
 		expect(f.stats.afterCompact).toBe(1);
 		expect(f.h.faux.state.callCount).toBe(2);
 	});
-	it.runIf(Boolean(process.env.B3_PATCHED_SDK)).each(["ADMITTED", "ADMITTED_AFTER_ACTIVE_JOIN", "PREPARED"] as const)(
+	it.each(["ADMITTED", "ADMITTED_AFTER_ACTIVE_JOIN", "PREPARED"] as const)(
 		"receiving binding settles retained %s without successor inference (same-process transfer)",
 		async (state) => {
 			const f = await lifecycleFixture(true);
