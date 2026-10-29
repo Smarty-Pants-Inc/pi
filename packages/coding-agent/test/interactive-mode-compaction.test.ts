@@ -329,6 +329,7 @@ describe("InteractiveMode compaction events", () => {
 			compactionQueueWork: new Set<Promise<void>>(),
 			recoveredImages: new Map<string, ImageContent>(),
 			session: {
+				recovery: { required: false },
 				clearQueue: vi.fn(),
 				prompt: vi.fn().mockReturnValue(prompt),
 				steer: vi.fn(),
@@ -387,6 +388,7 @@ describe("InteractiveMode compaction events", () => {
 				compactionQueueWork: new Set<Promise<void>>(),
 				recoveredImages: new Map<string, ImageContent>(),
 				session: {
+					recovery: { required: false },
 					prompt: vi.fn(() => prompt),
 					clearQueue: vi.fn(),
 					steer: vi.fn(),
@@ -428,7 +430,7 @@ describe("InteractiveMode compaction events", () => {
 		const ui = {
 			clearAllQueues: () => ({ steering: [], followUp: [] }),
 			updatePendingMessagesDisplay: vi.fn(),
-			session: { abort, agent: { getQueuedMessages: () => [] } },
+			session: { recovery: { required: false }, abort, agent: { getQueuedMessages: () => [] } },
 			recoveryText: () => "",
 		};
 		const restoreQueuedMessagesToEditor = Reflect.get(InteractiveMode.prototype, "restoreQueuedMessagesToEditor") as (
@@ -449,6 +451,7 @@ describe("InteractiveMode compaction events", () => {
 			compactionQueueWork: new Set<Promise<void>>(),
 			recoveredImages: new Map<string, ImageContent>(),
 			session: {
+				recovery: { required: false },
 				clearQueue: vi.fn(),
 				prompt: vi.fn().mockResolvedValue(undefined),
 				steer: vi.fn().mockResolvedValue(undefined),

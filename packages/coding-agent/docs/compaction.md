@@ -22,6 +22,22 @@ Pi has two summarization mechanisms:
 
 Both use closely related structured formats and track file operations cumulatively. Summarization requests disable prompt-cache writes because these one-off prompts are unlikely to be reused.
 
+## REQUIRED recovery maintenance
+
+The workflows and extension examples below otherwise describe ordinary sessions. With `recovery.required`, maintenance is separate from accepted user input: it never creates an empty round or borrows a settled input's permit. The host must compose a complete native recovery binding, B5's `RecoveryMaintenanceAdapter`, and B6's real native-registration/barrier/read ports. A missing base delivery, repair, validation or reconsideration port is an activation error, not a successful no-op.
+
+- Manual compact, model-switch compact and tree navigation reserve synchronously, interrupt/join actual work, then durably admit one immutable operation before summary inference. Tree navigation with an open logical input refuses `RECOVERY_MAINTENANCE_INPUT_SELECTED`.
+- The private current attempt permits only that operation's compact/tree summary. Ordinary turns, bug reports, unknown purposes, virtual summary routing, copied/stale tokens and SC085-only admission cannot borrow it. General input permission stays closed.
+- Before hooks may observe or veto; supplied summaries, cut/instruction/label changes and in-place mutations refuse. Post-append compact/tree observers run only after durable consumption, without maintenance authority.
+- Native authority-free model/thinking/name/label/custom-state controls are barriered under their own native-entry IDs before maintenance or input selection. A model switch that needs compaction includes its model/thinking changes in the frozen plan.
+- Summary Escape and `abortCompaction`/`abortRetry` cancel only the operation. Explicit task abort still durably cancels the real open/queued inputs captured by B5. Before native prepare, cancellation gets a control-only terminal plan; after prepare, the existing plan is finished and its actual result reported. Neither path releases before the real summary request joins.
+- The native prepare WAL retains exact planned bytes. B5's PREPARED state precedes application; B6 registration **and** durable barrier/readback precede CONSUMED. A successor settles the retained plan or closes unprepared work interrupted, never re-summarizes. Inference deadlines are not restamped by settlement.
+- Typed but unsubmitted TUI text stays in the editor. Already admitted B5 queues stay durable. Custom summary prompts and direct tree-label edits are not supported under REQUIRED.
+
+Interrupted-input maintenance requires an original-generation B4 repair receipt and the correct execution branch. The actual automatic-compaction-failure completion edge requests the one durable `auto-compact-retry` slot **before** continuation admission. Missing repair refuses; retry exhaustion holds rather than continuing into another overflow.
+
+**Integration status:** the native gates do not themselves implement the host's B2/B4/B5 delivery/repair pass. The SDK factory must also defer fresh-session metadata writes while a retained maintenance projection is unauthenticated; until that separate factory integration is present, factory checkpoint reopen fails closed. Isolated binding and same-process transfer tests do not establish the whole-host-stop, all-sessions, zero-lost-or-duplicate-effects, ≤120-second qualification.
+
 ## Compaction
 
 ### When It Triggers

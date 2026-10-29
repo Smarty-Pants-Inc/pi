@@ -45,6 +45,43 @@ export interface OriginalCompactionAttempt {
 	failAppend(cause: unknown): never;
 }
 
+/** Shared native one-shot mechanism. It supplies no admission or owner permission. */
+export class NativeOperationScope {
+	readonly #scope = new AsyncLocalStorage<object>();
+	readonly #request = new AsyncLocalStorage<object>();
+	readonly #live = new Set<object>();
+	readonly #seen = new WeakSet<object>();
+	readonly #append = new WeakSet<object>();
+	run<T>(token: object, action: () => T): T {
+		if (this.#seen.has(token)) throw new Error("RECOVERY_MAINTENANCE_TOKEN_REUSED");
+		this.#seen.add(token);
+		this.#live.add(token);
+		return this.#scope.run(token, action);
+	}
+	assert(token: object, request = false): void {
+		if (!this.#live.has(token) || this.#scope.getStore() !== token || (request && this.#request.getStore() !== token))
+			throw new Error("RECOVERY_MAINTENANCE_UNBOUND");
+	}
+	request<T>(token: object, invoke: () => T): T {
+		this.assert(token);
+		return this.#request.run(token, invoke);
+	}
+	beginAppend(token: object): void {
+		this.assert(token);
+		if (this.#append.has(token)) throw new Error("RECOVERY_MAINTENANCE_TOKEN_REUSED");
+		this.#append.add(token);
+	}
+	exit<T>(action: () => T): T {
+		return this.#scope.exit(action);
+	}
+	current(): object | undefined {
+		return this.#scope.getStore();
+	}
+	close(token: object): void {
+		this.#live.delete(token);
+	}
+}
+
 const attemptOwners = new WeakMap<object, { context: OrdinaryOwnerContext; session: AgentSession }>();
 export function assertOriginalCompactionAttempt(
 	attempt: OriginalCompactionAttempt,
@@ -58,8 +95,7 @@ export function assertOriginalCompactionAttempt(
 /** Same-owner serialization and effect DATA. No supplied synchronous check,
  * recorder, qualifier, append function or post-append observer is accepted. */
 export class OriginalCompaction {
-	readonly #scope = new AsyncLocalStorage<object>();
-	readonly #requestScope = new AsyncLocalStorage<object>();
+	readonly #attemptScope = new NativeOperationScope();
 	readonly #bodies = new Set<string>();
 	readonly #limit: number;
 	#bodyBytes = 0;
@@ -103,12 +139,14 @@ export class OriginalCompaction {
 
 	/** Async descendants retain the original request token, not renewed permission. */
 	assertProvider(): void {
-		const token = this.#scope.getStore();
+		const token = this.#attemptScope.current();
 		if (token || this.#active) {
-			assert(
-				this.#active && token === this.#active.token && this.#requestScope.getStore() === token,
-				"OPS_COMPACTION_PROVIDER_SCOPE",
-			);
+			assert(this.#active && token === this.#active.token, "OPS_COMPACTION_PROVIDER_SCOPE");
+			try {
+				this.#attemptScope.assert(token!, true);
+			} catch (cause) {
+				throw new Error("OPS_COMPACTION_PROVIDER_SCOPE", { cause });
+			}
 			this.#active.check();
 		}
 	}
@@ -174,7 +212,7 @@ export class OriginalCompaction {
 			assert(this.#active?.token === token, "OPS_COMPACTION_STALE_ATTEMPT");
 		};
 		this.#active = { token, check };
-		return this.#scope.run(token, async () => {
+		return this.#attemptScope.run(token, async () => {
 			try {
 				check();
 				assert(!this.#historyLost, "OPS_COMPACTION_CONTEXT_HISTORY_LOST");
@@ -189,7 +227,7 @@ export class OriginalCompaction {
 					},
 					request: (invoke) => {
 						check();
-						return this.#requestScope.run(token, invoke);
+						return this.#attemptScope.request(token, invoke);
 					},
 					prepare: (value) => {
 						check();
@@ -206,6 +244,7 @@ export class OriginalCompaction {
 					beginAppend: (result, beforeLeaf) => {
 						check();
 						assert(receipt.append === "not-attempted", "OPS_COMPACTION_APPEND_ONCE");
+						this.#attemptScope.beginAppend(token);
 						this.#exclude(result);
 						receipt.beforeLeaf = beforeLeaf;
 						receipt.summarySha256 = createHash("sha256").update(result.summary).digest("hex");
@@ -289,6 +328,7 @@ export class OriginalCompaction {
 				} finally {
 					if (attempt) attemptOwners.delete(attempt);
 					this.#active = undefined;
+					this.#attemptScope.close(token);
 				}
 			}
 		});

@@ -14,7 +14,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs, { readFileSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { basename, dirname } from "node:path";
@@ -97,6 +97,7 @@ import {
 	estimateProjectedContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	prepareBranchEntries,
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
@@ -162,6 +163,7 @@ import {
 	appendOwnedTerminalEntry,
 	appendOwnedTerminalMessage,
 	type BranchSummaryEntry,
+	buildSessionProjection,
 	type CompactionEntry,
 	type ContextEditEntry,
 	freezeDetached,
@@ -172,15 +174,32 @@ import {
 } from "./session-manager.ts";
 import {
 	type AcceptedRecoveryInput,
+	type AcceptedRecoveryMaintenance,
+	MAINTENANCE_RECOVERY_IO_TIMEOUT_MS,
+	type MaintenanceOperation,
+	type MaintenanceRecord,
+	type NativeMaintenanceAttempt,
+	type NativePlanRef,
 	type NativeTerminalWitness,
 	PI_PROCESS_INCARNATION_ID,
+	type ProviderPurpose,
 	type RecoveryCarrier,
+	type RecoveryGateSubject,
 	type RecoveryOccurrence,
+	type RepairRef,
 	type SessionRecoveryContext,
 	SessionRecoveryControl,
+	SessionRecoveryError,
 	type SessionRecoveryOptions,
 } from "./session-recovery-control.ts";
-import { type NativeRecoveryAppend, withSessionPersistenceScope } from "./session-recovery-persistence.ts";
+import {
+	claimNativeMaintenanceWriter,
+	isMaintenanceControl,
+	type NativeMaintenancePlan,
+	type NativeMaintenanceWriter,
+	type NativeRecoveryAppend,
+	withSessionPersistenceScope,
+} from "./session-recovery-persistence.ts";
 import { appendReceivedCustomMessage, appendReceivedMessage } from "./session-turn-appender.ts";
 import {
 	applyToolModifiers,
@@ -595,15 +614,37 @@ export class AgentSession {
 	readonly #originalAgent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly recovery: SessionRecoveryControl;
-	private readonly _recoveryScope = new AsyncLocalStorage<{ epoch: number; active: boolean; admitted: boolean }>();
+	private readonly _recoveryScope = new AsyncLocalStorage<{
+		epoch: number;
+		active: boolean;
+		admitted: boolean;
+		input?: AcceptedRecoveryInput;
+	}>();
 	private readonly _recoveryEntries = new Map<string, NativeRecoveryAppend>();
 	private _recoveryCarrier?: { resolve(value: RecoveryCarrier): void; reject(error: unknown): void };
 	private _recoveryStartupEpoch = -1;
 	private _recoveryStartup?: { epoch: number; promise: Promise<void> };
 	private readonly _recoveryDeferStartup: boolean;
 	private _recoveryStop?: Promise<void>;
+	private _compactionFailureInput?: AcceptedRecoveryInput;
+	private _compactionFailureEdge?: Promise<void>;
 	private _recoveryRawQueueMutation = false;
 	private _recoveryNativeDispatch = false;
+	private _nativeMaintenanceWriter?: NativeMaintenanceWriter;
+	private _recoveryRun?: Promise<void>;
+	private readonly _recoveryCommitted = new Set<string>();
+	private readonly _maintenanceRecords = new Map<string, MaintenanceRecord>();
+	private readonly _maintenanceRequests = new Set<Promise<unknown>>();
+	private readonly _maintenanceEntryRequests = new Map<string, string>();
+	private _maintenanceDraft?: {
+		attempt: NativeMaintenanceAttempt;
+		entries: SessionEntry[];
+		parentId: string | null;
+		observers: Array<() => Promise<void>>;
+		commitModel?: () => void;
+	};
+	private _maintenanceModelCommit = false;
+	private readonly _recoveryJoinEdges = new Map<string, Promise<void>>();
 	private readonly _rawAgentAbort: () => void | Promise<void>;
 	#contextUsageCache: { revision: number; contextWindow: number; usage: ContextUsage } | undefined;
 	readonly settingsManager: SettingsManager;
@@ -849,7 +890,8 @@ export class AgentSession {
 				void this._recoveryStop.catch(() => {});
 			},
 			join: async () => {
-				await this._recoveryStop;
+				// A rejected run has joined too. B4/native readback, not a rejection, decides whether its effects are safe.
+				await Promise.allSettled([this._recoveryStop, this._recoveryRun]);
 				await this.waitForIdle();
 			},
 		});
@@ -857,6 +899,24 @@ export class AgentSession {
 			if (!sessionManager.isPersisted() || !sessionManager.getRecoveryPersistenceState().preparedOpen)
 				throw this.recovery.block("RECOVERY_PREPARED_OPEN_REQUIRED");
 			sessionManager.assertRecoveryExclusion();
+			this._nativeMaintenanceWriter = claimNativeMaintenanceWriter(sessionManager);
+			this._nativeMaintenanceWriter.attribute((entry) => {
+				const requestId = this._maintenanceEntryRequests.get(entry.id);
+				if (requestId) return { kind: "maintenance", requestId };
+				const actual = entry as SessionEntry;
+				if (actual.type === "custom" && actual.customType === "pi-maintenance:prepare:v1")
+					return {
+						kind: "maintenance",
+						requestId: (actual.data as { plan: NativeMaintenancePlan }).plan.requestId,
+					};
+				const input = this.recovery.input ?? this._recoveryScope.getStore()?.input;
+				if (input) return { kind: "input", input: structuredClone(input) };
+				return ["model_change", "thinking_level_change", "label", "session_info", "custom", "usage"].includes(
+					entry.type,
+				)
+					? { kind: "control" }
+					: { kind: "unattributed" };
+			});
 			sessionManager.enableRecoveryPersistence();
 			if (
 				sessionManager.getRecoveryPersistenceState().needsRecovery &&
@@ -1042,7 +1102,15 @@ export class AgentSession {
 			sessionId: this.sessionId,
 			sessionFile: this.sessionFile ?? "",
 			processIncarnationId: PI_PROCESS_INCARNATION_ID,
-			epoch,
+			epoch: this.recovery.identity,
+			isReady: () => {
+				this.recovery.assertEpoch(epoch);
+				return this.recovery.phase === "READY" && !this.recovery.maintenanceActive;
+			},
+			assertMaintenanceScope: (subject: Readonly<AcceptedRecoveryMaintenance>) => {
+				this.recovery.assertEpoch(epoch);
+				this.recovery.assertMaintenanceCommit(subject);
+			},
 			deliverAccepted: (input: AcceptedRecoveryInput) => this._startRecoveryOccurrence(epoch, input),
 			resumeAccepted: (input: AcceptedRecoveryInput, entryId: string) =>
 				this._startRecoveryOccurrence(epoch, input, entryId),
@@ -1117,6 +1185,81 @@ export class AgentSession {
 		});
 	}
 
+	/** Restore only authenticated native settings; never append replacement metadata while HELD. */
+	private _restoreAuthenticatedRecoverySettings(): void {
+		const projection = this.sessionManager.buildSessionProjection();
+		if (projection.model) {
+			const model = this._modelRuntime.getModel(projection.model.provider, projection.model.modelId);
+			if (!model)
+				throw new SessionRecoveryError(
+					"RECOVERY_MAINTENANCE_UNCERTAIN",
+					`Authenticated model ${projection.model.provider}/${projection.model.modelId} is unavailable`,
+				);
+			this.agent.state.model = model;
+		}
+		this.agent.state.thinkingLevel = clampThinkingLevel(
+			this.agent.state.model,
+			projection.thinkingLevel as ThinkingLevel,
+		) as ThinkingLevel;
+	}
+
+	/** Full native scan + authoritative B5/B6 readback. No summary is started on adoption. */
+	private async _recoverMaintenanceStartup(): Promise<void> {
+		const binding = this.recovery.binding!;
+		const epoch = this.recovery.identity;
+		this._releaseRecoveryPersistence();
+		const native = this.sessionManager.inspectRecoveryEntries();
+		if (native.issues.length) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type !== "custom" || entry.customType !== "pi-maintenance:prepare:v1") continue;
+			const plan = (entry.data as { plan?: NativeMaintenancePlan })?.plan;
+			if (!plan || typeof plan.requestId !== "string")
+				throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+			const read = await binding.maintenance.read(
+				{ sessionId: this.sessionId, requestId: plan.requestId },
+				{ deadlineMs: Date.now() + MAINTENANCE_RECOVERY_IO_TIMEOUT_MS },
+			);
+			if (!read.ok || !read.value.record) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+			this._maintenanceRecords.set(plan.requestId, read.value.record);
+			for (const item of plan.entries) this._maintenanceEntryRequests.set(item.entryId, plan.requestId);
+		}
+		const pending = await binding.maintenance.listPending(this.sessionId, 256, {
+			deadlineMs: Date.now() + MAINTENANCE_RECOVERY_IO_TIMEOUT_MS,
+		});
+		if (!pending.ok) throw new SessionRecoveryError(pending.code, pending.message);
+		if (pending.value.records.length > 1) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+		for (const prior of pending.value.records) {
+			const read = await binding.maintenance.read(
+				{ sessionId: this.sessionId, requestId: prior.request.requestId },
+				{ deadlineMs: Date.now() + MAINTENANCE_RECOVERY_IO_TIMEOUT_MS },
+			);
+			if (!read.ok || !read.value.record) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+			const adopted = await binding.maintenance.adoptMaintenance(
+				{ sessionId: this.sessionId, requestId: prior.request.requestId },
+				epoch,
+				read.value.revision,
+				{ deadlineMs: Date.now() + MAINTENANCE_RECOVERY_IO_TIMEOUT_MS },
+			);
+			if (!adopted.ok) throw new SessionRecoveryError(adopted.code, adopted.message);
+			const attempt = this.recovery.reserveMaintenanceAdoption(adopted.value.record);
+			this._nativeMaintenanceWriter!.reserve(attempt, () => false);
+			this._nativeMaintenanceWriter!.joined(attempt);
+			this._maintenanceDraft = { attempt, entries: [], parentId: prior.request.baseLeafId, observers: [] };
+			await this.recovery.runMaintenance(attempt, () =>
+				this._finishMaintenanceAfterJoin(attempt, Promise.resolve(), "RECOVERY_MAINTENANCE_INTERRUPTED"),
+			);
+		}
+		const records = [...this._maintenanceRecords.values()];
+		for (const record of records) {
+			if (record.state !== "CONSUMED") throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+			await binding.validateMaintenanceReceipts(record, [...this._recoveryEntries.values()], epoch);
+			for (const entry of record.completion!.entries) this._recoveryCommitted.add(entry.entryId);
+		}
+		this._nativeMaintenanceWriter!.authenticate(records);
+		if (records.length) this._restoreAuthenticatedRecoverySettings();
+		this._refreshFinalizedContext();
+	}
+
 	/** Strict awaited startup, also used after replacement's rebind/withSession has returned. */
 	async completeRecoveryStartup(reason: SessionReadyEvent["reason"] = "startup"): Promise<void> {
 		if (!this.recovery.required || this._recoveryStartupEpoch === this.recovery.epoch) return;
@@ -1124,6 +1267,8 @@ export class AgentSession {
 		if (this._recoveryStartup?.epoch === epoch) return this._recoveryStartup.promise;
 		const promise = Promise.resolve().then(async () => {
 			try {
+				if (!this.recovery.binding) throw this.recovery.block("RECOVERY_BINDING_REQUIRED");
+				await this._recoverMaintenanceStartup();
 				await this._extensionRunner.emit({
 					type: "session_ready",
 					reason,
@@ -1179,7 +1324,8 @@ export class AgentSession {
 		});
 		void carrier.catch(() => {});
 		this._recoveryCarrier = { resolve, reject };
-		const scope = { epoch, active: true, admitted: false };
+		await this._drainRecoveryDebt();
+		const scope = { epoch, active: true, admitted: false, input };
 		let completion: Promise<void>;
 		if (entryId) {
 			this._releaseRecoveryPersistence();
@@ -1192,6 +1338,29 @@ export class AgentSession {
 				await this.waitForIdle();
 			});
 		}
+		this._recoveryRun = completion;
+		const triggerAutoRetry = async () => {
+			if (
+				this._compactionFailureInput?.admissionId !== input.admissionId ||
+				this.recovery.phase === "RETIRED" ||
+				this.recovery.maintenanceActive ||
+				this.recovery.taskCancellationPending
+			)
+				return;
+			this._compactionFailureInput = undefined;
+			// This is the actual-run completion edge, BEFORE admitContinuation. Admission spends B5's durable original-input slot.
+			await this._runRecoveryMaintenance(
+				{ kind: "auto-compact-retry", retryAnchor: input.originalInputId },
+				() => this.#compactSession(),
+				Date.now(),
+				input.deadlineMs,
+				input,
+			);
+		};
+		this._compactionFailureEdge = completion.then(triggerAutoRetry, triggerAutoRetry);
+		void this._compactionFailureEdge.catch((error) =>
+			this.recovery.block("RECOVERY_MAINTENANCE_RETRY_EXHAUSTED", error),
+		);
 		void completion.catch((error: unknown) => {
 			reject(error);
 			if (epoch === this.recovery.epoch) this.recovery.block("RECOVERY_OCCURRENCE_FAILED", error);
@@ -1226,15 +1395,496 @@ export class AgentSession {
 		}
 	}
 
-	private async _beforeRecoveryProvider(signal?: AbortSignal): Promise<void> {
-		this.sessionManager.assertRecoveryExclusion();
-		await this.recovery.beforeProvider(signal);
-		this._releaseRecoveryPersistence();
-		const epoch = this.recovery.epoch;
-		await this.recovery.binding!.commitNativeEntries([...this._recoveryEntries.values()], this.recovery.input!);
+	private async _commitRecoveryEntries(
+		entries: readonly NativeRecoveryAppend[],
+		subject: RecoveryGateSubject | undefined,
+	): Promise<readonly { entryId: string; bytesSha256: string; seq: number }[]> {
+		if (!entries.length) return [];
+		const epoch = this.recovery.identity;
+		const receipts = await this.recovery.binding!.commitNativeEntries(entries, subject, epoch);
 		this.recovery.assertEpoch(epoch);
+		if (
+			!receipts ||
+			entries.some(
+				(entry) =>
+					!receipts.some(
+						(receipt) =>
+							receipt.entryId === entry.entryId &&
+							receipt.bytesSha256 === entry.bytesSha256 &&
+							Number.isSafeInteger(receipt.seq),
+					),
+			)
+		)
+			throw this.recovery.block("RECOVERY_NATIVE_DURABILITY_UNCONFIRMED");
+		for (const entry of entries) this._recoveryCommitted.add(entry.entryId);
+		return receipts;
+	}
+	private async _drainRecoveryDebt(): Promise<void> {
+		this._releaseRecoveryPersistence();
+		const pending = [...this._recoveryEntries.values()].filter(
+			(entry) => !this._recoveryCommitted.has(entry.entryId),
+		);
+		const controls = pending.filter((entry) => entry.authority?.kind === "control");
+		await this._commitRecoveryEntries(controls, undefined);
+		const inputs = new Map<string, { input: AcceptedRecoveryInput; entries: NativeRecoveryAppend[] }>();
+		for (const entry of pending) {
+			if (entry.authority?.kind !== "input") continue;
+			const input = entry.authority.input;
+			const group = inputs.get(input.deliveryId) ?? { input, entries: [] };
+			group.entries.push(entry);
+			inputs.set(input.deliveryId, group);
+		}
+		for (const group of inputs.values()) await this._commitRecoveryEntries(group.entries, group.input);
+		const unattributed = pending.filter((entry) => !entry.authority || entry.authority.kind === "unattributed");
+		if (unattributed.length) {
+			const epoch = this.recovery.identity;
+			await this.recovery.binding!.verifyNativeEntries(unattributed, epoch); // Read-only existing B6 proof, never borrowed permission.
+			this.recovery.assertEpoch(epoch);
+			for (const entry of unattributed) this._recoveryCommitted.add(entry.entryId);
+		}
+	}
+	private async _beforeRecoveryProvider(signal?: AbortSignal, purpose: ProviderPurpose = "turn"): Promise<void> {
 		this.sessionManager.assertRecoveryExclusion();
-		await this.recovery.beforeProvider(signal);
+		await this.recovery.beforeProvider(signal, purpose);
+		if (this.recovery.currentMaintenance) {
+			this._releaseRecoveryPersistence();
+			if ([...this._recoveryEntries.values()].some((entry) => !this._recoveryCommitted.has(entry.entryId)))
+				throw this.recovery.block("RECOVERY_NATIVE_DURABILITY_UNCONFIRMED");
+		} else await this._drainRecoveryDebt();
+		this.sessionManager.assertRecoveryExclusion();
+		await this.recovery.beforeProvider(signal, purpose);
+	}
+	private _reconcileRecoveryAfterJoin(reason: string): Promise<void> {
+		if (this.recovery.taskCancellationPending) return Promise.resolve();
+		const epoch = this.recovery.identity;
+		const key = JSON.stringify([this.sessionId, epoch.bindingId, epoch.epoch, reason]);
+		const prior = this._recoveryJoinEdges.get(key);
+		if (prior) return prior;
+		const edge = (async () => {
+			this.recovery.assertEpoch(epoch);
+			this.sessionManager.assertRecoveryExclusion();
+			await this._drainRecoveryDebt();
+			await this.recovery.binding!.reconcile(this._recoveryContext(), reason);
+			this.recovery.assertEpoch(epoch);
+			if (this.recovery.phase === "HELD") this.recovery.phase = "READY";
+		})();
+		this._recoveryJoinEdges.set(key, edge);
+		return edge;
+	}
+	private _stageMaintenanceEntry(entry: SessionEntry): void {
+		const draft = this._maintenanceDraft;
+		if (!draft || draft.attempt !== this.recovery.currentMaintenance)
+			throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNBOUND");
+		draft.entries.push(JSON.parse(JSON.stringify(entry)) as SessionEntry);
+		draft.parentId = entry.id;
+		this._maintenanceEntryRequests.set(entry.id, draft.attempt.requestId);
+	}
+	/** Same native compaction shape as SessionManager.appendCompaction, staged until PREPARED. */
+	private _stageMaintenanceCompaction(
+		result: CompactionResult,
+		reason: "manual" | "threshold" | "overflow",
+		willRetry: boolean,
+	): CompactionResult {
+		const timestamp = new Date().toISOString();
+		const systemMessage = getCurrentSystemMessage(this.sessionManager.buildSessionProjection().messages);
+		const entry: CompactionEntry = {
+			type: "compaction",
+			id: randomUUID(),
+			parentId: this._maintenanceDraft!.parentId,
+			timestamp,
+			summary: result.summary,
+			firstKeptEntryId: result.firstKeptEntryId,
+			tokensBefore: result.tokensBefore,
+			details: result.details,
+			usage: result.usage,
+			fromHook: false,
+			...(systemMessage ? { systemMessage: { ...systemMessage, timestamp: new Date(timestamp).getTime() } } : {}),
+		};
+		this._stageMaintenanceEntry(entry);
+		const draft = this._maintenanceDraft!;
+		result.estimatedTokensAfter = estimateMessagesTokens(
+			buildSessionProjection([...this.sessionManager.getBranch(), ...draft.entries], draft.parentId).messages,
+		);
+		draft.observers.push(async () => {
+			result.estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
+			await this._emitCompactionHook({
+				type: "session_compact",
+				compactionEntry: this.sessionManager.getEntry(entry.id) as CompactionEntry,
+				fromExtension: false,
+				reason,
+				willRetry,
+			});
+			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+		});
+		return result;
+	}
+	private _freezeMaintenancePlan(
+		attempt: NativeMaintenanceAttempt,
+		outcome: NativeMaintenancePlan["outcome"],
+		errorCode?: string,
+	): NativeMaintenancePlan {
+		const draft = this._maintenanceDraft!;
+		const checkpointId = randomUUID();
+		this._stageMaintenanceEntry({
+			type: "custom",
+			customType: "pi-maintenance:checkpoint:v1",
+			id: checkpointId,
+			parentId: draft.parentId,
+			timestamp: new Date().toISOString(),
+			data: {
+				requestId: attempt.requestId,
+				operationSha256: attempt.record!.operationSha256,
+				outcome,
+				...(errorCode ? { errorCode } : {}),
+			},
+		});
+		return freezeDetached({
+			requestId: attempt.requestId,
+			operationSha256: attempt.record!.operationSha256,
+			outcome,
+			...(errorCode ? { errorCode } : {}),
+			entries: draft.entries.map((entry) => {
+				const bytes = Buffer.from(JSON.stringify(entry) + "\n");
+				return {
+					entryId: entry.id,
+					parentId: entry.parentId,
+					bytesBase64: bytes.toString("base64"),
+					bytesSha256: createHash("sha256").update(bytes).digest("hex"),
+				};
+			}),
+		});
+	}
+	/** Join the physical stream result, even when cancellation won the outer summary wait. */
+	private _maintenanceStreamRequest(
+		invoke: () => ReturnType<typeof this.agent.streamFunction>,
+	): ReturnType<typeof this.agent.streamFunction> {
+		const request = Promise.resolve().then(invoke);
+		const joined = request.then((stream) => stream.result());
+		this._maintenanceRequests.add(joined);
+		void joined.then(
+			() => this._maintenanceRequests.delete(joined),
+			() => this._maintenanceRequests.delete(joined),
+		);
+		return request;
+	}
+	private async _finishMaintenanceAfterJoin(
+		attempt: NativeMaintenanceAttempt,
+		joined: Promise<void>,
+		failureCode?: string,
+	): Promise<void> {
+		const writer = this._nativeMaintenanceWriter!;
+		const adapter = this.recovery.binding!.maintenance;
+		const epoch = this.recovery.identity;
+		const edge = await adapter.reconcileAfterJoin(
+			{ sessionId: this.sessionId, requestId: attempt.requestId },
+			epoch,
+			{
+				joined,
+				deadlineMs: Date.now() + MAINTENANCE_RECOVERY_IO_TIMEOUT_MS,
+				...(attempt.taskAbort ? { taskAbortRequestId: attempt.taskAbort.requestId } : {}),
+				settle: async (record, prepare) => {
+					this.recovery.assertEpoch(epoch);
+					this.sessionManager.assertRecoveryExclusion();
+					attempt.record = record;
+					const scan = this.sessionManager.inspectRecoveryEntries();
+					if (scan.issues.length) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+					const prepares = this.sessionManager
+						.getEntries()
+						.filter(
+							(entry) =>
+								entry.type === "custom" &&
+								entry.customType === "pi-maintenance:prepare:v1" &&
+								(entry.data as { plan?: NativeMaintenancePlan })?.plan?.requestId === attempt.requestId,
+						);
+					if (prepares.length > 1) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+					let plan: NativeMaintenancePlan;
+					let planRef: NativePlanRef;
+					if (prepares.length) {
+						const entry = prepares[0];
+						if (entry.type !== "custom") throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+						const data = entry.data as { plan: NativeMaintenancePlan; planSha256: string };
+						plan = data.plan;
+						planRef = {
+							entryId: entry.id,
+							bytesSha256: createHash("sha256")
+								.update(JSON.stringify(entry) + "\n")
+								.digest("hex"),
+							planSha256: data.planSha256,
+						};
+					} else {
+						if (record.plan) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+						this._maintenanceDraft!.entries = [];
+						this._maintenanceDraft!.parentId = record.request.baseLeafId;
+						const cancelled = attempt.cancelRequested || attempt.taskAbort !== undefined;
+						plan = this._freezeMaintenancePlan(
+							attempt,
+							cancelled ? "cancelled" : "failed",
+							cancelled ? "RECOVERY_MAINTENANCE_CANCELLED" : (failureCode ?? "RECOVERY_MAINTENANCE_INTERRUPTED"),
+						);
+						planRef = writer.prepare(attempt, plan);
+					}
+					// A complete native prepare beats late cancellation, including an unknown B5 prepare ACK.
+					const prepared = await prepare(planRef);
+					if (!prepared.ok) throw new SessionRecoveryError(prepared.code, prepared.message);
+					attempt.record = prepared.value;
+					for (const item of plan.entries) this._maintenanceEntryRequests.set(item.entryId, attempt.requestId);
+					writer.apply(attempt, plan, prepared.value);
+					this._releaseRecoveryPersistence();
+					const ids = new Set([planRef.entryId, ...plan.entries.map((entry) => entry.entryId)]);
+					const entries = [...this._recoveryEntries.values()].filter((entry) => ids.has(entry.entryId));
+					if (entries.length !== ids.size) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+					const subject: AcceptedRecoveryMaintenance = {
+						admissionKind: "maintenance",
+						sessionId: this.sessionId,
+						requestId: attempt.requestId,
+						epoch,
+						operationSha256: prepared.value.operationSha256,
+						permitRevision: prepared.value.permitRevision,
+						deadlineMs: record.request.deadlineMs,
+					};
+					const receipts = await this._commitRecoveryEntries(entries, subject);
+					const checkpoint = plan.entries.at(-1);
+					if (!checkpoint) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNCERTAIN");
+					return {
+						outcome: plan.outcome,
+						...(plan.errorCode ? { errorCode: plan.errorCode } : {}),
+						checkpointEntryId: checkpoint.entryId,
+						entries: receipts,
+					};
+				},
+				reconcile: async (record) => {
+					attempt.record = record;
+					this._maintenanceRecords.set(attempt.requestId, record);
+					const records = [...this._maintenanceRecords.values()];
+					for (const value of records)
+						await this.recovery.binding!.validateMaintenanceReceipts(
+							value,
+							[...this._recoveryEntries.values()],
+							epoch,
+						);
+					writer.authenticate(records);
+					if (this._maintenanceDraft!.commitModel) this._maintenanceDraft!.commitModel();
+					else this._restoreAuthenticatedRecoverySettings();
+					this._refreshFinalizedContext();
+					if (
+						attempt.operation.kind === "auto-compact-retry" &&
+						!["completed", "noop"].includes(record.completion!.outcome)
+					)
+						throw new SessionRecoveryError("RECOVERY_MAINTENANCE_RETRY_EXHAUSTED");
+					// This pass repairs/admitContinuation only. B5 releases its reservation and drives delivery ONCE afterwards.
+					await this.recovery.binding!.reconcile(this._recoveryContext(), attempt.requestId);
+					this.recovery.assertEpoch(epoch);
+					this._extensionRunner.maintenanceObserverOnly = false;
+					try {
+						await this.recovery.observeOutsideMaintenance(async () => {
+							const cancellation = new AbortController();
+							try {
+								for (const observer of this._maintenanceDraft!.observers)
+									await this._dispatchCancellationScope.run(cancellation.signal, observer);
+							} finally {
+								cancellation.abort(new SessionRecoveryError("RECOVERY_MAINTENANCE_TOKEN_REUSED"));
+							}
+						});
+					} finally {
+						this.recovery.releaseMaintenance(attempt);
+						writer.release(attempt);
+						this._maintenanceDraft = undefined;
+					}
+				},
+			},
+		);
+		if (!edge.ok) throw this.recovery.block(edge.code, new Error(edge.message));
+		if (this.recovery.phase === "HELD") this.recovery.phase = "READY";
+		await this.recovery.binding!.reconsiderMain?.(this._recoveryContext());
+	}
+	private _runRecoveryMaintenance<T>(
+		operation: MaintenanceOperation,
+		execute: () => Promise<T>,
+		issuedAtMs = Date.now(),
+		originatingDeadline?: number,
+		retainedInput?: AcceptedRecoveryInput,
+	): Promise<T> {
+		if (this._isAgentRunActive && this._recoveryScope.getStore()?.epoch === this.recovery.epoch)
+			throw new SessionRecoveryError("RECOVERY_MAINTENANCE_SELF_CALL");
+		const priorInput = retainedInput ?? this.recovery.input,
+			priorRun = this._recoveryRun,
+			priorEpoch = this.recovery.epoch;
+		const deadlineMs = Math.min(
+			issuedAtMs + COMPACTION_TIMEOUT_MS,
+			originatingDeadline ?? Infinity,
+			priorInput?.deadlineMs ?? Infinity,
+		);
+		const attempt = this.recovery.reserveMaintenance(operation, issuedAtMs, deadlineMs);
+		const writer = this._nativeMaintenanceWriter!;
+		try {
+			writer.reserve(
+				attempt,
+				(entry) =>
+					this._recoveryScope.getStore()?.epoch === priorEpoch &&
+					["message", "custom_message", "custom", "usage"].includes(entry.type),
+			);
+		} catch (error) {
+			this.recovery.releaseMaintenance(attempt);
+			return Promise.reject(error);
+		}
+		let finish!: () => void;
+		attempt.completion = new Promise<void>((resolve) => {
+			finish = resolve;
+		});
+		return this.recovery.runMaintenance(attempt, async () => {
+			let failure: { error: unknown } | undefined;
+			let result!: T;
+			let released = false;
+			try {
+				await this.recovery.interrupt(operation.kind, true);
+				await this._recoveryStop;
+				if (priorRun) await priorRun.catch(() => {}); // actual completion; B4 repair below decides whether continuation is safe
+				writer.joined(attempt);
+				await this._drainRecoveryDebt();
+				let repair: RepairRef | undefined;
+				if (priorInput) {
+					if (!this.recovery.binding!.repairMaintenance)
+						throw new SessionRecoveryError("RECOVERY_MAINTENANCE_REPAIR_REQUIRED");
+					repair = await this.recovery.binding!.repairMaintenance(priorInput, this.sessionManager.getLeafId());
+					if (
+						repair.originalInputId !== priorInput.originalInputId ||
+						repair.executionBranchEntryId !== this.sessionManager.getLeafId()
+					)
+						throw new SessionRecoveryError("RECOVERY_MAINTENANCE_REPAIR_REQUIRED");
+				}
+				const branch = this.sessionManager.getBranch(),
+					baseLeafId = this.sessionManager.getLeafId();
+				const baseHistorySha256 = createHash("sha256")
+					.update(
+						JSON.stringify(
+							branch.map((entry) => [
+								entry.id,
+								createHash("sha256")
+									.update(JSON.stringify(entry) + "\n")
+									.digest("hex"),
+							]),
+						),
+					)
+					.digest("hex");
+				const viewSha256 = createHash("sha256")
+					.update(
+						JSON.stringify({
+							baseHistorySha256,
+							model: this.model,
+							thinkingLevel: this.thinkingLevel,
+							compaction: this.settingsManager.getCompactionSettings(this.model),
+							repair,
+						}),
+					)
+					.digest("hex");
+				try {
+					await this.recovery.beginMaintenance(attempt, {
+						version: 1,
+						admissionKind: "maintenance",
+						sessionId: this.sessionId,
+						requestId: attempt.requestId,
+						epoch: this.recovery.identity,
+						operation,
+						baseLeafId,
+						baseHistorySha256,
+						viewSha256,
+						issuedAtMs,
+						deadlineMs,
+						...(repair ? { repair } : {}),
+					});
+				} catch (error) {
+					const read = await this.recovery.binding!.maintenance.read(
+						{ sessionId: this.sessionId, requestId: attempt.requestId },
+						{ deadlineMs: Date.now() + MAINTENANCE_RECOVERY_IO_TIMEOUT_MS },
+					);
+					if (!read.ok) throw this.recovery.block("RECOVERY_MAINTENANCE_UNCERTAIN", read);
+					attempt.record = read.value.record;
+					if (!attempt.record) throw error;
+					failure = { error }; // Unknown begin/admit never restarts computation; settle the same admitted request.
+				}
+				this._maintenanceDraft = { attempt, entries: [], parentId: baseLeafId, observers: [] };
+				this._extensionRunner.maintenanceObserverOnly = true;
+				if (attempt.taskAbort) {
+					const abort = attempt.taskAbort;
+					const captured = await this.recovery.binding!.maintenance.captureTaskAbort(
+						this.sessionId,
+						abort.requestId,
+						this.recovery.identity,
+						abort.at,
+						abort.bootId,
+						{ deadlineMs: Date.now() + MAINTENANCE_RECOVERY_IO_TIMEOUT_MS },
+					);
+					if (!captured.ok) throw new SessionRecoveryError(captured.code, captured.message);
+				}
+				if (!failure && attempt.token) {
+					try {
+						await this.recovery.binding!.maintenance.withMaintenanceAttempt(attempt.token, async (signal) => {
+							const abort = () => attempt.controller.abort(signal.reason);
+							if (signal.aborted) abort();
+							else signal.addEventListener("abort", abort, { once: true });
+							const timer = setTimeout(
+								() => attempt.controller.abort(new SessionRecoveryError("RECOVERY_MAINTENANCE_DEADLINE")),
+								Math.max(0, deadlineMs - Date.now()),
+							);
+							try {
+								attempt.controller.signal.throwIfAborted();
+								result = await execute();
+								attempt.controller.signal.throwIfAborted();
+								if (result && typeof result === "object" && "cancelled" in result && result.cancelled)
+									throw new SessionRecoveryError("RECOVERY_MAINTENANCE_CANCELLED");
+								const plan = this._freezeMaintenancePlan(
+									attempt,
+									this._maintenanceDraft!.entries.length ? "completed" : "noop",
+								);
+								const ref = writer.prepare(attempt, plan);
+								attempt.prepared = true;
+								await this.recovery.prepareMaintenance(ref);
+							} finally {
+								clearTimeout(timer);
+								signal.removeEventListener("abort", abort);
+							}
+						});
+					} catch (error) {
+						failure = { error };
+					}
+				}
+				const requestsJoined = Promise.allSettled([...this._maintenanceRequests]).then(() => {});
+				await requestsJoined; // No successor inference and no cancellation/idle substitute for this join.
+				await this._finishMaintenanceAfterJoin(
+					attempt,
+					requestsJoined,
+					failure?.error instanceof SessionRecoveryError ? failure.error.code : undefined,
+				);
+				released = true;
+				// A durable prepared plan wins over late cancellation or an unknown prepare ACK.
+				// Report its actual completion rather than pretending the committed mutation failed.
+				if (failure && !["completed", "noop"].includes(attempt.record?.completion?.outcome ?? ""))
+					throw failure.error;
+				return result;
+			} catch (error) {
+				if (!attempt.record) {
+					this.recovery.releaseMaintenance(attempt);
+					writer.release(attempt);
+					released = true;
+					if (error instanceof SessionRecoveryError && error.code === "RECOVERY_MAINTENANCE_BUSY") {
+						const driven = await this.recovery.binding!.maintenance.releaseLostMaintenance(
+							{ sessionId: this.sessionId, requestId: attempt.requestId },
+							this.recovery.identity,
+							{ deadlineMs: Date.now() + MAINTENANCE_RECOVERY_IO_TIMEOUT_MS },
+						);
+						if (!driven.ok) throw this.recovery.block(driven.code, driven.message);
+					} else if (operation.kind === "auto-compact-retry")
+						this.recovery.block(
+							error instanceof SessionRecoveryError ? error.code : "RECOVERY_MAINTENANCE_RETRY_EXHAUSTED",
+							error,
+						);
+					else await this._reconcileRecoveryAfterJoin(attempt.requestId);
+				} else if (!released) this.recovery.block("RECOVERY_MAINTENANCE_UNCERTAIN", error);
+				throw error;
+			} finally {
+				finish();
+			}
+		});
 	}
 
 	/** Adapter-original uses the SAME live post-result hook merge and image normalization path. */
@@ -1288,7 +1938,7 @@ export class AgentSession {
 		assertSettling();
 		const descriptor = this._recoveryEntries.get(witnessEntryId);
 		if (!descriptor) throw this.recovery.block("RECOVERY_TERMINAL_FLUSH_MISSING");
-		await this.recovery.binding!.commitNativeEntries([...this._recoveryEntries.values()], input);
+		await this._drainRecoveryDebt();
 		assertSettling();
 		const result = await this.recovery.binding!.recordInputOutcome({
 			sessionId: this.sessionId,
@@ -1303,6 +1953,7 @@ export class AgentSession {
 		assertSettling();
 		if (!result.durable || (result.status === "already-terminal" && result.kind !== "settled"))
 			throw this.recovery.block("RECOVERY_SETTLEMENT_NOT_DURABLE");
+		this.recovery.clearSelected();
 		this.recovery.phase = "READY";
 	}
 
@@ -1408,7 +2059,9 @@ export class AgentSession {
 
 	private async _getSummarizationRequestAuth(
 		selectedModel: Model<any>,
-		signal?: AbortSignal,
+		signal: AbortSignal | undefined,
+		purpose: ProviderPurpose,
+		sourceView: AgentMessage[],
 	): Promise<{
 		model: Model<any>;
 		apiKey?: string;
@@ -1416,18 +2069,18 @@ export class AgentSession {
 		env?: Record<string, string>;
 		thinkingLevel: ThinkingLevel;
 	}> {
-		if (this.recovery.required) await this._beforeRecoveryProvider(signal);
+		if (this.recovery.required) {
+			await this._beforeRecoveryProvider(signal, purpose);
+			if (this.recovery.currentMaintenance && isVirtualModel(selectedModel))
+				throw new SessionRecoveryError("RECOVERY_MAINTENANCE_PURPOSE_UNSUPPORTED");
+		}
 		// Route a virtual model first: summaries size their input and output from the model they get.
 		const { model, thinkingLevel } = isVirtualModel(selectedModel)
-			? await this._modelRuntime.resolveModel(
-					selectedModel,
-					convertToLlm(this.recovery.required ? await this.recovery.project(this.messages) : this.messages),
-					{
-						reason: "direct",
-						thinkingLevel: this.thinkingLevel,
-						signal,
-					},
-				)
+			? await this._modelRuntime.resolveModel(selectedModel, convertToLlm(sourceView), {
+					reason: "direct",
+					thinkingLevel: this.thinkingLevel,
+					signal,
+				})
 			: { model: selectedModel, thinkingLevel: this.thinkingLevel };
 		if (this.agent.streamFunction === streamSimple) {
 			return { ...(await this._getRequiredRequestAuth(model, signal)), thinkingLevel };
@@ -2195,6 +2848,12 @@ export class AgentSession {
 		preserveDistinctFailure = false,
 		beforeNotification?: () => void,
 	): Promise<void> {
+		if (this.recovery.currentMaintenance && this._maintenanceDraft) {
+			this._maintenanceDraft.observers.push(() =>
+				this._emitSessionCompactFailed(event, undefined, preserveDistinctFailure, beforeNotification),
+			);
+			return;
+		}
 		if (this._extensionRunner.hasHandlers("session_compact_failed")) {
 			let notified = !beforeNotification;
 			try {
@@ -2882,7 +3541,7 @@ export class AgentSession {
 		try {
 			this._rawAbortRetry();
 			this._rawAbortCompaction();
-			this.abortBranchSummary();
+			this._rawAbortBranchSummary();
 			this.abortBash();
 			this._rawAgentAbort();
 		} catch {
@@ -3579,7 +4238,10 @@ export class AgentSession {
 			}
 			if (this.recovery.required && recoveryEpoch === this.recovery.epoch) {
 				try {
-					if (this._stopAfterCompactionFailure) await this.recovery.interrupt("compaction-failure", true);
+					if (this._stopAfterCompactionFailure) {
+						if (this._compactionStopOutcome === "error") this._compactionFailureInput = this.recovery.input;
+						await this.recovery.interrupt("compaction-failure", true);
+					}
 					// biome-ignore lint/correctness/noUnsafeFinally: Caught below so REQUIRED persistence failure blocks finalization and rejects before settlement notification.
 					if (persistenceFailure) throw persistenceFailure.cause;
 					if (!this._agentRunAbortRequested && !this._abortDuringBeforeSettle) {
@@ -5646,7 +6308,7 @@ export class AgentSession {
 		this._queueTriggeredBehindPreflight();
 		this._rawAbortRetry();
 		this._rawAbortCompaction();
-		this.abortBranchSummary();
+		this._rawAbortBranchSummary();
 		if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;
 		void this._rawAgentAbort();
 		this._resolveIdleWaitIfIdle();
@@ -5689,7 +6351,12 @@ export class AgentSession {
 		this._modelSwitchDispatches.clear();
 	}
 
-	private async _compactForModelSwitch(model: Model<any>, guardedCommit: () => void): Promise<void> {
+	private async _compactForModelSwitch(
+		model: Model<any>,
+		guardedCommit: (writeNative?: boolean) => void,
+		desiredThinking = this._getThinkingLevelForModelSwitch(model),
+	): Promise<void> {
+		this.recovery.assertNoMaintenance();
 		this._inheritedCancellation();
 		const commit = () => {
 			this._inheritedCancellation();
@@ -5717,6 +6384,49 @@ export class AgentSession {
 			throw new Error(`${refusal} Wait for the current operation, then compact and retry.`);
 		if (!this.autoCompactionEnabled)
 			throw new Error(`${refusal} Auto-compaction is disabled; compact with the current model first.`);
+
+		if (this.recovery.required) {
+			return this._runRecoveryMaintenance(
+				{ kind: "compact", reason: "model-switch", targetModel: { provider: model.provider, id: model.id } },
+				async () => {
+					const outcome = await this._runAutoCompaction("threshold", false);
+					if (outcome === "failed" || outcome === "aborted") throw new Error("Compaction " + outcome);
+					const draft = this._maintenanceDraft!;
+					const entries = [...this.sessionManager.getBranch(), ...draft.entries];
+					const remaining = estimateProjectedContextTokens(
+						buildSessionProjection(entries, draft.parentId),
+						entries,
+					).tokens;
+					if (remaining > 0.8 * model.contextWindow)
+						throw new Error("Compaction could not reduce context below 80% of the target window.");
+					this._stageMaintenanceEntry({
+						type: "model_change",
+						id: randomUUID(),
+						parentId: draft.parentId,
+						timestamp: new Date().toISOString(),
+						provider: model.provider,
+						modelId: model.id,
+					});
+					const level = clampThinkingLevel(model, desiredThinking) as ThinkingLevel;
+					if (level !== this.thinkingLevel)
+						this._stageMaintenanceEntry({
+							type: "thinking_level_change",
+							id: randomUUID(),
+							parentId: draft.parentId,
+							timestamp: new Date().toISOString(),
+							thinkingLevel: level,
+						});
+					draft.commitModel = () => {
+						this._maintenanceModelCommit = true;
+						try {
+							guardedCommit(false);
+						} finally {
+							this._maintenanceModelCommit = false;
+						}
+					};
+				},
+			);
+		}
 
 		// ponytail: summarize with the old model while its larger window still fits;
 		// do not persist a target that cannot safely accept the compacted context.
@@ -5774,6 +6484,7 @@ export class AgentSession {
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
+		this.recovery.assertNoMaintenance();
 		// Capture the origin's cancellation before auth; a late auth cannot commit after refusal or retirement (#132 R4-8).
 		const inherited = this._inheritedCancellation();
 		const signals = [inherited, options.signal].filter((item): item is AbortSignal => item !== undefined);
@@ -5790,11 +6501,11 @@ export class AgentSession {
 		assertLive();
 
 		const previousModel = this.model;
-		await this._compactForModelSwitch(model, () => {
+		await this._compactForModelSwitch(model, (writeNative = true) => {
 			assertLive();
 			const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
 			this.agent.state.model = model;
-			this.sessionManager.appendModelChange(model.provider, model.id);
+			if (writeNative) this.sessionManager.appendModelChange(model.provider, model.id);
 			if (options.persist) {
 				this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 				this._addPersistedDefaultToNonEmptyScope(model);
@@ -5859,17 +6570,21 @@ export class AgentSession {
 		const next = scopedModels[nextIndex];
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.model, next.thinkingLevel);
 
-		await this._compactForModelSwitch(next.model, () => {
-			this.agent.state.model = next.model;
-			this.sessionManager.appendModelChange(next.model.provider, next.model.id);
-			if (options.persist) {
-				this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
-				this._addPersistedDefaultToNonEmptyScope(next.model);
-			}
+		await this._compactForModelSwitch(
+			next.model,
+			(writeNative = true) => {
+				this.agent.state.model = next.model;
+				if (writeNative) this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+				if (options.persist) {
+					this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+					this._addPersistedDefaultToNonEmptyScope(next.model);
+				}
 
-			// Scoped/per-model thinking overrides are clamped without changing global defaults.
-			this.setThinkingLevel(thinkingLevel);
-		});
+				// Scoped/per-model thinking overrides are clamped without changing global defaults.
+				this.setThinkingLevel(thinkingLevel);
+			},
+			thinkingLevel,
+		);
 
 		await this._emitModelSelect(next.model, currentModel, "cycle");
 		this._drainPreflightQueuesAfterModelSwitch();
@@ -5893,9 +6608,9 @@ export class AgentSession {
 		const nextModel = availableModels[nextIndex];
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(nextModel);
-		await this._compactForModelSwitch(nextModel, () => {
+		await this._compactForModelSwitch(nextModel, (writeNative = true) => {
 			this.agent.state.model = nextModel;
-			this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+			if (writeNative) this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 			if (options.persist) {
 				this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 				this._addPersistedDefaultToNonEmptyScope(nextModel);
@@ -5922,6 +6637,7 @@ export class AgentSession {
 	 * Persists the requested level to global defaults only when options.persist is true.
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
+		if (!this._maintenanceModelCommit) this.recovery.assertNoMaintenance();
 		this._inheritedCancellation();
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
@@ -5937,7 +6653,7 @@ export class AgentSession {
 		}
 
 		if (isChanging) {
-			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+			if (!this._maintenanceModelCommit) this.sessionManager.appendThinkingLevelChange(effectiveLevel);
 			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
 			void this._extensionRunner.emit({
 				type: "thinking_level_select",
@@ -6030,11 +6746,9 @@ export class AgentSession {
 
 	private async _prepareRecoveryCompaction(preparation: CompactionPreparation, signal: AbortSignal): Promise<void> {
 		if (!this.recovery.required) return;
-		await this._beforeRecoveryProvider(signal);
-		const epoch = this.recovery.epoch;
-		if (!this.recovery.binding?.validateCompaction)
-			throw this.recovery.block("RECOVERY_COMPACTION_VALIDATOR_REQUIRED");
-		await this.recovery.binding.validateCompaction(this.recovery.input!, preparation);
+		await this._beforeRecoveryProvider(signal, "compact-summary");
+		const epoch = this.recovery.identity;
+		await this.recovery.binding!.validateCompaction(this.recovery.subject, preparation, undefined, epoch);
 		this.recovery.assertEpoch(epoch);
 		preparation.messagesToSummarize = await this.recovery.project(preparation.messagesToSummarize);
 		preparation.turnPrefixMessages = await this.recovery.project(preparation.turnPrefixMessages);
@@ -6051,13 +6765,21 @@ export class AgentSession {
 	): Promise<CompactionResult> {
 		this.#ordinaryOwner?.requestProvenance.interrupt(new Error("OWNER_REQUEST_CAPTURE_AUXILIARY"));
 		// Resolve only for Pi's own summary, within the operation-wide deadline.
-		const request = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
+		const request = await raceWithAbortSignal(
+			this._getSummarizationRequestAuth(model, signal, "compact-summary", [
+				...preparation.messagesToSummarize,
+				...preparation.turnPrefixMessages,
+			]),
+			signal,
+		);
 		const callbacks = this._summarizationRetryCallbacks({ source: "compaction", reason });
 		const stream = this.agent.streamFunction;
 		const summaryStream: typeof stream = this.recovery.required
 			? async (...args) => {
-					await this._beforeRecoveryProvider(signal);
-					return stream(...args);
+					await this._beforeRecoveryProvider(signal, "compact-summary");
+					return this.recovery.currentMaintenance
+						? this.recovery.maintenanceRequest(() => this._maintenanceStreamRequest(() => stream(...args)))
+						: stream(...args);
 				}
 			: attempt
 				? (...args) => attempt.request(() => stream(...args))
@@ -6123,6 +6845,10 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		if (this.recovery.required) {
+			if (customInstructions !== undefined) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_USER_TEXT");
+			return this._runRecoveryMaintenance({ kind: "compact", reason: "manual" }, () => this.#compactSession());
+		}
 		// Refuse a cancelled descendant before it can abort unrelated work or request a summary.
 		const admission = this._inputAdmissionScope.getStore();
 		const ownsHeldAdmission = admission !== undefined && this._inputAdmissions.has(admission);
@@ -6158,9 +6884,12 @@ export class AgentSession {
 	): Promise<CompactionResult> {
 		const controller = new AbortController();
 		this._compactionAbortController = controller;
-		const signals = [controller.signal, attempt?.signal, inherited].filter(
-			(item): item is AbortSignal => item !== undefined,
-		);
+		const signals = [
+			controller.signal,
+			attempt?.signal,
+			inherited,
+			this.recovery.currentMaintenance?.controller.signal,
+		].filter((item): item is AbortSignal => item !== undefined);
 		const signal = signals.length > 1 ? AbortSignal.any(signals) : controller.signal;
 		const timeout = startCompactionDeadline(controller);
 		let fromExtension = false;
@@ -6255,9 +6984,23 @@ export class AgentSession {
 			signal.throwIfAborted();
 
 			if (this.recovery.required) {
-				await this.recovery.binding!.validateCompaction!(this.recovery.input!, preparation, firstKeptEntryId);
-				await this._beforeRecoveryProvider(signal);
+				const epoch = this.recovery.identity;
+				await this.recovery.binding!.validateCompaction(
+					this.recovery.subject,
+					preparation,
+					firstKeptEntryId,
+					epoch,
+				);
+				this.recovery.assertEpoch(epoch);
+				if (this.recovery.currentMaintenance) await this.recovery.checkMaintenance();
+				else await this._beforeRecoveryProvider(signal, "compact-summary");
 			}
+			if (this.recovery.currentMaintenance)
+				return this._stageMaintenanceCompaction(
+					{ summary, firstKeptEntryId, tokensBefore, usage, details },
+					"manual",
+					false,
+				);
 			if (attempt) await attempt.settle();
 			signal.throwIfAborted();
 			attempt?.check();
@@ -6412,6 +7155,7 @@ export class AgentSession {
 
 	/** Private captured constructor closure; no public AgentSession method or abort. */
 	async #compactOriginal(attempt: OriginalCompactionAttempt): Promise<CompactionResult> {
+		if (this.recovery.required) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_UNBOUND");
 		const owner = this.#ordinaryOwner;
 		if (!owner) throw new Error("OPS_COMPACTION_ORIGINAL_OWNER_REQUIRED");
 		assertOriginalCompactionAttempt(attempt, owner, this);
@@ -6465,6 +7209,7 @@ export class AgentSession {
 	 * Cancel in-progress compaction (manual or auto).
 	 */
 	abortCompaction(): void | Promise<void> {
+		if (this.recovery.required && this.recovery.maintenanceActive) return this.recovery.cancelMaintenance();
 		if (this.recovery.required && this.recovery.input) return this.abort();
 		this._rawAbortCompaction();
 	}
@@ -6489,7 +7234,11 @@ export class AgentSession {
 	/**
 	 * Cancel in-progress branch summarization.
 	 */
-	abortBranchSummary(): void {
+	abortBranchSummary(): void | Promise<void> {
+		if (this.recovery.required && this.recovery.maintenanceActive) return this.recovery.cancelMaintenance();
+		this._rawAbortBranchSummary();
+	}
+	private _rawAbortBranchSummary(): void {
 		// The reason is also the refusal that abandoned tree-hook descendants observe.
 		this._branchSummaryAbortController?.abort(
 			new InputAdmissionError("INPUT_ADMISSION_ABORTED", "tree navigation cancelled"),
@@ -6750,8 +7499,25 @@ export class AgentSession {
 			signal.throwIfAborted();
 
 			if (this.recovery.required) {
-				await this.recovery.binding!.validateCompaction!(this.recovery.input!, preparation, firstKeptEntryId);
-				await this._beforeRecoveryProvider(signal);
+				const epoch = this.recovery.identity;
+				const maintenance = this.recovery.currentMaintenance;
+				await this.recovery.binding!.validateCompaction(
+					maintenance?.token ?? this.recovery.subject,
+					preparation,
+					firstKeptEntryId,
+					epoch,
+				);
+				this.recovery.assertEpoch(epoch);
+				if (maintenance) await this.recovery.checkMaintenance();
+				else await this._beforeRecoveryProvider(signal, "compact-summary");
+			}
+			if (this.recovery.currentMaintenance) {
+				this._stageMaintenanceCompaction(
+					{ summary, firstKeptEntryId, tokensBefore, usage, details },
+					reason,
+					willRetry,
+				);
+				return willRetry || this.agent.hasQueuedMessages();
 			}
 			const compactionId = this.sessionManager.appendCompaction(
 				summary,
@@ -7149,7 +7915,8 @@ export class AgentSession {
 				},
 				getContextUsage: () => this.getContextUsage(),
 				compact: (options) => {
-					void (async () => {
+					// A live hook schedules this operation, never awaits its own native run.
+					const execute = async () => {
 						try {
 							const result = await this.compact(options?.customInstructions);
 							options?.onComplete?.(result);
@@ -7157,7 +7924,10 @@ export class AgentSession {
 							const err = error instanceof Error ? error : new Error(String(error));
 							options?.onError?.(err);
 						}
-					})();
+					};
+					void this._recoveryScope.exit(() =>
+						this._inputAdmissionScope.exit(() => this._dispatchCancellationScope.exit(execute)),
+					);
 				},
 				getSystemPrompt: () => this.systemPrompt,
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
@@ -7748,6 +8518,7 @@ export class AgentSession {
 	 * Cancel in-progress retry.
 	 */
 	abortRetry(): void | Promise<void> {
+		if (this.recovery.required && this.recovery.maintenanceActive) return this.recovery.cancelMaintenance();
 		if (this.recovery.required && this.recovery.input) return this.abort();
 		this._rawAbortRetry();
 	}
@@ -7936,6 +8707,24 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		if (!this.recovery.required) return this._navigateTree(targetId, options);
+		if (this._isAgentRunActive && getExtensionExecutionPath() !== undefined)
+			throw new SessionRecoveryError("RECOVERY_MAINTENANCE_SELF_CALL");
+		if (this.recovery.input || this.recovery.binding!.getCancelTargets().length)
+			throw new SessionRecoveryError("RECOVERY_MAINTENANCE_INPUT_SELECTED");
+		if (Object.keys(options).some((key) => key !== "summarize" && options[key as keyof typeof options] !== undefined))
+			throw new SessionRecoveryError("RECOVERY_MAINTENANCE_USER_TEXT");
+		const target = this.sessionManager.getEntry(targetId);
+		if (target && isMaintenanceControl(target)) throw new SessionRecoveryError("RECOVERY_MAINTENANCE_INVALID");
+		return this._runRecoveryMaintenance(
+			{ kind: "tree-nav", targetEntryId: targetId, summarize: options.summarize ?? false },
+			() => this._navigateTree(targetId, options),
+		);
+	}
+	private async _navigateTree(
+		targetId: string,
+		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
+	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: tree requires separate receiving");
 		const inherited = this._inheritedCancellation();
 		if (this.isStreaming) {
@@ -7947,7 +8736,9 @@ export class AgentSession {
 			);
 		}
 
-		const oldLeafId = this.sessionManager.getLeafId();
+		const oldLeafId = this.recovery.required
+			? this.sessionManager.getSemanticLeafId()
+			: this.sessionManager.getLeafId();
 
 		// No-op if already at target
 		if (targetId === oldLeafId) {
@@ -7991,6 +8782,7 @@ export class AgentSession {
 		this._branchSummaryAbortController = new AbortController();
 		const navigationSignal = AbortSignal.any([
 			this._branchSummaryAbortController.signal,
+			...(this.recovery.currentMaintenance ? [this.recovery.currentMaintenance.controller.signal] : []),
 			this._shutdownCancellation.signal,
 			...(inherited ? [inherited] : []),
 		]);
@@ -8039,16 +8831,31 @@ export class AgentSession {
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
+				const source = prepareBranchEntries(
+					entriesToSummarize,
+					(this.model!.contextWindow || 128000) - branchSummarySettings.reserveTokens,
+				).messages;
+				const sourceView = this.recovery.required ? await this.recovery.project(source) : source;
+				const stream = this.agent.streamFunction;
+				const checkedStream: typeof stream = this.recovery.required
+					? async (...args) => {
+							await this._beforeRecoveryProvider(navigationSignal, "tree-summary");
+							return this.recovery.maintenanceRequest(() =>
+								this._maintenanceStreamRequest(() => stream(...args)),
+							);
+						}
+					: stream;
 				const result = await generateBranchSummary(entriesToSummarize, {
 					...(await raceWithAbortSignal(
-						this._getSummarizationRequestAuth(this.model!, navigationSignal),
+						this._getSummarizationRequestAuth(this.model!, navigationSignal, "tree-summary", sourceView),
 						navigationSignal,
 					)),
 					signal: navigationSignal,
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
-					streamFn: this.agent.streamFunction,
+					streamFn: checkedStream,
+					...(this.recovery.required ? { projectMessages: async () => structuredClone(sourceView) } : {}),
 					retry: this.settingsManager.getRetrySettings(),
 					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
 				});
@@ -8090,6 +8897,40 @@ export class AgentSession {
 			// Cancellation can release a held hook without authorizing its branch or label changes.
 			navigationSignal.throwIfAborted();
 
+			if (this.recovery.currentMaintenance) {
+				await this.recovery.checkMaintenance();
+				// The target and abandoned branch are still pinned; user/custom targets use THEIR PARENT.
+				if (this.sessionManager.getSemanticLeafId() !== oldLeafId || !this.sessionManager.getEntry(targetId))
+					throw new SessionRecoveryError("RECOVERY_MAINTENANCE_CONFLICT");
+				this._maintenanceDraft!.parentId = newLeafId;
+				let summaryEntry: BranchSummaryEntry | undefined;
+				if (summaryText) {
+					summaryEntry = {
+						type: "branch_summary",
+						id: randomUUID(),
+						parentId: newLeafId,
+						timestamp: new Date().toISOString(),
+						fromId: oldLeafId ?? "root",
+						summary: summaryText,
+						details: summaryDetails,
+						usage: summaryUsage,
+						fromHook: false,
+					};
+					this._stageMaintenanceEntry(summaryEntry);
+				}
+				this._maintenanceDraft!.observers.push(async () => {
+					this._restoreToolsFromTranscript();
+					this._restoreMidOutputRetryCount();
+					await this._extensionRunner.emit({
+						type: "session_tree",
+						newLeafId: this.sessionManager.getSemanticLeafId(),
+						oldLeafId,
+						summaryEntry,
+						fromExtension: summaryText ? false : undefined,
+					});
+				});
+				return { editorText, cancelled: false, summaryEntry };
+			}
 			// Switch leaf (with or without summary)
 			// Summary is attached at the navigation target position (newLeafId), not the old branch
 			let summaryEntry: BranchSummaryEntry | undefined;
@@ -8344,7 +9185,10 @@ export class AgentSession {
 		if (!model) {
 			throw new Error("No model selected");
 		}
-		const auth = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
+		const auth = await raceWithAbortSignal(
+			this._getSummarizationRequestAuth(model, signal, "bug-report", this.messages),
+			signal,
+		);
 		signal.throwIfAborted();
 		return generateBugReportSummary({
 			...auth,

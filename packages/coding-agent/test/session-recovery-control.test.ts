@@ -29,7 +29,36 @@ function fixture(overrides: Partial<SessionRecoveryBinding> = {}) {
 		deliver: async () => {},
 		beforeProvider: async () => ({ permitted: true }),
 		projectContext: async (messages) => messages,
-		commitNativeEntries: async () => {},
+		commitNativeEntries: async (entries) =>
+			entries.map((entry, index) => ({ entryId: entry.entryId, bytesSha256: entry.bytesSha256, seq: index + 1 })),
+		maintenance: Object.assign(
+			Object.fromEntries(
+				[
+					"admitMaintenance",
+					"beginMaintenance",
+					"prepareMaintenance",
+					"consumeMaintenance",
+					"adoptMaintenance",
+					"read",
+					"withMaintenanceAttempt",
+					"assertMaintenanceGate",
+					"cancelMaintenance",
+					"reconcileAfterJoin",
+					"captureTaskAbort",
+					"releaseLostMaintenance",
+				].map((name) => [
+					name,
+					() => {
+						throw new Error("RECOVERY_MAINTENANCE_UNBOUND");
+					},
+				]),
+			),
+			{ listPending: async () => ({ ok: true, value: { revision: 0, records: [] } }) },
+		) as unknown as SessionRecoveryBinding["maintenance"],
+		validateMaintenanceReceipts: async () => {},
+		verifyNativeEntries: async () => {},
+		validateCompaction: async () => {},
+		reconcile: async () => {},
 		recordInputOutcome: async () => ({ durable: true, status: "recorded", revision: 1 }),
 		getCancelTargets: () => [],
 		validateTerminal: async () => ({ complete: true }),

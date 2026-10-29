@@ -15,7 +15,13 @@ export type NativeFlushReceipt =
 	| { kind: "file-fsync"; file: string; bytesThrough: number; namespaceDurable: true }
 	| { kind: "owned-journal-commit"; file: string; bytes: number; sha256: string };
 
+export type NativeEntryAuthority =
+	| { kind: "input"; input: import("./session-recovery-control.ts").AcceptedRecoveryInput }
+	| { kind: "maintenance"; requestId: string }
+	| { kind: "control" }
+	| { kind: "unattributed" };
 export interface NativeRecoveryAppend {
+	authority?: NativeEntryAuthority;
 	sessionId: string;
 	entryId: string;
 	location: NativeEntryLocation;
@@ -44,6 +50,47 @@ export interface NativeRecoveryScan {
 		bytes: Uint8Array;
 		reason: "invalid-header" | "invalid-entry" | "duplicate-entry" | "missing-final-lf" | "commit-unproven";
 	}>;
+}
+
+export interface NativeMaintenancePlan {
+	requestId: string;
+	operationSha256: string;
+	outcome: "completed" | "noop" | "cancelled" | "failed";
+	errorCode?: string;
+	entries: Array<{ entryId: string; parentId: string | null; bytesBase64: string; bytesSha256: string }>;
+}
+export interface NativeMaintenanceWriter {
+	attribute(resolve: (entry: { type: string; id: string }) => NativeEntryAuthority): void;
+	reserve(attempt: object, allowJoiningWrite: (entry: { type: string }) => boolean): void;
+	joined(attempt: object): void;
+	release(attempt: object): void;
+	prepare(attempt: object, plan: NativeMaintenancePlan): import("./session-recovery-control.ts").NativePlanRef;
+	apply(
+		attempt: object,
+		plan: NativeMaintenancePlan,
+		record: import("./session-recovery-control.ts").MaintenanceRecord,
+	): void;
+	authenticate(records: readonly import("./session-recovery-control.ts").MaintenanceRecord[]): void;
+	semanticLeaf(): string | null;
+}
+const maintenanceWriters = new WeakMap<object, NativeMaintenanceWriter>();
+const claimedWriters = new WeakSet<object>();
+/** Internal constructor-only registration, not an extension API. */
+export function bindNativeMaintenanceWriter(manager: object, writer: NativeMaintenanceWriter): void {
+	if (maintenanceWriters.has(manager)) throw new Error("RECOVERY_MAINTENANCE_UNBOUND");
+	maintenanceWriters.set(manager, writer);
+}
+export function claimNativeMaintenanceWriter(manager: object): NativeMaintenanceWriter {
+	const writer = maintenanceWriters.get(manager);
+	if (!writer || claimedWriters.has(manager)) throw new Error("RECOVERY_MAINTENANCE_UNBOUND");
+	claimedWriters.add(manager);
+	return writer;
+}
+export const isMaintenanceControl = (entry: { type: string; customType?: string }): boolean =>
+	(entry.type === "custom" || entry.type === "custom_message") &&
+	entry.customType?.startsWith("pi-maintenance:") === true;
+export function maintenancePlanHash(plan: NativeMaintenancePlan): string {
+	return createHash("sha256").update(JSON.stringify(plan)).digest("hex");
 }
 
 const persistenceScopes = new WeakMap<object, number>();

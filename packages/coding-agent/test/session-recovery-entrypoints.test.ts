@@ -61,7 +61,36 @@ async function setup(
 		},
 		beforeProvider: async () => ({ permitted: true }),
 		projectContext: async (messages) => messages,
-		commitNativeEntries: async () => {},
+		commitNativeEntries: async (entries) =>
+			entries.map((entry, index) => ({ entryId: entry.entryId, bytesSha256: entry.bytesSha256, seq: index + 1 })),
+		maintenance: Object.assign(
+			Object.fromEntries(
+				[
+					"admitMaintenance",
+					"beginMaintenance",
+					"prepareMaintenance",
+					"consumeMaintenance",
+					"adoptMaintenance",
+					"read",
+					"withMaintenanceAttempt",
+					"assertMaintenanceGate",
+					"cancelMaintenance",
+					"reconcileAfterJoin",
+					"captureTaskAbort",
+					"releaseLostMaintenance",
+				].map((name) => [
+					name,
+					() => {
+						throw new Error("RECOVERY_MAINTENANCE_UNBOUND");
+					},
+				]),
+			),
+			{ listPending: async () => ({ ok: true, value: { revision: 0, records: [] } }) },
+		) as unknown as SessionRecoveryBinding["maintenance"],
+		validateMaintenanceReceipts: async () => {},
+		verifyNativeEntries: async () => {},
+		validateCompaction: async () => {},
+		reconcile: async () => {},
 		recordInputOutcome: async (request) => {
 			requests.push(request);
 			return { durable: true, status: "recorded", revision: requests.length };
@@ -676,7 +705,7 @@ describe("REQUIRED native SDK entrypoints", () => {
 		await t.session.reload();
 		expect(starts).toBe(2);
 		expect(ready).toBe(2);
-		expect(t.context().epoch).toBe(old.epoch + 1);
+		expect(t.context().epoch).toEqual({ ...old.epoch, epoch: old.epoch.epoch + 1 });
 		await expect(old.deliverAccepted(t.input)).rejects.toThrow("RECOVERY_EPOCH_REVOKED");
 		expect(t.session.recovery.phase).toBe("READY");
 		failReload = true;
@@ -912,6 +941,11 @@ describe("REQUIRED native SDK entrypoints", () => {
 					b6Entered.resolve();
 					await b6Release.promise;
 				}
+				return entries.map((entry, index) => ({
+					entryId: entry.entryId,
+					bytesSha256: entry.bytesSha256,
+					seq: index + 1,
+				}));
 			};
 			await t.session.bindExtensions({});
 			expect(t.session.agent.state.tools.map((tool) => tool.name)).toContain("count");

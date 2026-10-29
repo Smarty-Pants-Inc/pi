@@ -67,11 +67,16 @@ import {
 	toColdEntry,
 	toHotEntry,
 } from "./session-lazy-entries.ts";
-import type { RecoveryPreOpenBinding } from "./session-recovery-control.ts";
+import type { MaintenanceRecord, NativePlanRef, RecoveryPreOpenBinding } from "./session-recovery-control.ts";
 import {
 	assertSessionPersistenceReleased,
+	bindNativeMaintenanceWriter,
 	inspectNativeRecoveryBytes,
+	isMaintenanceControl,
+	maintenancePlanHash,
+	type NativeEntryAuthority,
 	type NativeFlushReceipt,
+	type NativeMaintenancePlan,
 	type NativeRecoveryAppend,
 	type NativeRecoveryScan,
 	nativeRecoveryAppend,
@@ -1495,6 +1500,11 @@ export class SessionManager {
 	#recoveryPersistence?: RecoveryPersistenceState;
 	#recoveryOpenOrigin: "new" | "ordinary-open" | "recovery-open" | "owned-open" = "new";
 	#recoveryPreparedNew = false;
+	#maintenanceReservation?: { attempt: object; joined: boolean; allow(entry: SessionEntry): boolean };
+	#maintenanceWriting = false;
+	#recoveryAuthority?: (entry: { type: string; id: string }) => NativeEntryAuthority;
+	#maintenanceReopenPending = false;
+	readonly #authenticatedMaintenance = new Set<string>();
 	#recoveryExclusion?: () => void;
 	private constructor(
 		cwd: string,
@@ -1509,6 +1519,28 @@ export class SessionManager {
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
 		this.#ownedJournal = ownedJournal;
+		bindNativeMaintenanceWriter(this, {
+			attribute: (resolve) => {
+				if (this.#recoveryAuthority) throw new Error("RECOVERY_MAINTENANCE_UNBOUND");
+				this.#recoveryAuthority = resolve;
+			},
+			reserve: (attempt, allow) => {
+				if (this.#maintenanceReservation) throw new Error("RECOVERY_MAINTENANCE_BUSY");
+				this.#maintenanceReservation = { attempt, joined: false, allow };
+			},
+			joined: (attempt) => {
+				this.#assertMaintenanceAttempt(attempt);
+				this.#maintenanceReservation!.joined = true;
+			},
+			release: (attempt) => {
+				this.#assertMaintenanceAttempt(attempt);
+				this.#maintenanceReservation = undefined;
+			},
+			prepare: (attempt, plan) => this.#prepareMaintenance(attempt, plan),
+			apply: (attempt, plan, record) => this.#applyMaintenance(attempt, plan, record),
+			authenticate: (records) => this.#authenticateMaintenance(records),
+			semanticLeaf: () => this.getSemanticLeafId(),
+		});
 		detachedSessionSources.set(this, {
 			revision: () => this.revision(),
 			getLeafEntry: () => (this.leafId ? this.byId.get(this.leafId) : undefined),
@@ -1880,6 +1912,9 @@ export class SessionManager {
 			needsRecovery: this.flushed,
 		};
 		this.#recoveryPersistence = state;
+		this.#maintenanceReopenPending = this.fileEntries.some(
+			(entry) => entry.type !== "session" && isMaintenanceControl(entry),
+		);
 		if (this.#ownedJournal) {
 			this.#ownedJournal.assertWritable();
 			state.needsRecovery = this.#ownedBootstrap === undefined;
@@ -1913,11 +1948,10 @@ export class SessionManager {
 		this.#assertRecoveryReleased();
 		const state = this.#recoveryPersistence;
 		if (!state) throw new Error("RECOVERY_PERSISTENCE_NOT_ENABLED");
-		return state.appends
-			.splice(0)
-			.map((entry) =>
-				nativeRecoveryAppend(entry.sessionId, entry.entryId, entry.location, entry.bytes, entry.flushReceipt),
-			);
+		return state.appends.splice(0).map((entry) => ({
+			...nativeRecoveryAppend(entry.sessionId, entry.entryId, entry.location, entry.bytes, entry.flushReceipt),
+			authority: entry.authority,
+		}));
 	}
 
 	/** Full native file, including abandoned branches and unframed final candidates.
@@ -2067,7 +2101,14 @@ export class SessionManager {
 		receipt: NativeFlushReceipt,
 	): void {
 		const state = this.#recoveryPersistence!;
-		state.appends.push(nativeRecoveryAppend(state.sessionId, entryId, location, bytes, receipt));
+		const entry = JSON.parse(Buffer.from(bytes).toString("utf8")) as SessionEntry;
+		const descriptor = nativeRecoveryAppend(state.sessionId, entryId, location, bytes, receipt);
+		descriptor.authority =
+			this.#recoveryAuthority?.(entry) ??
+			(["model_change", "thinking_level_change", "label", "session_info", "custom", "usage"].includes(entry.type)
+				? { kind: "control" }
+				: { kind: "unattributed" });
+		state.appends.push(descriptor);
 	}
 
 	#captureOwnedRecoveryAppend(entryId: string, bytes: Buffer, receipt: { bytes: number; sha256: string }): void {
@@ -2153,7 +2194,144 @@ export class SessionManager {
 		}
 	}
 
+	#assertMaintenanceAttempt(attempt: object): void {
+		if (this.#maintenanceReservation?.attempt !== attempt) throw new Error("RECOVERY_MAINTENANCE_UNBOUND");
+	}
+	#assertMaintenanceWrite(entry?: SessionEntry): void {
+		if (this.#maintenanceWriting) return;
+		if (entry && isMaintenanceControl(entry)) throw new Error("RECOVERY_MAINTENANCE_INVALID");
+		if (this.#maintenanceReopenPending) throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+		const reservation = this.#maintenanceReservation;
+		if (reservation && (!entry || reservation.joined || !reservation.allow(entry)))
+			throw new Error("RECOVERY_MAINTENANCE_BUSY");
+	}
+	#maintenanceWrite<T>(action: () => T): T {
+		this.assertRecoveryExclusion();
+		this.#maintenanceWriting = true;
+		try {
+			return action();
+		} finally {
+			this.#maintenanceWriting = false;
+		}
+	}
+	#prepareMaintenance(attempt: object, plan: NativeMaintenancePlan): NativePlanRef {
+		this.#assertMaintenanceAttempt(attempt);
+		if (!this.#maintenanceReservation!.joined) throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+		const planSha256 = maintenancePlanHash(plan);
+		const entry: CustomEntry = {
+			type: "custom",
+			customType: "pi-maintenance:prepare:v1",
+			id: randomUUID(),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			data: { plan: JSON.parse(JSON.stringify(plan)), planSha256 },
+		};
+		this.#maintenanceWrite(() => this._appendEntry(entry));
+		return {
+			entryId: entry.id,
+			bytesSha256: createHash("sha256")
+				.update(JSON.stringify(entry) + "\n")
+				.digest("hex"),
+			planSha256,
+		};
+	}
+	#validateMaintenancePlan(plan: NativeMaintenancePlan, record: MaintenanceRecord): CustomEntry {
+		if (
+			!record.plan ||
+			record.request.sessionId !== this.sessionId ||
+			record.request.requestId !== plan.requestId ||
+			record.operationSha256 !== plan.operationSha256 ||
+			record.plan.planSha256 !== maintenancePlanHash(plan)
+		)
+			throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+		const prepare = this.byId.get(record.plan.entryId);
+		if (
+			!prepare ||
+			prepare.type !== "custom" ||
+			prepare.customType !== "pi-maintenance:prepare:v1" ||
+			createHash("sha256")
+				.update(JSON.stringify(prepare) + "\n")
+				.digest("hex") !== record.plan.bytesSha256 ||
+			JSON.stringify(prepare.data) !== JSON.stringify({ plan, planSha256: record.plan.planSha256 })
+		)
+			throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+		return prepare;
+	}
+	#applyMaintenance(attempt: object, plan: NativeMaintenancePlan, record: MaintenanceRecord): void {
+		this.#assertMaintenanceAttempt(attempt);
+		if (record.state !== "PREPARED") throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+		this.#validateMaintenancePlan(plan, record);
+		if (this.inspectRecoveryEntries().issues.length) throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+		let missing = false;
+		for (const item of plan.entries) {
+			const bytes = Buffer.from(item.bytesBase64, "base64");
+			if (createHash("sha256").update(bytes).digest("hex") !== item.bytesSha256 || bytes.at(-1) !== 10)
+				throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+			const entry = JSON.parse(bytes.toString("utf8")) as SessionEntry;
+			if (
+				entry.id !== item.entryId ||
+				entry.parentId !== item.parentId ||
+				JSON.stringify(entry) + "\n" !== bytes.toString("utf8")
+			)
+				throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+			const existing = this.byId.get(item.entryId);
+			if (existing) {
+				if (missing || JSON.stringify(existing) + "\n" !== bytes.toString("utf8"))
+					throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+			} else {
+				missing = true;
+				this.#maintenanceWrite(() => this._appendEntry(entry));
+				if (JSON.stringify(this.byId.get(entry.id)) + "\n" !== bytes.toString("utf8"))
+					throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+			}
+		}
+	}
+	#authenticateMaintenance(records: readonly MaintenanceRecord[]): void {
+		const validated = new Set<string>();
+		for (const entry of this.fileEntries) {
+			if (entry.type !== "custom" || entry.customType !== "pi-maintenance:prepare:v1") continue;
+			const data = entry.data as { plan: NativeMaintenancePlan; planSha256: string };
+			const record = records.find((value) => value.request.requestId === data?.plan?.requestId);
+			if (!record || record.state !== "CONSUMED" || !record.completion)
+				throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+			this.#validateMaintenancePlan(data.plan, record);
+			for (const item of data.plan.entries) {
+				const actual = this.byId.get(item.entryId);
+				const receipt = record.completion.entries.find((value) => value.entryId === item.entryId);
+				if (
+					!actual ||
+					!receipt ||
+					receipt.bytesSha256 !== item.bytesSha256 ||
+					createHash("sha256")
+						.update(JSON.stringify(actual) + "\n")
+						.digest("hex") !== item.bytesSha256
+				)
+					throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+				if (isMaintenanceControl(actual)) validated.add(actual.id);
+			}
+			validated.add(entry.id);
+		}
+		for (const entry of this.fileEntries) {
+			if (entry.type !== "session" && isMaintenanceControl(entry) && !validated.has(entry.id))
+				throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+		}
+		for (const id of validated) this.#authenticatedMaintenance.add(id);
+		this.#maintenanceReopenPending = false;
+	}
+	/** Checkpoints are semantically transparent ONLY after ledger authentication. */
+	getSemanticLeafId(): string | null {
+		if (this.#maintenanceReopenPending) throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+		let id = this.leafId;
+		while (id) {
+			const entry = this.byId.get(id)!;
+			if (!isMaintenanceControl(entry)) return id;
+			if (!this.#authenticatedMaintenance.has(id)) throw new Error("RECOVERY_MAINTENANCE_UNCERTAIN");
+			id = entry.parentId;
+		}
+		return null;
+	}
 	private _appendEntry(entry: SessionEntry): void {
+		this.#assertMaintenanceWrite(entry);
 		if (this.#recoveryPersistence?.failure)
 			throw new Error("RECOVERY_PERSISTENCE_FAILED", { cause: this.#recoveryPersistence.failure });
 		if (this.#recoveryPersistence?.needsRecovery) throw new Error("RECOVERY_SCAN_REQUIRED");
@@ -2282,6 +2460,7 @@ export class SessionManager {
 	}
 
 	async #appendEntryOwnedTerminal(entry: SessionEntry): Promise<void> {
+		this.#assertMaintenanceWrite(entry);
 		if (this.#recoveryPersistence?.failure)
 			throw new Error("RECOVERY_PERSISTENCE_FAILED", { cause: this.#recoveryPersistence.failure });
 		if (this.#recoveryPersistence?.needsRecovery) throw new Error("RECOVERY_SCAN_REQUIRED");
@@ -2613,6 +2792,7 @@ export class SessionManager {
 	// =========================================================================
 
 	getLeafId(): string | null {
+		if (this.#maintenanceReopenPending) return null;
 		return this.leafId;
 	}
 
@@ -2789,6 +2969,7 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionProjection(): SessionProjection {
+		if (this.#maintenanceReopenPending) return projectSessionContext([], "off", null);
 		const { contextEntries, thinkingLevel, model } = this.getBranchProjection();
 		return this.ownedView(projectSessionContext(contextEntries, thinkingLevel, model ? { ...model } : null));
 	}
@@ -2879,6 +3060,7 @@ export class SessionManager {
 	 * are not modified or deleted.
 	 */
 	branch(branchFromId: string): void {
+		this.#assertMaintenanceWrite();
 		this.#ownedJournal?.assertActive();
 		if (!this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
@@ -2895,6 +3077,7 @@ export class SessionManager {
 	 * Use this when navigating to re-edit the first user message.
 	 */
 	resetLeaf(): void {
+		this.#assertMaintenanceWrite();
 		this.#ownedJournal?.assertActive();
 		detachedSelectionInvalidators.get(this)?.();
 		this.leafId = null;
@@ -2913,6 +3096,7 @@ export class SessionManager {
 		fromHook?: boolean,
 		usage?: Usage,
 	): string {
+		this.#assertMaintenanceWrite();
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -3010,7 +3194,7 @@ export class SessionManager {
 		const pendingLabelIds: string[] = [];
 		let pathParentId: string | null = null;
 		for (const entry of path) {
-			if (entry.type === "label") {
+			if (entry.type === "label" || isMaintenanceControl(entry)) {
 				pendingLabelIds.push(entry.id);
 				continue;
 			}
