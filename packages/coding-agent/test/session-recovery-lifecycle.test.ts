@@ -1,14 +1,16 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fauxAssistantMessage } from "../../ai/src/index.ts";
 import type { AgentSession, AgentSessionEvent } from "../src/core/agent-session.ts";
 import type { ExtensionContext } from "../src/core/extensions/types.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
-import { SessionManager } from "../src/core/session-manager.ts";
+import { type FileEntry, SessionManager } from "../src/core/session-manager.ts";
 import {
 	type AcceptedRecoveryInput,
 	type MaintenanceRecord,
@@ -18,7 +20,7 @@ import {
 	type SessionRecoveryBinding,
 	type SessionRecoveryContext,
 } from "../src/core/session-recovery-control.ts";
-import type { NativeRecoveryAppend } from "../src/core/session-recovery-persistence.ts";
+import type { NativeMaintenancePlan, NativeRecoveryAppend } from "../src/core/session-recovery-persistence.ts";
 import { createHarness, type Harness } from "./suite/harness.ts";
 
 const sessions: AgentSession[] = [],
@@ -123,7 +125,17 @@ function memoryMaintenance(): RecoveryMaintenanceAdapter {
 	return api;
 }
 
-async function lifecycleFixture(required: boolean, extension?: (pi: any) => void) {
+interface LifecycleFixtureStorage {
+	readonly root: string;
+	readonly file?: string;
+	readonly predecessorPid?: number;
+	readonly beforeBind?: (
+		session: AgentSession,
+		maintenance: RecoveryMaintenanceAdapter,
+		harness: Harness,
+	) => Promise<void>;
+}
+async function lifecycleFixture(required: boolean, extension?: (pi: any) => void, storage?: LifecycleFixtureStorage) {
 	const b5Root = process.env.B3_B5_SOURCE,
 		fabricRoot = process.env.B3_FABRIC_SOURCE;
 	const real = required && b5Root && fabricRoot;
@@ -202,8 +214,30 @@ async function lifecycleFixture(required: boolean, extension?: (pi: any) => void
 		validateCompaction: async () => {},
 	};
 	const binding = new Proxy(fallback, { get: (_target, key) => Reflect.get(implementation ?? fallback, key) });
+	const retainedManager = storage?.file
+		? await SessionManager.openForRecoveryAfterExclusion(storage.file, {
+				excludeWriter: async () => {
+					// This proves local test-process death, not B2 physical host exclusion/custody.
+					if (!storage.predecessorPid) throw new Error("CRASH_PREDECESSOR_PID_REQUIRED");
+					const assertCurrent = () => {
+						try {
+							process.kill(storage.predecessorPid!, 0);
+						} catch (error) {
+							expect((error as NodeJS.ErrnoException).code).toBe("ESRCH");
+							return;
+						}
+						throw new Error("CRASH_PREDECESSOR_STILL_LIVE");
+					};
+					assertCurrent();
+					return { assertCurrent };
+				},
+			})
+		: storage
+			? SessionManager.create(storage.root, storage.root)
+			: undefined;
 	h = await createHarness({
 		persistSession: true,
+		...(retainedManager ? { sessionManager: retainedManager, cwd: storage!.root } : {}),
 		models: [
 			{ id: "faux-1", contextWindow: 64_000 },
 			{ id: "target-small", contextWindow: 1000 },
@@ -249,7 +283,7 @@ async function lifecycleFixture(required: boolean, extension?: (pi: any) => void
 	}));
 	sessions.push(session);
 	cleanups.push(session.subscribe((event) => events.push(event)));
-	for (let i = 0; i < 4; i++) {
+	for (let i = 0; !storage?.file && i < 4; i++) {
 		h.sessionManager.appendMessage({
 			role: "user",
 			content: "retained " + i + " history ".repeat(100),
@@ -258,8 +292,10 @@ async function lifecycleFixture(required: boolean, extension?: (pi: any) => void
 		h.sessionManager.appendMessage(fauxAssistantMessage("retained answer " + i + " answer ".repeat(100)));
 	}
 	if (real) {
+		if (storage) console.log("B3_CRASH_STEP before-b6-open", process.pid);
 		store = await b6Module.RecoveryDurabilityStore.open({
-			directory: join(h.tempDir, "b6"),
+			required: Boolean(storage?.file),
+			directory: join(storage?.root ?? h.tempDir, "b6"),
 			storeId: "native-lifecycle",
 			sessionId: session.sessionId,
 			sessionFile: session.sessionFile,
@@ -272,6 +308,7 @@ async function lifecycleFixture(required: boolean, extension?: (pi: any) => void
 				);
 			},
 		});
+		if (storage) console.log("B3_CRASH_STEP after-b6-open", process.pid);
 		cleanups.push(
 			() => store.close(),
 			() => unbind?.(),
@@ -289,7 +326,7 @@ async function lifecycleFixture(required: boolean, extension?: (pi: any) => void
 				ownedEpoch = epoch;
 				unbind?.();
 				unbind = b5.bindInputAdmission({
-					root: h.tempDir,
+					root: storage?.root ?? h.tempDir,
 					sessionId: session.sessionId,
 					mainAgent: {
 						id: "session:" + session.sessionId,
@@ -362,9 +399,12 @@ async function lifecycleFixture(required: boolean, extension?: (pi: any) => void
 		implementation = b3.createNativeMaintenanceBinding({ host, maintenance, durability: store });
 		implementation.advanceEpoch?.(session.recovery.identity); // The real adapter is attached after SDK construction in this cross-repo fixture.
 		h.sessionManager.recoverRecoveryAppends();
-		await commit(h.sessionManager.drainRecoveryAppends()); // Explicit frozen pre-existing fixture history, before maintenance admission.
+		// Leave reopened descriptors for native startup's own drain. They are NOT
+		// new authority; startup reads existing B6 proof and authenticates the WAL.
+		if (!storage?.file) await commit(h.sessionManager.drainRecoveryAppends()); // Frozen fixture history only.
 	}
 	session.refreshContext();
+	await storage?.beforeBind?.(session, maintenance, h);
 	await session.bindExtensions({});
 	const queueInput = (text: string, id: string) => {
 		if (!real) return fail("REAL_B5_REQUIRED");
@@ -1131,3 +1171,304 @@ describe.skipIf(!realAvailable)("native maintenance with real B5/B6/B3", () => {
 		expect(f.stats.mainReconsiders).toBe(1);
 	});
 });
+
+interface MaintenanceCrashSnapshot {
+	readonly pid: number;
+	readonly stage: string;
+	readonly file: string;
+	readonly phase: string;
+	readonly providerCalls: number;
+	readonly successorProviderRequests: number;
+	readonly record: MaintenanceRecord;
+	readonly fileBase64: string;
+	readonly entries: readonly { entryId: string; bytesSha256: string }[];
+	readonly proofs: readonly { entryId: string; bytesSha256: string; seq: number }[];
+}
+const crashWorkerStage = process.env.B3_CRASH_WORKER_STAGE;
+
+// Worker is a test process, not an agent. The real SDK/B3 binding/B5/B6 own all
+// mutations; only provider/ACK boundaries are held. Parent SIGKILL cannot run cleanup.
+if (crashWorkerStage) {
+	it("B3 maintenance crash worker", async () => {
+		const root = process.env.B3_CRASH_ROOT!;
+		let successorProviderRequests = 0;
+		const inputModule = await import(
+			/* @vite-ignore */ pathToFileURL(join(process.env.B3_B5_SOURCE!, "src/recovery/input-admission.ts")).href
+		);
+		const hold = async (
+			session: AgentSession,
+			h: Harness,
+			proofs: MaintenanceCrashSnapshot["proofs"] = [],
+		): Promise<never> => {
+			const scan = session.sessionManager.inspectRecoveryEntries();
+			expect(scan.issues).toEqual([]);
+			const snapshot: MaintenanceCrashSnapshot = {
+				pid: process.pid,
+				stage: crashWorkerStage,
+				file: session.sessionFile!,
+				phase: session.recovery.phase,
+				providerCalls: h.faux.state.callCount,
+				successorProviderRequests,
+				record: inputModule.readRecoverySession(session.sessionId).maintenance[0].record,
+				fileBase64: readFileSync(session.sessionFile!).toString("base64"),
+				entries: scan.entries.map((entry) => ({ entryId: entry.entryId, bytesSha256: digest(entry.bytes) })),
+				proofs,
+			};
+			await new Promise<void>((resolve, reject) =>
+				process.stdout.write(`B3_CRASH_READY ${JSON.stringify(snapshot)}\n`, (error) =>
+					error ? reject(error) : resolve(),
+				),
+			);
+			return new Promise<never>(() => {});
+		};
+		const receiving = ["ADOPTED", "RECOVERED", "REBOOT"].includes(crashWorkerStage);
+		const f = await lifecycleFixture(
+			true,
+			receiving
+				? (pi) => {
+						pi.on("before_provider_request", () => {
+							successorProviderRequests++;
+							fail("SUCCESSOR_MUST_NOT_INFER");
+						});
+					}
+				: undefined,
+			{
+				root,
+				...(receiving
+					? {
+							file: process.env.B3_CRASH_FILE!,
+							predecessorPid: Number(process.env.B3_CRASH_PREDECESSOR_PID),
+						}
+					: {}),
+				beforeBind: async (session, maintenance, h) => {
+					console.log("B3_CRASH_STEP before-bind", process.pid);
+					if (crashWorkerStage !== "ADOPTED") return;
+					const adopt = maintenance.adoptMaintenance.bind(maintenance);
+					maintenance.adoptMaintenance = async (...args) => {
+						const result = await adopt(...args);
+						expect(result.ok).toBe(true);
+						await hold(session, h); // Second crash AFTER durable adoption, BEFORE settlement.
+						return result;
+					};
+				},
+			},
+		);
+		console.log("B3_CRASH_STEP after-bind", process.pid);
+		if (receiving) {
+			const record: MaintenanceRecord = f.b5.readRecoverySession(f.session.sessionId).maintenance[0].record;
+			expect(record.state).toBe("CONSUMED");
+			expect(f.session.recovery.phase).toBe("READY");
+			const proofs: Array<{ entryId: string; bytesSha256: string; seq: number }> = [];
+			for (const entry of record.completion!.entries) {
+				const found = await f.store.readDurableEntry({
+					sessionId: f.session.sessionId,
+					deliveryId: nativeEntryDeliveryId(f.session.sessionId, entry.entryId),
+					recordKind: "carrier",
+				});
+				expect(found.found).toBe(true);
+				expect(found.seq).toBe(entry.seq);
+				expect(digest(found.bytes)).toBe(entry.bytesSha256);
+				const actual = f.session.sessionManager
+					.inspectRecoveryEntries()
+					.entries.find((value) => value.entryId === entry.entryId)!;
+				expect(Buffer.from(found.bytes).equals(Buffer.from(actual.bytes))).toBe(true);
+				proofs.push({ ...entry });
+			}
+			await hold(f.session, f.h, proofs);
+		}
+		if (crashWorkerStage === "ACTIVE") {
+			f.h.setResponses([async () => hold(f.session, f.h)]);
+		} else {
+			f.h.setResponses(Array.from({ length: 4 }, () => fauxAssistantMessage("one original prepared summary")));
+			if (["NATIVE_PREPARE", "PREPARED"].includes(crashWorkerStage)) {
+				const prepare = f.maintenance.prepareMaintenance.bind(f.maintenance);
+				f.maintenance.prepareMaintenance = async (...args) => {
+					if (crashWorkerStage === "NATIVE_PREPARE") await hold(f.session, f.h);
+					const result = await prepare(...args);
+					expect(result.ok).toBe(true);
+					await hold(f.session, f.h);
+					return result;
+				};
+			} else if (crashWorkerStage === "B6_COMMITTED") {
+				const barrier = f.store.awaitDurableAppend.bind(f.store);
+				f.store.awaitDurableAppend = async (request: { entryId?: string }) => {
+					const result = await barrier(request);
+					const descriptor = request.entryId && f.native.get(request.entryId);
+					if (
+						descriptor &&
+						JSON.parse(Buffer.from(descriptor.bytes).toString()).customType === "pi-maintenance:checkpoint:v1"
+					) {
+						expect(result.durable).toBe(true);
+						await hold(f.session, f.h);
+					}
+					return result;
+				};
+			} else throw new Error(`Unknown original crash stage ${crashWorkerStage}`);
+		}
+		await f.session.compact();
+		throw new Error("CRASH_BOUNDARY_NOT_REACHED");
+	}, 120_000);
+} else {
+	// RECOVERY-LIFECYCLE-001: real process loss/data-safety boundary. Explicitly NOT
+	// physical host power loss, deployed owned profile or complete cohort qualification.
+	describe.skipIf(!realAvailable || process.platform === "win32")("native maintenance process crash matrix", () => {
+		it.each(["ACTIVE", "NATIVE_PREPARE", "PREPARED", "B6_COMMITTED"] as const)(
+			"SIGKILL at %s, second crash after adoption, then receiver process reboot",
+			async (boundary) => {
+				const root = mkdtempSync(join(tmpdir(), "b3-maintenance-crash-"));
+				const artifacts = process.env.B3_TEST_ARTIFACTS
+					? join(process.env.B3_TEST_ARTIFACTS, `crash-${boundary}`)
+					: join(root, "evidence");
+				mkdirSync(artifacts, { recursive: true });
+				const owned: Array<() => Promise<{ code: number | null; signal: NodeJS.Signals | null }>> = [];
+				const start = (stage: string, predecessor?: MaintenanceCrashSnapshot) => {
+					const child: ChildProcess = spawn(
+						process.execPath,
+						[
+							fileURLToPath(new URL("../../../node_modules/vitest/vitest.mjs", import.meta.url)),
+							"run",
+							"test/session-recovery-lifecycle.test.ts",
+							"--pool=threads",
+							"--maxWorkers=1",
+							"-t",
+							"^B3 maintenance crash worker$",
+							"--reporter=verbose",
+						],
+						{
+							cwd: fileURLToPath(new URL("../", import.meta.url)),
+							env: {
+								...process.env,
+								B3_CRASH_WORKER_STAGE: stage,
+								B3_CRASH_ROOT: root,
+								B3_CRASH_FILE: predecessor?.file ?? "",
+								B3_CRASH_PREDECESSOR_PID: String(predecessor?.pid ?? ""),
+							},
+							stdio: ["ignore", "pipe", "pipe"],
+						},
+					);
+					let stdout = "",
+						stderr = "",
+						pending = "";
+					let resolve!: (snapshot: MaintenanceCrashSnapshot) => void, reject!: (error: Error) => void;
+					const ready = new Promise<MaintenanceCrashSnapshot>((yes, no) => {
+						resolve = yes;
+						reject = no;
+					});
+					child.stdout!.on("data", (chunk: Buffer) => {
+						stdout += chunk.toString();
+						pending += chunk.toString();
+						while (pending.includes("\n")) {
+							const end = pending.indexOf("\n");
+							const line = pending.slice(0, end);
+							pending = pending.slice(end + 1);
+							if (line.startsWith("B3_CRASH_READY ")) {
+								try {
+									resolve(JSON.parse(line.slice("B3_CRASH_READY ".length)));
+								} catch (error) {
+									reject(new Error("Malformed crash worker receipt", { cause: error }));
+								}
+							}
+						}
+					});
+					child.stderr!.on("data", (chunk: Buffer) => {
+						stderr += chunk.toString();
+					});
+					child.once("error", reject);
+					const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((done) => {
+						child.once("close", (code, signal) => {
+							writeFileSync(join(artifacts, `${stage}.stdout`), stdout);
+							writeFileSync(join(artifacts, `${stage}.stderr`), stderr);
+							reject(new Error(`Crash worker exited before receipt: ${code}/${signal}\n${stdout}\n${stderr}`));
+							done({ code, signal });
+						});
+					});
+					// IPC stdout is the normal event source; this one-shot timer bounds a missing gate.
+					const timeout = setTimeout(() => {
+						child.kill("SIGKILL");
+					}, 60_000);
+					void closed.then(() => clearTimeout(timeout));
+					const stop = async () => {
+						if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+						return closed;
+					};
+					owned.push(stop);
+					cleanups.push(async () => {
+						await stop();
+					});
+					return { child, ready, stop };
+				};
+				const original = start(boundary);
+				try {
+					const before = await original.ready;
+					expect(before.pid).toBe(original.child.pid);
+					expect(before.record.state).toBe(
+						["ACTIVE", "NATIVE_PREPARE"].includes(boundary) ? "ACTIVE" : "PREPARED",
+					);
+					expect(before.providerCalls).toBeGreaterThan(0);
+					expect(await original.stop()).toEqual({ code: null, signal: "SIGKILL" });
+					const second = start("ADOPTED", before);
+					const adopted = await second.ready;
+					expect(adopted.providerCalls).toBe(0);
+					expect(adopted.successorProviderRequests).toBe(0);
+					expect(adopted.record.activeEpoch.processIncarnationId).not.toBe(
+						before.record.activeEpoch.processIncarnationId,
+					);
+					expect(adopted.record.request).toEqual(before.record.request); // Original IDs, view, epoch and deadline.
+					expect(adopted.fileBase64).toBe(before.fileBase64); // Adoption itself writes no native effect.
+					expect(await second.stop()).toEqual({ code: null, signal: "SIGKILL" });
+					const receiver = start("RECOVERED", adopted);
+					const recovered = await receiver.ready;
+					expect(recovered.providerCalls).toBe(0);
+					expect(recovered.successorProviderRequests).toBe(0);
+					expect(recovered.record.request).toEqual(before.record.request);
+					expect(recovered.record.state).toBe("CONSUMED");
+					expect(recovered.record.completion!.outcome).toBe(boundary === "ACTIVE" ? "failed" : "completed");
+					expect(
+						Buffer.from(recovered.fileBase64, "base64")
+							.subarray(0, Buffer.from(before.fileBase64, "base64").length)
+							.equals(Buffer.from(before.fileBase64, "base64")),
+					).toBe(true);
+					expect(new Set(recovered.entries.map((entry) => entry.entryId)).size).toBe(recovered.entries.length);
+					for (const entry of before.entries) expect(recovered.entries).toContainEqual(entry);
+					expect(recovered.proofs).toEqual(recovered.record.completion!.entries);
+					const recoveredBytes = Buffer.from(recovered.fileBase64, "base64");
+					const rows = recoveredBytes
+						.toString("utf8")
+						.trimEnd()
+						.split("\n")
+						.map((line) => JSON.parse(line) as FileEntry);
+					expect(rows.filter((entry) => entry.type === "compaction")).toHaveLength(boundary === "ACTIVE" ? 0 : 1);
+					const prepares = rows.filter(
+						(entry) => entry.type === "custom" && entry.customType === "pi-maintenance:prepare:v1",
+					);
+					expect(prepares).toHaveLength(1);
+					const plan = (prepares[0] as { data: { plan: NativeMaintenancePlan } }).data.plan;
+					for (const item of plan.entries) {
+						const exactBytes = Buffer.from(item.bytesBase64, "base64");
+						expect(digest(exactBytes)).toBe(item.bytesSha256);
+						expect(recoveredBytes.indexOf(exactBytes)).toBeGreaterThanOrEqual(0);
+						expect(recoveredBytes.indexOf(exactBytes)).toBe(recoveredBytes.lastIndexOf(exactBytes));
+					}
+					expect(await receiver.stop()).toEqual({ code: null, signal: "SIGKILL" });
+					const reboot = start("REBOOT", recovered);
+					const rebooted = await reboot.ready;
+					expect(rebooted.providerCalls).toBe(0);
+					expect(rebooted.successorProviderRequests).toBe(0);
+					expect(rebooted.record).toEqual(recovered.record);
+					expect(rebooted.proofs).toEqual(recovered.proofs);
+					expect(rebooted.fileBase64).toBe(recovered.fileBase64); // No second effect or checkpoint append.
+					expect(await reboot.stop()).toEqual({ code: null, signal: "SIGKILL" });
+					writeFileSync(
+						join(artifacts, "snapshots.json"),
+						`${JSON.stringify({ boundary, before, adopted, recovered, rebooted }, null, 2)}\n`,
+					);
+				} finally {
+					await Promise.all(owned.map((stop) => stop()));
+					// Keep authoritative native/B5/B6 bytes even when an assertion fails.
+					if (process.env.B3_TEST_ARTIFACTS) cpSync(root, join(artifacts, "storage"), { recursive: true });
+				}
+			},
+			150_000,
+		);
+	});
+}
