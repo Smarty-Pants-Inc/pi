@@ -1,4 +1,4 @@
-import type { StreamFn } from "@earendil-works/pi-agent-core";
+import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { prepareCompaction } from "../../../src/core/compaction/index.ts";
@@ -54,9 +54,14 @@ describe("#6647 compaction retries transient summarization failures", () => {
 	}
 
 	/** streamFn that responds with the given sequence of assistant messages across calls. */
-	function useScriptedStreamFn(harness: Harness, script: AssistantMessage[]): () => number {
+	function useScriptedStreamFn(
+		harness: Harness,
+		script: AssistantMessage[],
+		requestThinkingLevels?: Array<ThinkingLevel | undefined>,
+	): () => number {
 		let callCount = 0;
-		const streamFunction: StreamFn = (model) => {
+		const streamFunction: StreamFn = (model, _context, options) => {
+			requestThinkingLevels?.push(options?.reasoning);
 			const message = script[callCount] ?? script[script.length - 1]!;
 			callCount++;
 			const stream = createAssistantMessageEventStream();
@@ -80,6 +85,70 @@ describe("#6647 compaction retries transient summarization failures", () => {
 		harness.session.agent.streamFunction = streamFunction;
 		return () => callCount;
 	}
+
+	// Regression for smarty-dev#17478: only the compaction retry lowers effort; session and normal turns stay unchanged.
+	it.each([
+		{ sessionLevel: "xhigh", retryLevel: "medium" },
+		{ sessionLevel: "low", retryLevel: "low" },
+	] satisfies { sessionLevel: ThinkingLevel; retryLevel: ThinkingLevel }[])(
+		"retries a cut summary at $retryLevel without changing the session's $sessionLevel level",
+		async ({ sessionLevel, retryLevel }) => {
+			const harness = await createHarness({
+				models: [{ id: "reasoning-faux", reasoning: true }],
+			});
+			harnesses.push(harness);
+			seedCompactableSession(harness);
+			const model = harness.getModel();
+			harness.session.agent.state.model = { ...model, thinkingLevelMap: { xhigh: "xhigh" } };
+			harness.session.setThinkingLevel(sessionLevel);
+			const cut = fauxAssistantMessage("partial summary", {
+				stopReason: "error",
+				errorMessage: "OpenAI Responses stream ended before a terminal response event",
+			});
+			const requestThinkingLevels: Array<ThinkingLevel | undefined> = [];
+			const getCallCount = useScriptedStreamFn(
+				harness,
+				[cut, fauxAssistantMessage("recovered summary"), fauxAssistantMessage("normal response")],
+				requestThinkingLevels,
+			);
+			vi.useFakeTimers();
+
+			const compaction = harness.session.compact();
+			await vi.advanceTimersByTimeAsync(2000);
+			await expect(compaction).resolves.toMatchObject({ summary: expect.stringContaining("recovered summary") });
+			expect(getCallCount()).toBe(2);
+			expect(requestThinkingLevels).toEqual([sessionLevel, retryLevel]);
+			expect(harness.session.thinkingLevel).toBe(sessionLevel);
+
+			await harness.session.prompt("normal turn");
+			expect(requestThinkingLevels).toEqual([sessionLevel, retryLevel, sessionLevel]);
+			expect(harness.session.thinkingLevel).toBe(sessionLevel);
+		},
+	);
+
+	// smarty-dev#17478: a successful first summary attempt does not trigger the lower-effort retry.
+	it("does not retry a successful first summary attempt", async () => {
+		const harness = await createHarness({ models: [{ id: "reasoning-faux", reasoning: true }] });
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const model = harness.getModel();
+		harness.session.agent.state.model = { ...model, thinkingLevelMap: { xhigh: "xhigh" } };
+		harness.session.setThinkingLevel("xhigh");
+		const requestThinkingLevels: Array<ThinkingLevel | undefined> = [];
+		const getCallCount = useScriptedStreamFn(
+			harness,
+			[fauxAssistantMessage("first-attempt summary")],
+			requestThinkingLevels,
+		);
+
+		await expect(harness.session.compact()).resolves.toMatchObject({
+			summary: expect.stringContaining("first-attempt summary"),
+		});
+
+		expect(getCallCount()).toBe(1);
+		expect(requestThinkingLevels).toEqual(["xhigh"]);
+		expect(harness.session.thinkingLevel).toBe("xhigh");
+	});
 
 	it("retries a transient `terminated` summarization error and compacts successfully", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
