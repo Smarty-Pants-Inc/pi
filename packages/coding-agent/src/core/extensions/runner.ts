@@ -401,7 +401,18 @@ export class ExtensionRunner {
 	private isProjectTrustedFn: () => boolean = () => true;
 	private getSignalFn: () => AbortSignal | undefined = () => undefined;
 	private waitForIdleFn: () => Promise<void> = async () => {};
-	private abortFn: () => void = () => {};
+	private abortFn: () => void | Promise<void> = () => {};
+	/** Native REQUIRED only; ordinary observer dispatch remains best effort. */
+	strictRecovery = false;
+	/** Native maintenance before-hooks are observe/veto only. */
+	maintenanceObserverOnly = false;
+	private getSessionRecovery: ExtensionContextActions["getSessionRecovery"];
+
+	getSessionRecoveryBindings() {
+		return this.extensions.flatMap((extension) =>
+			extension.sessionRecovery ? [{ source: extension.path, binding: extension.sessionRecovery }] : [],
+		);
+	}
 	private hasPendingMessagesFn: () => boolean = () => false;
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
@@ -491,6 +502,7 @@ export class ExtensionRunner {
 		this.isProjectTrustedFn = contextActions.isProjectTrusted;
 		this.getSignalFn = contextActions.getSignal;
 		this.abortFn = contextActions.abort;
+		this.getSessionRecovery = contextActions.getSessionRecovery;
 		this.hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.shutdownHandler = contextActions.shutdown;
 		this.getContextUsageFn = contextActions.getContextUsage;
@@ -1060,7 +1072,11 @@ export class ExtensionRunner {
 			},
 			abort: () => {
 				runner.assertActive();
-				runner.abortFn();
+				return runner.abortFn();
+			},
+			get sessionRecovery() {
+				runner.assertActive();
+				return runner.getSessionRecovery?.();
 			},
 			hasPendingMessages: () => {
 				runner.assertActive();
@@ -1403,8 +1419,24 @@ export class ExtensionRunner {
 					if (snapshot.type === "session_before_compact") snapshot.branchEntries = branchEntries!;
 					// Keep the small preparation/envelope per handler: Sets and extension flags
 					// may be mutable, unlike the shared frozen history.
+					const observeOnly =
+						this.strictRecovery &&
+						this.maintenanceObserverOnly &&
+						(event.type === "session_before_compact" || event.type === "session_before_tree");
+					const before = observeOnly ? isolateValue({ ...snapshot, signal: undefined }) : undefined;
 					const handlerResult = await this.dispatchHandler(handler, snapshot, ctx, signal);
 					signal?.throwIfAborted();
+					if (
+						observeOnly &&
+						(!isDeepStrictEqual(before, { ...snapshot, signal: undefined }) ||
+							("signal" in observerEvent &&
+								(!("signal" in snapshot) || snapshot.signal !== observerEvent.signal)) ||
+							(handlerResult !== undefined &&
+								(!handlerResult ||
+									typeof handlerResult !== "object" ||
+									Object.keys(handlerResult).some((key) => key !== "cancel"))))
+					)
+						throw new Error(`RECOVERY_MAINTENANCE_HOOK_CONTENT: ${ext.path}: ${event.type}`);
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
 						result = isolateValue(handlerResult) as SessionBeforeEventResult;
@@ -1414,6 +1446,14 @@ export class ExtensionRunner {
 					}
 				} catch (err) {
 					signal?.throwIfAborted();
+					if (
+						this.strictRecovery &&
+						this.maintenanceObserverOnly &&
+						(event.type === "session_before_compact" || event.type === "session_before_tree")
+					)
+						throw new Error(`RECOVERY_MAINTENANCE_HOOK_CONTENT: ${ext.path}: ${event.type}`, { cause: err });
+					if (this.strictRecovery && (event.type === "session_start" || event.type === "session_ready"))
+						throw new Error(`RECOVERY_STARTUP_HANDLER_FAILED: ${ext.path}: ${event.type}`, { cause: err });
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1563,7 +1603,11 @@ export class ExtensionRunner {
 		}
 	}
 
-	async emitToolResult(event: ToolResultEvent, signal?: AbortSignal): Promise<ToolResultEventResult | undefined> {
+	async emitToolResult(
+		event: ToolResultEvent,
+		signal?: AbortSignal,
+		strict = this.strictRecovery,
+	): Promise<ToolResultEventResult | undefined> {
 		await this.closeToolScope(event.toolCallId);
 		signal = this.dispatchSignal(event.type, signal);
 		const ctx = this.createContext();
@@ -1578,6 +1622,15 @@ export class ExtensionRunner {
 						| ToolResultEventResult
 						| undefined;
 					signal?.throwIfAborted();
+					if (
+						strict &&
+						handlerResult !== undefined &&
+						(handlerResult === null ||
+							typeof handlerResult !== "object" ||
+							(handlerResult.content !== undefined && !Array.isArray(handlerResult.content)) ||
+							(handlerResult.isError !== undefined && typeof handlerResult.isError !== "boolean"))
+					)
+						throw new Error("RECOVERY_TOOL_RESULT_MALFORMED");
 					if (!handlerResult) continue;
 
 					if (handlerResult.content !== undefined) {
@@ -1606,6 +1659,7 @@ export class ExtensionRunner {
 					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
+					if (strict) throw new Error(`RECOVERY_TOOL_RESULT_HANDLER_FAILED: ${ext.path}`, { cause: err });
 					this.emitError({
 						extensionPath: ext.path,
 						event: "tool_result",
@@ -2009,6 +2063,8 @@ export class ExtensionRunner {
 					};
 					const result = (await this.dispatchHandler(handler, event, ctx, signal)) as InputEventResult | undefined;
 					signal?.throwIfAborted();
+					if (this.strictRecovery && result && result.action !== "continue")
+						throw new Error(`REQUIRED_INPUT_HOOK_PROTOCOL_ERROR: ${ext.path}: ${result.action}`);
 					if (result?.action === "handled") return result;
 					if (result?.action === "transform") {
 						currentText = result.text;
@@ -2016,6 +2072,8 @@ export class ExtensionRunner {
 					}
 				} catch (err) {
 					signal?.throwIfAborted();
+					if (this.strictRecovery)
+						throw new Error(`REQUIRED_INPUT_HOOK_PROTOCOL_ERROR: ${ext.path}`, { cause: err });
 					this.emitError({
 						extensionPath: ext.path,
 						event: "input",

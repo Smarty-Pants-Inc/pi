@@ -270,6 +270,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	prepareRequest?: PrepareRequest;
 
+	/** Repeatable host permission barrier before preparation, conversion and dispatch; not physical-attempt admission. */
+	assertProviderPermission?: (signal?: AbortSignal) => Promise<void>;
+	/** Pure repeatable provider-view repair, after ordinary context transforms. Never edits raw history. */
+	projectProviderContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+
 	/**
 	 * Called after `turn_end` when the loop will continue, immediately before the next turn starts.
 	 * Return replacement context/model/thinking state or messages to append to affect that turn.

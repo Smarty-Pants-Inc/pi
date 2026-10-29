@@ -132,6 +132,8 @@ export interface AgentOptions {
 	transformToolUpdate?: AgentLoopConfig["transformToolUpdate"];
 	finishTurn?: FinishTurn;
 	prepareRequest?: PrepareRequest;
+	assertProviderPermission?: AgentLoopConfig["assertProviderPermission"];
+	projectProviderContext?: AgentLoopConfig["projectProviderContext"];
 	prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -278,6 +280,8 @@ export class Agent {
 	/** @internal Synchronous batch check before reservation or message publication. Does not restrict enqueue admission. */
 	public validateQueuedMessages?: (messages: readonly AgentMessage[], mode: "steer" | "followUp") => void;
 	public prepareRequest?: PrepareRequest;
+	public assertProviderPermission?: AgentLoopConfig["assertProviderPermission"];
+	public projectProviderContext?: AgentLoopConfig["projectProviderContext"];
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
@@ -316,6 +320,8 @@ export class Agent {
 		this.transformToolUpdate = runtimeOptions.transformToolUpdate;
 		this.finishTurn = runtimeOptions.finishTurn;
 		this.prepareRequest = runtimeOptions.prepareRequest;
+		this.assertProviderPermission = runtimeOptions.assertProviderPermission;
+		this.projectProviderContext = runtimeOptions.projectProviderContext;
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
 		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
 		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
@@ -490,7 +496,7 @@ export class Agent {
 	}
 
 	/** Abort the current run, if one is active. */
-	abort(): void {
+	abort(): void | Promise<void> {
 		this.activeRun?.abortController.abort();
 	}
 
@@ -643,6 +649,8 @@ export class Agent {
 			transformToolUpdate: this.transformToolUpdate,
 			finishTurn: this.finishTurn,
 			prepareRequest: this.prepareRequest,
+			assertProviderPermission: this.assertProviderPermission,
+			projectProviderContext: this.projectProviderContext,
 			prepareNextTurn:
 				this.prepareNextTurnWithContext || this.prepareNextTurn
 					? async (context) => {

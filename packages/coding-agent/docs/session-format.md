@@ -184,6 +184,14 @@ Use `customType` to identify your extension's entries on reload. Interactive mod
 
 Pi stores [virtual model](virtual-models.md) router state as custom entries with `customType` `pi.virtual-model-state` and `data` `{ provider, modelId, state }`.
 
+### Reserved recovery-maintenance control entries
+
+The whole `pi-maintenance:` custom-type prefix belongs to the bound native recovery writer. Public custom-entry/message append paths reject it. A `pi-maintenance:prepare:v1` entry retains one frozen native plan: fixed IDs, parents, timestamps, exact JSON-plus-LF bytes and hashes. B5 stores only the plan reference/hash, not summary text. A `pi-maintenance:checkpoint:v1` follows the planned compaction or navigation parent; it does not interpret `data.finalLeafId`. For user/custom-message tree targets the checkpoint parent is the actual `newLeafId`, excluding the text moved into the editor.
+
+These are non-conversational control entries, not accepted input or additional usage. On REQUIRED reopen, their presence holds the semantic leaf/projection until binding startup authenticates every selected plan against B5 and existing B6 receipts. Missing/orphan/changed records fail closed. A raw JSONL scan, file length or later custody receipt does not establish an earlier B6 commit. An old consumed checkpoint cannot rewind later legitimate entries. Recovery forks omit these reserved records and relink the retained path rather than importing another session's maintenance authority.
+
+See [REQUIRED recovery maintenance](compaction.md#required-recovery-maintenance) for operation gates, cancellation and integration prerequisites. This is not physical failover qualification.
+
 ### CustomMessageEntry
 
 Extension-injected messages that DO participate in LLM context.

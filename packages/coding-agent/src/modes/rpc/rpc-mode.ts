@@ -619,7 +619,11 @@ export async function runRpcMode(
 			}
 
 			case "clear_queue": {
-				return success(id, "clear_queue", session.clearQueue());
+				return success(
+					id,
+					"clear_queue",
+					session.recovery.required ? await session.cancelAndClearQueue() : session.clearQueue(),
+				);
 			}
 
 			case "new_session": {

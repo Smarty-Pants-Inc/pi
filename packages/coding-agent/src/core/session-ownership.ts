@@ -19,6 +19,7 @@ import {
 	type OwnerHost,
 } from "./owner-effects.ts";
 import { persistOwnedTerminalSession, SessionManager } from "./session-manager.ts";
+import { withSessionPersistenceScope } from "./session-recovery-persistence.ts";
 
 const inspectOriginalJournalResources = OwnedJournal.prototype.inspectResources;
 const inspectOriginalJournalPermission = OwnedJournal.prototype.inspectPermission;
@@ -673,11 +674,11 @@ export class SessionOwnership {
 	/** Called only by narrow native message/control persistence sites. The close
 	 * owner opens this phase after all physical effects have actually settled. */
 	async terminal<T>(write: () => T): Promise<T> {
-		if (this.#phase === "active") return this.within(write);
+		if (this.#phase === "active") return withSessionPersistenceScope(this.manager, () => this.within(write));
 		if (this.#phase !== "draining" && this.#phase !== "terminal") throw new Error("STALE_OWNER");
 		await this.#terminalReady;
 		if (this.#phase !== "terminal") throw new Error("STALE_OWNER");
-		return this.#journal.terminal(write);
+		return withSessionPersistenceScope(this.manager, () => this.#journal.terminal(write));
 	}
 
 	close(
@@ -768,11 +769,13 @@ export class SessionOwnership {
 			if (!errors.length) {
 				try {
 					await Promise.race([
-						this.#journal.terminal(async () => {
-							await hooks.persist?.();
-							checkDeadline();
-							await persistOwnedTerminalSession(this.manager);
-						}),
+						withSessionPersistenceScope(this.manager, () =>
+							this.#journal.terminal(async () => {
+								await hooks.persist?.();
+								checkDeadline();
+								await persistOwnedTerminalSession(this.manager);
+							}),
+						),
 						deadline,
 					]);
 					checkDeadline();

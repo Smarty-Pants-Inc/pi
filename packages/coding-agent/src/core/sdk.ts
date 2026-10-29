@@ -21,6 +21,7 @@ import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
 import { assertUnownedSessionManager, getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import { currentSessionOwnership } from "./session-ownership.ts";
+import type { SessionRecoveryOptions } from "./session-recovery-control.ts";
 import {
 	applyToolModifiers,
 	DEFAULT_TOOL_NAMES,
@@ -50,6 +51,8 @@ import { getBranchSelection } from "./virtual-models.ts";
 setDefaultStreamFn(streamSimple);
 
 export interface CreateAgentSessionOptions {
+	/** Typed launch fact. Must be supplied before retained native open; no CLI/env spelling is implied. */
+	recovery?: SessionRecoveryOptions;
 	/** Working directory for project-local discovery. Default: process.cwd() */
 	cwd?: string;
 	/** Global config directory. Default: ~/.pi/agent */
@@ -196,6 +199,7 @@ function getDefaultAgentDir(): string {
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const owner = ordinaryOwnerOf(options);
+	const selectedRecovery = options.recovery ? Object.freeze({ ...options.recovery }) : undefined;
 	if (!owner && currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
 	const suppliedManager = options.sessionManager;
 	if (owner) {
@@ -231,6 +235,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			tools: tools?.slice(),
 			thinkingLevel,
 			sessionStartEvent,
+			recovery: selectedRecovery,
 			sessionManager: suppliedManager,
 		});
 		owner.assertSdkInputs(options);
@@ -257,9 +262,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
+	if (!owner && selectedRecovery) options = { ...options, recovery: selectedRecovery };
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	if (suppliedManager && options.recovery?.required && options.recovery.sessionFile)
+		throw new Error("RECOVERY_OPEN_TARGET_AMBIGUOUS");
+	const sessionManager =
+		suppliedManager ??
+		(options.recovery?.required && options.recovery.sessionFile
+			? await SessionManager.openForRecoveryAfterExclusion(options.recovery.sessionFile, options.recovery.preOpen)
+			: SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir)));
+	if (options.recovery?.required) {
+		if (!sessionManager.isPersisted() || !sessionManager.getRecoveryPersistenceState().preparedOpen)
+			throw new Error("RECOVERY_PREPARED_OPEN_REQUIRED");
+		sessionManager.assertRecoveryExclusion();
+		sessionManager.enableRecoveryPersistence();
+		if (
+			sessionManager.getRecoveryPersistenceState().needsRecovery &&
+			sessionManager.recoverRecoveryAppends().issues.length
+		)
+			throw new Error("RECOVERY_NATIVE_SCAN_INCOMPLETE");
+	}
 	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath, settingsManager }));
-	const sessionManager = suppliedManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
@@ -516,17 +539,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 	});
 
-	// Restore missing settings metadata for older sessions.
-	if (hasExistingSession) {
-		if (!hasThinkingEntry) {
+	// A held maintenance projection is not proof of a fresh session. The native
+	// startup pass must authenticate retained records before any metadata append;
+	// it also restores the authenticated model/thinking selection into agent state.
+	const retainedMaintenance =
+		options.recovery?.required &&
+		sessionManager
+			.getEntries()
+			.some((entry) => entry.type === "custom" && entry.customType.startsWith("pi-maintenance:"));
+	if (!retainedMaintenance) {
+		// Restore missing settings metadata for older sessions.
+		if (hasExistingSession) {
+			if (!hasThinkingEntry) {
+				sessionManager.appendThinkingLevelChange(thinkingLevel);
+			}
+		} else {
+			// Save initial model and thinking level for new sessions so they can be restored on resume
+			if (model) {
+				sessionManager.appendModelChange(model.provider, model.id);
+			}
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
-	} else {
-		// Save initial model and thinking level for new sessions so they can be restored on resume
-		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
-		}
-		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
 
 	const sessionConfig = {
@@ -546,6 +579,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
+		recovery: options.recovery,
 	};
 	owner?.assertActive();
 	const session = new AgentSession(owner ? bindOrdinaryOptions(sessionConfig, owner) : sessionConfig);

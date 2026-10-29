@@ -24,6 +24,7 @@ import {
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
 import { assertUnownedSessionManager, SessionManager } from "./session-manager.ts";
+import type { SessionRecoveryOptions } from "./session-recovery-control.ts";
 
 /**
  * Result returned by runtime creation.
@@ -49,6 +50,7 @@ export type CreateAgentSessionRuntimeFactory = (options: {
 	sessionManager: SessionManager;
 	sessionStartEvent?: SessionStartEvent;
 	projectTrustContext?: ProjectTrustContext;
+	recovery?: SessionRecoveryOptions;
 }) => Promise<CreateAgentSessionRuntimeResult>;
 
 /**
@@ -342,7 +344,7 @@ export class AgentSessionRuntime {
 		reason: SessionShutdownEvent["reason"],
 		targetSessionFile?: string,
 	): Promise<void> {
-		await outgoing.session.abort();
+		await outgoing.session.interruptForLifecycle(`replacement:${reason}`);
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
 		await raceWithAbortSignal(
@@ -388,6 +390,13 @@ export class AgentSessionRuntime {
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
 		assertUnownedSessionManager(options.sessionManager);
+		if (outgoing.session.recovery.required) {
+			options.recovery = { required: true, deferStartup: true, preOpen: outgoing.session.recovery.preOpen };
+			const state = options.sessionManager.getRecoveryPersistenceState();
+			if (!state.preparedOpen) throw new Error("RECOVERY_PREPARED_OPEN_REQUIRED");
+			options.sessionManager.assertRecoveryExclusion();
+			options.sessionManager.enableRecoveryPersistence();
+		}
 		const construction = this.createRuntime(Object.freeze(options));
 		// A non-cooperative factory may finish after cancellation. Never publish it;
 		// observe its result and retire the unpublished session instead.
@@ -404,6 +413,8 @@ export class AgentSessionRuntime {
 		);
 		let fencing = false;
 		try {
+			if (outgoing.session.recovery.required && !session.recovery.required)
+				throw new Error("RECOVERY_FACTORY_FORWARDING_REQUIRED");
 			outgoing.session.shutdownSignal?.throwIfAborted();
 			this.#assertCurrent(outgoing);
 			assertUnownedSessionManager(session.sessionManager);
@@ -467,7 +478,14 @@ export class AgentSessionRuntime {
 			);
 		}
 		this.#publish(session, services, diagnostics, modelFallbackMessage, options.sessionStartEvent);
-		await finish();
+		try {
+			await finish();
+			if (session.recovery.required)
+				await session.withFencedInput(() => session.completeRecoveryStartup(options.sessionStartEvent?.reason));
+		} catch (error) {
+			if (session.recovery.required) session.recovery.block("RECOVERY_REPLACEMENT_FAILED", error);
+			throw error;
+		}
 	}
 
 	#publish(
@@ -521,7 +539,14 @@ export class AgentSessionRuntime {
 			}
 
 			const previousSessionFile = outgoing.session.sessionFile;
-			const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+			const sessionManager = outgoing.session.recovery.required
+				? await SessionManager.openForRecoveryAfterExclusion(
+						sessionPath,
+						outgoing.session.recovery.preOpen,
+						undefined,
+						options?.cwdOverride,
+					)
+				: SessionManager.open(sessionPath, undefined, options?.cwdOverride);
 			assertSessionCwdExists(sessionManager, this.cwd);
 			await this.teardownCurrent(outgoing, "resume", sessionManager.getSessionFile());
 			this.#assertCurrent(outgoing);
@@ -607,6 +632,7 @@ export class AgentSessionRuntime {
 			if (beforeResult.cancelled) {
 				return { cancelled: true };
 			}
+			if (outgoing.session.recovery.required) await outgoing.session.interruptForLifecycle("fork-selection");
 			let targetLeafId: string | null;
 			let selectedText: string | undefined;
 
@@ -653,8 +679,12 @@ export class AgentSessionRuntime {
 				if (!existsSync(currentSessionFile)) {
 					throw new Error("This session has not been saved yet. Send a message before cloning or forking it.");
 				}
-				const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
-				const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
+				const sessionManager = outgoing.session.recovery.required
+					? outgoing.sessionManager.forkForRecovery(targetLeafId)
+					: SessionManager.open(currentSessionFile, sessionDir);
+				const forkedSessionPath = outgoing.session.recovery.required
+					? sessionManager.getSessionFile()
+					: sessionManager.createBranchedSession(targetLeafId);
 				if (!forkedSessionPath) {
 					throw new Error("Failed to create forked session");
 				}
@@ -738,7 +768,14 @@ export class AgentSessionRuntime {
 				copyFileSync(resolvedPath, destinationPath, constants.COPYFILE_EXCL);
 			}
 
-			const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
+			const sessionManager = outgoing.session.recovery.required
+				? await SessionManager.openForRecoveryAfterExclusion(
+						destinationPath,
+						outgoing.session.recovery.preOpen,
+						sessionDir,
+						cwdOverride,
+					)
+				: SessionManager.open(destinationPath, sessionDir, cwdOverride);
 			assertSessionCwdExists(sessionManager, this.cwd);
 			await this.teardownCurrent(outgoing, "resume", sessionManager.getSessionFile());
 			this.#assertCurrent(outgoing);
@@ -904,7 +941,7 @@ export class AgentSessionRuntime {
 						.close({
 							stop: () => {
 								this.#assertIdentity(outgoing);
-								return outgoing.session.abort();
+								return outgoing.session.interruptForLifecycle("owner-close");
 							},
 							persist: async () => {
 								this.#assertIdentity(outgoing);
@@ -922,7 +959,7 @@ export class AgentSessionRuntime {
 				}
 				return await this.#ownerDisposal;
 			}
-			await outgoing.session.abort();
+			await outgoing.session.interruptForLifecycle("runtime-dispose");
 			this.#assertCurrent(outgoing, true);
 			await this.waitForShutdownHook(outgoing.session);
 			this.#assertCurrent(outgoing, true);
@@ -949,18 +986,27 @@ export async function createAgentSessionRuntime(
 		agentDir: string;
 		sessionManager: SessionManager;
 		sessionStartEvent?: SessionStartEvent;
+		recovery?: SessionRecoveryOptions;
 	},
 ): Promise<AgentSessionRuntime> {
 	const owner = ordinaryOwnerOf(options);
 	const sessionManager = options.sessionManager;
 	assertOrdinaryRuntime(sessionManager, owner, createRuntime);
 	const { cwd, agentDir, sessionStartEvent } = options;
-	const retained = Object.freeze({ cwd, agentDir, sessionStartEvent, sessionManager });
+	const retained = Object.freeze({ cwd, agentDir, sessionStartEvent, sessionManager, recovery: options.recovery });
+	if (options.recovery?.required) {
+		if (!sessionManager.getRecoveryPersistenceState().preparedOpen)
+			throw new Error("RECOVERY_PREPARED_OPEN_REQUIRED");
+		sessionManager.assertRecoveryExclusion();
+		sessionManager.enableRecoveryPersistence();
+	}
 	assertSessionCwdExists(sessionManager, retained.cwd);
 	const { session, services, diagnostics, modelFallbackMessage } = await (owner
 		? owner.within(() => createRuntime(bindOrdinaryOptions(retained, owner)))
 		: createRuntime(retained));
 	assertOrdinaryRuntime(session.sessionManager, owner, createRuntime);
+	if (options.recovery?.required && !session.recovery.required)
+		throw new Error("RECOVERY_FACTORY_FORWARDING_REQUIRED");
 	return new AgentSessionRuntime(session, services, createRuntime, diagnostics, modelFallbackMessage);
 }
 

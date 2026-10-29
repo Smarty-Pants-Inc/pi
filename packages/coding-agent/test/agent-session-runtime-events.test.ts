@@ -212,6 +212,50 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		},
 	);
 
+	// Smarty-Pants-Inc/smarty-dev#16188: observing abort must also stop the real original Agent.
+	it("ordinary abort stops the active original agent after a callback replaces session.agent", async () => {
+		const { runtimeHost, faux } = await createRuntimeHost(() => {});
+		const session = runtimeHost.session;
+		const original = session.agent;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		faux.setResponses([
+			async (_context, options) => {
+				entered.resolve();
+				await new Promise<void>((resolve) => {
+					options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+					void release.promise.then(resolve);
+				});
+				return fauxAssistantMessage("cancelled", { stopReason: "aborted" });
+			},
+		]);
+		const replacement = Object.create(original);
+		const replacementAbort = vi.fn();
+		Object.assign(replacement, { abort: replacementAbort });
+		const originalAbort = vi.spyOn(original, "abort");
+		const hook = vi.spyOn(session, "abortBranchSummary").mockImplementation(() => {
+			Object.defineProperty(session, "agent", { value: replacement, configurable: true });
+		});
+		const running = session.prompt("active original");
+		try {
+			await entered.promise;
+			const signal = original.signal;
+			expect(signal?.aborted).toBe(false);
+			await session.abort();
+			await running;
+			expect(signal?.aborted).toBe(true);
+			expect(original.signal).toBeUndefined();
+			expect(originalAbort).toHaveBeenCalledOnce();
+			expect(replacementAbort).not.toHaveBeenCalled();
+		} finally {
+			release.resolve();
+			Object.defineProperty(session, "agent", { value: original, configurable: true });
+			hook.mockRestore();
+			originalAbort.mockRestore();
+			await running;
+		}
+	});
+
 	it.each(["failed", "aborted"] as const)(
 		"TUI does not restore input already retained by real session compaction (%s)",
 		async (outcome) => {

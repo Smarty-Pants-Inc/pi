@@ -67,6 +67,7 @@ import {
 	type SessionCwdIssue,
 } from "./core/session-cwd.ts";
 import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
+import type { SessionRecoveryOptions } from "./core/session-recovery-control.ts";
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
@@ -579,9 +580,13 @@ async function promptForMissingSessionCwd(
 
 export interface MainOptions {
 	extensionFactories?: InlineExtension[];
+	/** Typed launch seam only. B2 owns the eventual public launch spelling. */
+	recovery?: SessionRecoveryOptions;
 }
 
 export async function main(args: string[], options?: MainOptions) {
+	// REQUIRED must never silently downgrade through a services factory that drops its option.
+	if (options?.recovery?.required) throw new Error("RECOVERY_MAIN_SERVICES_FORWARDING_REQUIRED");
 	const parsed = parseArgs(args);
 	// Receive before migrations, resource discovery, trust hooks or model fallback.
 	// Unsupported owned invocations never fall through to the unowned bootstrap.

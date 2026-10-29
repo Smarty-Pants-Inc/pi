@@ -311,6 +311,9 @@ interface NativeOwnerBinding {
 	appendJournal(lease: NativeLease, name: string, previousLength: number, suffix: Buffer): number;
 	appendTerminalJournal(lease: NativeLease, name: string, previousLength: number, suffix: Buffer): number;
 	verifyJournal(lease: NativeLease, name: string, previousLength: number): number;
+	/** Additive capability: unlike verifyJournal, flushes the exact retained prefix. */
+	journalFlushAbi?: number;
+	flushJournal?(lease: NativeLease, name: string, previousLength: number): number;
 	appendTerminalJournalAsync(
 		lease: NativeLease,
 		name: string,
@@ -706,6 +709,8 @@ export class OwnedJournal {
 	readonly #initialHeader?: SessionHeader;
 	#chunks: Buffer[] = [];
 	#length = 0;
+	// Current-incarnation proof: successful nonempty commit OR explicit native recovery flush.
+	#committedAppendBytes = 0;
 	readonly #hash = createHash("sha256");
 	#loaded: boolean;
 	#quarantined = false;
@@ -878,7 +883,7 @@ export class OwnedJournal {
 		return this.#commit(bytes, true);
 	}
 
-	/** Explicit receipt only: ordinary appends update the running hash, not a digest. */
+	/** Custody/readback only, NOT flush proof. Ordinary appends maintain the running hash. */
 	currentReceipt(): { bytes: number; sha256: string } {
 		this.assertWritable();
 		try {
@@ -890,8 +895,38 @@ export class OwnedJournal {
 		}
 	}
 
+	/** Proof from this incarnation's nonempty native commit or explicit recovery flush.
+	 * A recovered read/currentReceipt alone never establishes this proof. */
+	committedAppendReceipt(): { bytes: number; sha256: string } | undefined {
+		this.assertWritable();
+		if (!this.#committedAppendBytes || this.#committedAppendBytes !== this.#length) return undefined;
+		return { bytes: this.#committedAppendBytes, sha256: this.#hash.copy().digest("hex") };
+	}
+
+	/** Re-verify and fsync retained bytes through the existing native owner, without
+	 * appending anything. This proves a CURRENT flush, not historical durability.
+	 * Repeated recovery rechecks custody but reuses an already proven exact prefix.
+	 * Older addons remain usable normally, but cannot supply recovery flush proof. */
+	flushRecoveryPrefix(): { bytes: number; sha256: string } | undefined {
+		this.assertActive();
+		if (!this.#length) return undefined;
+		if (this.#committedAppendBytes === this.#length) return this.currentReceipt();
+		if (this.#native.journalFlushAbi !== 1 || typeof this.#native.flushJournal !== "function") return undefined;
+		try {
+			const count = this.#native.flushJournal(this.#lease, basename(this.file), this.#length);
+			if (count !== this.#length) throw new Error("OWNER_JOURNAL_RECEIPT");
+			this.#committedAppendBytes = count;
+			return { bytes: count, sha256: this.#hash.copy().digest("hex") };
+		} catch (error) {
+			this.#failCommit(error);
+		}
+	}
+
 	/** Submit only the admitted suffix; native retains and verifies the trusted prefix. */
-	append(suffix: Buffer): void {
+	append(suffix: Buffer): void;
+	append(suffix: Buffer, captureReceipt: true): { bytes: number; sha256: string };
+	append(suffix: Buffer, captureReceipt = false): { bytes: number; sha256: string } | undefined {
+		if (captureReceipt && !suffix.length) throw new Error("OWNER_NONEMPTY_COMMIT_REQUIRED");
 		this.assertWritable();
 		if (suffix.length > this.maxBytes - this.#length) throw new Error("OWNER_JOURNAL_NOT_APPEND");
 		const retained = Buffer.from(suffix);
@@ -901,13 +936,18 @@ export class OwnedJournal {
 				: this.#native.appendJournal(this.#lease, basename(this.file), this.#length, retained);
 			if (count !== this.#length + retained.length) throw new Error("OWNER_JOURNAL_RECEIPT");
 			this.#retain(retained);
+			if (retained.length) this.#committedAppendBytes = count;
+			if (captureReceipt) return { bytes: count, sha256: this.#hash.copy().digest("hex") };
 		} catch (error) {
 			this.#failCommit(error);
 		}
 	}
 
-	async appendTerminalAsync(suffix: Buffer): Promise<void> {
-		await this.#commitTerminalAsync(Buffer.from(suffix), false);
+	appendTerminalAsync(suffix: Buffer): Promise<void>;
+	appendTerminalAsync(suffix: Buffer, captureReceipt: true): Promise<{ bytes: number; sha256: string }>;
+	async appendTerminalAsync(suffix: Buffer, captureReceipt = false): Promise<unknown> {
+		if (captureReceipt && !suffix.length) throw new Error("OWNER_NONEMPTY_COMMIT_REQUIRED");
+		return this.#commitTerminalAsync(Buffer.from(suffix), false, captureReceipt);
 	}
 
 	async commitTerminalAsync(bytes: Buffer): Promise<{ bytes: number; sha256: string }> {
@@ -915,7 +955,11 @@ export class OwnedJournal {
 		return this.currentReceipt();
 	}
 
-	async #commitTerminalAsync(bytes: Buffer, full: boolean): Promise<void> {
+	async #commitTerminalAsync(
+		bytes: Buffer,
+		full: boolean,
+		captureReceipt = false,
+	): Promise<{ bytes: number; sha256: string } | undefined> {
 		const scope = terminalWrites.getStore();
 		if (scope?.journal !== this || !scope.active || !this.#sealed || this.#quarantined || this.#releaseAttempted)
 			throw new Error("OWNER_TERMINAL_STATE");
@@ -939,6 +983,11 @@ export class OwnedJournal {
 			});
 			if (count !== expected) throw new Error("OWNER_JOURNAL_RECEIPT");
 			this.#retain(suffix!);
+			if (suffix!.length) this.#committedAppendBytes = count;
+			if (captureReceipt) {
+				if (!suffix!.length) throw new Error("OWNER_NONEMPTY_COMMIT_REQUIRED");
+				return { bytes: count, sha256: this.#hash.copy().digest("hex") };
+			}
 		} catch (error) {
 			this.#failCommit(error);
 		}
@@ -978,7 +1027,9 @@ export class OwnedJournal {
 				? this.#native.commitTerminalJournal(this.#lease, basename(this.file), previous, next)
 				: this.#native.commitJournal(this.#lease, basename(this.file), previous, next);
 			if (count !== next.length) throw new Error("OWNER_JOURNAL_RECEIPT");
+			const appended = next.length - this.#length;
 			this.#retain(next.subarray(this.#length));
+			if (appended) this.#committedAppendBytes = count;
 			return this.currentReceipt();
 		} catch (error) {
 			this.#failCommit(error);

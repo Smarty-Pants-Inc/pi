@@ -65,6 +65,8 @@ export interface CollectEntriesResult {
 }
 
 export interface GenerateBranchSummaryOptions {
+	/** Native repaired source view, applied before conversion/serialization. */
+	projectMessages?: (messages: AgentMessage[]) => Promise<AgentMessage[]>;
 	/** Model to use for summarization */
 	model: Model<any>;
 	/** API key for the model */
@@ -320,7 +322,9 @@ export async function generateBranchSummary(
 	const contextWindow = model.contextWindow || 128000;
 	const tokenBudget = contextWindow - reserveTokens;
 
-	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
+	const prepared = prepareBranchEntries(entries, tokenBudget);
+	const messages = options.projectMessages ? await options.projectMessages(prepared.messages) : prepared.messages;
+	const fileOps = prepared.fileOps;
 
 	if (messages.length === 0) {
 		return { summary: "No content to summarize" };

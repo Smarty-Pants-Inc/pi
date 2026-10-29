@@ -3947,7 +3947,8 @@ export class InteractiveMode {
 				// Keep editor active; submissions are queued during compaction.
 				this.autoCompactionEscapeHandler = this.defaultEditor.onEscape;
 				this.defaultEditor.onEscape = () => {
-					this.session.abortCompaction();
+					if (this.session.recovery.required) this.restoreQueuedMessagesToEditor({ abort: true });
+					else this.session.abortCompaction();
 				};
 				const colorFn = isEmbeddedStatus(this.editor)
 					? (text: string) =>
@@ -4019,7 +4020,8 @@ export class InteractiveMode {
 				// Set up escape to abort retry
 				this.retryEscapeHandler = this.defaultEditor.onEscape;
 				this.defaultEditor.onEscape = () => {
-					this.session.abortRetry();
+					if (this.session.recovery.required) this.restoreQueuedMessagesToEditor({ abort: true });
+					else this.session.abortRetry();
 				};
 				this.showStatusIndicator(
 					new RetryStatusIndicator(this.ui, event.attempt, event.maxAttempts, event.delayMs, event.waitMessage),
@@ -5322,7 +5324,35 @@ export class InteractiveMode {
 		}
 	}
 
+	private requiredQueueRestore?: Promise<void>;
+
+	private async restoreRequiredQueuedMessages(): Promise<void> {
+		const messages = this.session.agent.getQueuedMessages();
+		const compaction = [...this.compactionQueuedMessages];
+		const { steering, followUp } = await this.session.cancelAndClearQueue();
+		// Do not remove input typed while durability/join was pending.
+		const captured = new Set(compaction);
+		this.compactionQueuedMessages = this.compactionQueuedMessages.filter((message) => !captured.has(message));
+		const queued = [...steering, ...followUp, ...compaction.map((message) => message.input.text)];
+		const imageText = this.recoveryText(messages, true);
+		if (imageText) queued.push(imageText);
+		const current = this.editor.getExpandedText?.() ?? this.editor.getText();
+		if (queued.length) this.editor.setText([...queued, current].filter((text) => text.trim()).join("\n\n"));
+		this.updatePendingMessagesDisplay();
+		this.ui.requestRender();
+	}
+
 	private restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
+		if (this.session.recovery.required) {
+			if (!this.requiredQueueRestore) {
+				this.requiredQueueRestore = this.restoreRequiredQueuedMessages()
+					.catch((error: unknown) => this.showError(error instanceof Error ? error.message : String(error)))
+					.finally(() => {
+						this.requiredQueueRestore = undefined;
+					});
+			}
+			return 0;
+		}
 		// Snapshot complete content before clearQueue destroys the native queues.
 		const messages = this.session.agent.getQueuedMessages();
 		const { steering, followUp } = this.clearAllQueues();
@@ -5349,6 +5379,11 @@ export class InteractiveMode {
 	}
 
 	private queueCompactionMessage(input: ReceivedInput, mode: "steer" | "followUp"): void {
+		if (this.session.recovery.required) {
+			this.restoreRejectedInput(input.text);
+			this.showStatus("Not submitted during maintenance; input retained in editor");
+			return;
+		}
 		this.confirmUnsentDiscard = false;
 		this.compactionQueuedMessages.push({ input, mode });
 		this.stagingAudit?.("compaction-enqueued");
@@ -5368,6 +5403,7 @@ export class InteractiveMode {
 	}
 
 	private flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
+		if (this.session.recovery.required) return Promise.resolve();
 		const work = this.transferCompactionQueue(options);
 		this.compactionQueueWork.add(work);
 		void work.then(
@@ -6252,7 +6288,9 @@ export class InteractiveMode {
 
 	private showTreeSelector(initialSelectedId?: string): void {
 		const tree = this.sessionManager.getTree();
-		const realLeafId = this.sessionManager.getLeafId();
+		const realLeafId = this.session.recovery.required
+			? this.sessionManager.getSemanticLeafId()
+			: this.sessionManager.getLeafId();
 		const initialFilterMode = this.settingsManager.getTreeFilterMode();
 
 		if (tree.length === 0) {
@@ -6267,7 +6305,12 @@ export class InteractiveMode {
 				this.ui.terminal.rows,
 				async (entryId) => {
 					// Selecting the current leaf is a no-op (already there)
-					if (entryId === this.sessionManager.getLeafId()) {
+					if (
+						entryId ===
+						(this.session.recovery.required
+							? this.sessionManager.getSemanticLeafId()
+							: this.sessionManager.getLeafId())
+					) {
 						done();
 						this.showStatus("Already at this point");
 						return;
@@ -6286,7 +6329,7 @@ export class InteractiveMode {
 							const summaryChoice = await this.showExtensionSelector("Summarize branch?", [
 								"No summary",
 								"Summarize",
-								"Summarize with custom prompt",
+								...(this.session.recovery.required ? [] : ["Summarize with custom prompt"]),
 							]);
 
 							if (summaryChoice === undefined) {
@@ -6311,9 +6354,9 @@ export class InteractiveMode {
 					}
 
 					// The user committed to navigating: stop the active response first.
-					if (this.session.isStreaming) {
+					if (!this.session.recovery.required && this.session.isStreaming) {
 						this.restoreQueuedMessagesToEditor();
-						await this.session.abort();
+						await this.session.interruptForLifecycle("tree-navigation");
 					}
 
 					// Recheck after the dialogs and streaming abort, before replacing another operation's UI.
@@ -6377,6 +6420,10 @@ export class InteractiveMode {
 					this.ui.requestRender();
 				},
 				(entryId, label) => {
+					if (this.session.recovery.required) {
+						this.showError("RECOVERY_MAINTENANCE_USER_TEXT: label editing is unavailable under REQUIRED");
+						return;
+					}
 					this.sessionManager.appendLabelChange(entryId, label);
 					this.ui.requestRender();
 				},

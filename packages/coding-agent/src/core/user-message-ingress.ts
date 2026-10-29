@@ -57,10 +57,16 @@ export class UserMessageIngress {
 	private runtimeAvailable = true;
 	/** Host lifecycle fence (#163 input fences/disposal), checked with the generation fence. */
 	private readonly lifecycleRefusal: () => RejectionReason | undefined;
+	private readonly beforeReservation: () => RejectionReason | undefined;
 
-	constructor(shutdownSignal: AbortSignal, lifecycleRefusal: () => RejectionReason | undefined = () => undefined) {
+	constructor(
+		shutdownSignal: AbortSignal,
+		lifecycleRefusal: () => RejectionReason | undefined = () => undefined,
+		beforeReservation: () => RejectionReason | undefined = () => undefined,
+	) {
 		this.shutdownSignal = shutdownSignal;
 		this.lifecycleRefusal = lifecycleRefusal;
+		this.beforeReservation = beforeReservation;
 	}
 
 	get generation(): string {
@@ -134,6 +140,10 @@ export class UserMessageIngress {
 		if (registrationEpoch.length > MAX_ID_BYTES || requestId.length > MAX_ID_BYTES) {
 			return rejected("admission_refused");
 		}
+		// REQUIRED has not reached authoritative B5 storage here. Refuse without looking up,
+		// hashing or consuming a key. Ordinary lifecycle/duplicate semantics below are unchanged.
+		const earlyRefusal = this.beforeReservation();
+		if (earlyRefusal) return rejected(earlyRefusal);
 		// Snapshot only supported fields after O(1) length bounds and before any asynchronous hook.
 		// Do not enumerate or retain arbitrary caller-owned properties.
 		request = {
