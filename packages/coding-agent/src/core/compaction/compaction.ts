@@ -671,6 +671,15 @@ function createSummarizationOptions(
 	return options;
 }
 
+/** Reduce expensive compaction reasoning only after the existing retry classifier admits a retry. */
+function getCompactionRetryThinkingLevel(
+	model: Model<any>,
+	thinkingLevel: ThinkingLevel | undefined,
+): Exclude<ThinkingLevel, "off"> | undefined {
+	if (!model.reasoning) return undefined;
+	return thinkingLevel === "high" || thinkingLevel === "xhigh" || thinkingLevel === "max" ? "medium" : undefined;
+}
+
 interface SummarizationLimits {
 	maxTokens?: number;
 	requestTimeoutMs?: number;
@@ -696,6 +705,7 @@ export async function completeSummarization(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	requestTimeoutMs?: number,
+	retryThinkingLevel?: Exclude<ThinkingLevel, "off">,
 ): Promise<AssistantMessage> {
 	assertContextFitsWindow(context.messages, model);
 	// Avoid cache writes for one-off summaries. Reuse caller-supplied routing when available;
@@ -773,7 +783,17 @@ export async function completeSummarization(
 		onRetryAttemptStart: () => observe(() => callbacks.onRetryAttemptStart?.()),
 		onRetryFinished: (...args) => observe(() => callbacks.onRetryFinished?.(...args)),
 	};
-	return retryAssistantCall(produce, retry, requestOptions.signal, observers, (response) =>
+	const retryCallbacks: RetryCallbacks | undefined =
+		retryThinkingLevel === undefined
+			? observers
+			: {
+					...observers,
+					onRetryScheduled: async (attempt, maxAttempts, delayMs, errorMessage) => {
+						requestOptions.reasoning = retryThinkingLevel;
+						await observers?.onRetryScheduled?.(attempt, maxAttempts, delayMs, errorMessage);
+					},
+				};
+	return retryAssistantCall(produce, retry, requestOptions.signal, retryCallbacks, (response) =>
 		isRetryableAssistantError(response, undefined, { discardPartialOutput }),
 	);
 }
@@ -895,6 +915,7 @@ export async function generateSummaryWithUsage(
 		retry,
 		callbacks,
 		limits?.requestTimeoutMs,
+		getCompactionRetryThinkingLevel(model, thinkingLevel),
 	);
 
 	if (response.stopReason === "aborted") {
@@ -1393,6 +1414,7 @@ async function generateTurnPrefixSummary(
 		retry,
 		callbacks,
 		limits?.requestTimeoutMs,
+		getCompactionRetryThinkingLevel(model, thinkingLevel),
 	);
 
 	if (response.stopReason === "aborted") {

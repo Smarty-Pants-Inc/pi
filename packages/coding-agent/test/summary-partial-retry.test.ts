@@ -1,4 +1,4 @@
-import type { StreamFn } from "@earendil-works/pi-agent-core";
+import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
@@ -46,8 +46,10 @@ function failure(
 
 function scriptedStream(responses: AssistantMessage[]) {
 	const contexts: TranscriptContext[] = [];
-	const streamFn = vi.fn<StreamFn>((_model, requestContext) => {
+	const requestThinkingLevels: Array<ThinkingLevel | undefined> = [];
+	const streamFn = vi.fn<StreamFn>((_model, requestContext, options) => {
 		contexts.push(structuredClone(requestContext));
+		requestThinkingLevels.push(options?.reasoning);
 		const response = responses[Math.min(contexts.length - 1, responses.length - 1)];
 		const stream = createAssistantMessageEventStream();
 		if (response.stopReason === "pending") {
@@ -62,7 +64,7 @@ function scriptedStream(responses: AssistantMessage[]) {
 		stream.end();
 		return stream;
 	});
-	return { streamFn, contexts };
+	return { streamFn, contexts, requestThinkingLevels };
 }
 
 // smarty-dev#17478: summaries discard failed text/thinking, unlike ordinary assistant turns.
@@ -118,6 +120,37 @@ describe("summary-only partial-output retry", () => {
 			expect(onRetryFinished).toHaveBeenCalledWith(true, 1);
 		},
 	);
+
+	// smarty-dev#17478: the initial history-summary path lowers only its retry request.
+	it("retries an xhigh history summary at medium without changing the caller's level", async () => {
+		const originalThinkingLevel: ThinkingLevel = "xhigh";
+		const failed = failure([{ type: "text", text: "partial history" }], eof);
+		const { streamFn, requestThinkingLevels } = scriptedStream([failed, fauxAssistantMessage("COMPLETE HISTORY")]);
+		const result = await compact(
+			{
+				firstKeptEntryId: "keep",
+				messagesToSummarize: [{ role: "user", content: "original history", timestamp: 1 }],
+				turnPrefixMessages: [],
+				isSplitTurn: false,
+				tokensBefore: 100,
+				fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+				settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+			},
+			model,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			originalThinkingLevel,
+			streamFn,
+			undefined,
+			retry,
+		);
+
+		expect(result.summary).toBe("COMPLETE HISTORY");
+		expect(requestThinkingLevels).toEqual(["xhigh", "medium"]);
+		expect(originalThinkingLevel).toBe("xhigh");
+	});
 
 	it("preserves the final error, content and usage after exhausting the existing retry loop", async () => {
 		const first = failure([{ type: "text", text: "first partial" }], eof);
