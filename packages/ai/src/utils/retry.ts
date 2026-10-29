@@ -240,8 +240,8 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  *   retried, but reported as unsuccessful if they happen after a retry was scheduled.
  *   Aborts during the backoff sleep are normalized to an aborted `AssistantMessage`
  *   too, so callers do not need to care when cancellation happened.
- * - A non-retryable error (per {@link isRetryableAssistantError}, including quota/
- *   billing exhaustion) is returned immediately so deterministic errors fail fast.
+ * - A non-retryable error (per `shouldRetry`, defaulting to {@link isRetryableAssistantError},
+ *   including quota/billing exhaustion) is returned immediately so deterministic errors fail fast.
  * - Otherwise retries up to `maxRetries` times with exponential backoff, emitting
  *   `onRetryScheduled` before each sleep, `onRetryAttemptStart` after each sleep before
  *   the retried call starts, and `onRetryFinished` once at the end (whether the loop
@@ -255,6 +255,7 @@ export async function retryAssistantCall(
 	policy: RetryPolicy | undefined,
 	signal: AbortSignal | undefined,
 	callbacks?: RetryCallbacks,
+	shouldRetry: (message: AssistantMessage) => boolean = isRetryableAssistantError,
 ): Promise<AssistantMessage> {
 	const maxAttempts = policy?.enabled ? policy.maxRetries : 0;
 
@@ -293,7 +294,7 @@ export async function retryAssistantCall(
 		}
 
 		// Non-retryable, or budget exhausted: return the final error message.
-		if (attempt >= maxAttempts || !isRetryableAssistantError(response)) {
+		if (attempt >= maxAttempts || !shouldRetry(response)) {
 			if (lastRetry) await callbacks?.onRetryFinished?.(false, lastRetry.attempt, response.errorMessage);
 			return response;
 		}
@@ -347,14 +348,25 @@ export function throttledLimitWait(message: AssistantMessage): { delayMs: number
  * Stream consumers should pass what they observed: output seen in the stream blocks a retry even when the
  * terminal message dropped it, and observed reasoning lets a premature close whose content was dropped be
  * restarted.
+ *
+ * `discardPartialOutput` is only for callers that discard failed text/thinking and offer no tools
+ * (summarization, smarty-dev#17478). Tool calls and all non-output exclusions remain terminal.
  */
-export function isRetryableAssistantError(message: AssistantMessage, observed?: AssistantStreamObservation): boolean {
+export function isRetryableAssistantError(
+	message: AssistantMessage,
+	observed?: AssistantStreamObservation,
+	options?: { discardPartialOutput?: boolean },
+): boolean {
 	if (message.stopReason !== "error" || !message.errorMessage) return false;
 	// Marker recovery requires the dedicated one-shot policy even for an empty thinking/text start block.
 	if (message.recovery?.recovery === "anthropic_mid_output_fallback") return false;
-	// Output is never replayed, except reasoning-only output on a premature close (smarty-dev#6730).
+	// Ordinary turns only replay reasoning-only premature closes (smarty-dev#6730). Summaries may
+	// discard text/thinking, but never a tool call, even one with empty arguments (smarty-dev#17478).
+	const discardPartialOutput =
+		options?.discardPartialOutput === true &&
+		message.content.every((block) => block.type === "text" || block.type === "thinking");
 	const output = hasAssistantOutput(message) || observed?.answer === true || observed?.reasoning === true;
-	if (output && !isReasoningOnlyPrematureStream(message, observed)) return false;
+	if (output && !discardPartialOutput && !isReasoningOnlyPrematureStream(message, observed)) return false;
 	// An observer can fail after receiving generated output but before normalization records it.
 	// Retrying its transient-looking error would regenerate output, not repair the observer.
 	if (message.diagnostics?.some((diagnostic) => diagnostic.type === "provider_stream_observer_error")) return false;

@@ -516,10 +516,11 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
-// A split compaction has two serial summaries. Allow two existing 10-minute
-// SDK request windows in total, including retries and backoff, not per attempt.
+// A split compaction has two serial summaries. Their requests, retries, and
+// retry backoff share one 20-minute deadline, not a window per attempt.
 const COMPACTION_TIMEOUT_MS = 20 * 60_000;
-const COMPACTION_RETRY_POLICY: RetryPolicy = { enabled: true, maxRetries: 1, baseDelayMs: 2000 };
+// Share two transient retries across both summaries, with 2s-based exponential backoff.
+const COMPACTION_RETRY_POLICY: RetryPolicy = { enabled: true, maxRetries: 2, baseDelayMs: 2000 };
 const ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT = 3;
 
 // Boolean values retain the continuation decision; failures must not look like
