@@ -956,6 +956,74 @@ describe.skipIf(!realAvailable)("native maintenance with real B5/B6/B3", () => {
 		await original.occurrence.completion;
 		await f.b5.releaseRecoveryInputAfterJoin(original.selected, original.occurrence.completion, async () => {});
 	});
+	// RECOVERY-LIFECYCLE-001: data-safety/trust-boundary regression, not positive RepairRef qualification.
+	it("active-input compact truly joins late persistence, but the pinned original anchor differs from its repair leaf", async () => {
+		const f = await lifecycleFixture(true),
+			entered = deferred(),
+			release = deferred();
+		let joined = false,
+			repairLeaf: string | null | undefined;
+		const repair = f.implementation.repairMaintenance!;
+		f.implementation.repairMaintenance = async (input, leaf) => {
+			expect(joined).toBe(true);
+			repairLeaf = leaf;
+			return repair(input, leaf);
+		};
+		f.h.setResponses([
+			async () => {
+				entered.resolve();
+				await release.promise; // Deliberately non-cooperative original provider.
+				return fauxAssistantMessage("late original response");
+			},
+		]);
+		const original = await f.startInput("original active work", "active-repair-original");
+		const originalJoined = original.occurrence.completion.then(
+			() => {
+				joined = true;
+			},
+			() => {
+				joined = true;
+			},
+		);
+		await entered.promise;
+		const originalAnchor = f.b5.readRecoverySession(f.session.sessionId).inputs[0].delivery.executionBranchEntryId;
+		const compact = f.session.compact();
+		const finished = compact.catch((error: unknown) => error);
+		try {
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(joined).toBe(false);
+			expect(repairLeaf).toBeUndefined();
+		} finally {
+			release.resolve();
+		}
+		await originalJoined;
+		expect(await finished).toMatchObject({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" });
+		expect(repairLeaf).toBe(f.session.sessionManager.getLeafId());
+		expect(repairLeaf).not.toBe(originalAnchor);
+		// B5 recordRecoveryRepair requires this immutable delivery anchor, whereas
+		// native and B5 admission both require repair.executionBranchEntryId == current leaf.
+		// Do not change either reference or mint a fake receipt to call this a positive repair.
+		const ledger = f.b5.readRecoverySession(f.session.sessionId);
+		expect(ledger.inputs[0].delivery.executionBranchEntryId).toBe(originalAnchor);
+		expect(ledger.maintenance).toHaveLength(0);
+		expect(ledger.repairs).toHaveLength(0);
+		expect(ledger.outcomes.some((outcome: { kind: string }) => outcome.kind === "lifecycle-interrupt")).toBe(true);
+		expect(
+			ledger.outcomes.some((outcome: { kind: string }) => ["settled", "user-cancel"].includes(outcome.kind)),
+		).toBe(false);
+		const late = f.native.get(repairLeaf!);
+		expect(late).toBeDefined();
+		expect(late!.authority).toMatchObject({ kind: "input", input: { originalInputId: "active-repair-original" } });
+		expect(
+			await f.store.readDurableEntry({
+				sessionId: f.session.sessionId,
+				deliveryId: nativeEntryDeliveryId(f.session.sessionId, repairLeaf!),
+				recordKind: "carrier",
+			}),
+		).toMatchObject({ found: true, bytes: late!.bytes });
+		expect(f.h.faux.state.callCount).toBe(1); // No maintenance inference without repair.
+	});
 	it("actual automatic-failure completion edge requires original-generation repair before continuation", async () => {
 		const f = await lifecycleFixture(true);
 		f.session.setAutoCompactionEnabled(true);

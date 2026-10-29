@@ -33,3 +33,27 @@ power-off qualification placeholder. Both built-CLI cases executed and passed:
 `SIGKILL at before-delta reloads only committed history`. Neither is a substitute
 for an ACTIVE maintenance crash, receiver reboot, physical exclusion or cohort
 recovery within 120 seconds.
+
+## Open-input repair is still blocked
+
+The added active-input regression uses a deliberately non-cooperative original
+provider. `/compact` reserves and interrupts, but does not call repair or start a
+summary until the original promise actually joins. Its late native assistant
+entry is retained with the original input authority and exact B6 bytes. The
+logical input has a lifecycle-interrupt outcome, not a fabricated settlement or
+user cancellation.
+
+That run exposes a concrete composition conflict with read-only B5 pin
+`6993174850bfd1460f2d3be2ca3f40376c63d1c5`: native passes the post-join leaf to
+`repairMaintenance` and requires the returned `executionBranchEntryId` to equal
+that leaf. B5 `recordRecoveryRepair` instead requires the immutable original
+`delivery.executionBranchEntryId`; B5 maintenance admission also requires its
+`baseLeafId` to equal the repair reference. A late assistant/result append makes
+those IDs different. The regression asserts that difference on real JSONL and
+B5 history. It does not rewrite the original delivery commitment, rewind the
+branch or invent an original-generation receipt to bypass the conflict.
+
+Thus the positive active-input repair, actual automatic-failure retry and its
+cross-process original-input retry-slot qualification remain missing. Resolving
+the anchor/leaf contract and supplying genuine B4 repair/cut/terminal ports are
+caller dependencies; a passing negative refusal test is not that qualification.
