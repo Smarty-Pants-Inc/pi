@@ -26,6 +26,7 @@ function seedHistory(harness: Harness, totalTokens = 650): string {
 }
 
 // Regression coverage for #8133.
+// pi#325: keep model token overrides distinct from shared summary and phase settings.
 describe("AgentSession compaction model overrides", () => {
 	const harnesses: Harness[] = [];
 	afterEach(() => {
@@ -45,6 +46,9 @@ describe("AgentSession compaction model overrides", () => {
 						enabled: path !== "manual",
 						reserveTokens: 10,
 						keepRecentTokens: 20000,
+						maxSummaryTokens: 7000,
+						primaryTimeoutMs: 12345,
+						fallbackTimeoutMs: 23456,
 						modelOverrides: { "faux/faux-1": { reserveTokens: 2000, keepRecentTokens: 150 } },
 					},
 				},
@@ -85,6 +89,9 @@ describe("AgentSession compaction model overrides", () => {
 				enabled: path !== "manual",
 				reserveTokens: 2000,
 				keepRecentTokens: 150,
+				maxSummaryTokens: 7000,
+				primaryTimeoutMs: 12345,
+				fallbackTimeoutMs: 23456,
 			});
 			expect(preparations[0]?.reason).toBe(
 				path === "manual" ? "manual" : path === "overflow" ? "overflow" : "threshold",
@@ -125,7 +132,8 @@ describe("AgentSession compaction model overrides", () => {
 		]);
 		if (path === "manual") await harness.session.compact();
 		else await harness.session.prompt("continue");
-		expect(budgets).toEqual([1600]);
+		// pi#325: reserveTokens no longer sets the summary output target; the model's 3000-token cap does.
+		expect(budgets).toEqual([3000]);
 		expect(harness.sessionManager.getEntries().find((entry) => entry.type === "compaction")).toMatchObject({
 			firstKeptEntryId: recentUserId,
 			summary: "built-in summary",
@@ -176,9 +184,13 @@ describe("AgentSession compaction model overrides", () => {
 
 	it("captures model identity before awaiting summarization auth", async () => {
 		const harness = await createHarness({
-			models: [{ id: "first" }, { id: "second" }],
+			models: [
+				{ id: "first", maxTokens: 900 },
+				{ id: "second", maxTokens: 2500 },
+			],
 			settings: {
 				compaction: {
+					maxSummaryTokens: 8000,
 					modelOverrides: {
 						"faux/first": { reserveTokens: 2000, keepRecentTokens: 150 },
 						"faux/second": { reserveTokens: 4000, keepRecentTokens: 20000 },
@@ -201,6 +213,7 @@ describe("AgentSession compaction model overrides", () => {
 			},
 		]);
 		await harness.session.compact();
-		expect(requests).toEqual([{ id: "first", maxTokens: 1600 }]);
+		// pi#325: auth mutates the active selection, but sizing and dispatch stay on the captured first model.
+		expect(requests).toEqual([{ id: "first", maxTokens: 900 }]);
 	});
 });

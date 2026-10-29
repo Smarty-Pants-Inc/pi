@@ -651,6 +651,9 @@ class SummarizationError extends Error {
 	}
 }
 
+/** Native checkpoint allocation/validation failure, not a provider or observer error. */
+class CompactionBudgetError extends Error {}
+
 function createSummarizationOptions(
 	model: Model<any>,
 	maxTokens: number,
@@ -1149,20 +1152,19 @@ export async function compact(
 	const fileSuffix = formatFileOperations(fileLists);
 	const turnSeparator = "\n\n---\n\n**Turn Context (split turn):**\n\n";
 	const hasPrefix = isSplitTurn && turnPrefixMessages.length > 0;
-	const split = hasPrefix && messagesToSummarize.length > 0;
-	const fixedHistory = hasPrefix && !split ? (previousSummary ?? "No prior history.") : "";
+	// A prior checkpoint is history too, even when the kept boundary starts this turn.
+	const split = hasPrefix && (messagesToSummarize.length > 0 || previousSummary !== undefined);
+	const fixedHistory = hasPrefix && !split ? "No prior history." : "";
 	const suffixTokens = Math.ceil(fileSuffix.length / 4);
 	const outputBudget =
 		maxSummaryTokens - suffixTokens - Math.ceil((fixedHistory.length + (hasPrefix ? turnSeparator.length : 0)) / 4);
-	if (outputBudget < (split ? 2 : 1))
-		throw new Error("Compaction output allowance cannot fit the retained references and split summary");
 	const historyBudget = split ? Math.floor((outputBudget * 2) / 3) : outputBudget;
 	const prefixBudget = split ? outputBudget - historyBudget : outputBudget;
 	const validateSummary = (text: string): string => {
 		const checkpoint = text + fileSuffix;
 		const estimate = Math.ceil(checkpoint.length / 4);
 		if (estimate > maxSummaryTokens) {
-			throw new Error(
+			throw new CompactionBudgetError(
 				`Compaction summary estimate ${estimate} exceeds maxSummaryTokens ${maxSummaryTokens}; checkpoint was not saved`,
 			);
 		}
@@ -1197,10 +1199,15 @@ export async function compact(
 
 	try {
 		signal?.throwIfAborted();
-		if (isSplitTurn && turnPrefixMessages.length > 0) {
+		if (outputBudget < (split ? 2 : 1)) {
+			throw new CompactionBudgetError(
+				"Compaction output allowance cannot fit the retained references and split summary",
+			);
+		}
+		if (hasPrefix) {
 			let historyText = previousSummary ?? "No prior history.";
 			let historyUsage: Usage | undefined;
-			if (messagesToSummarize.length > 0) {
+			if (split) {
 				const historyResult = await generateSummaryWithUsage(
 					messagesToSummarize,
 					model,
@@ -1263,6 +1270,7 @@ export async function compact(
 			summary = result.text;
 			summaryUsage = result.usage;
 		}
+		completedPrimaryUsage = summaryUsage;
 		summary = validateSummary(summary);
 	} catch (error) {
 		fallback?.signal.throwIfAborted();
@@ -1270,6 +1278,7 @@ export async function compact(
 		const primaryError = deadlineExpired ? signal.reason : error;
 		const eligible =
 			deadlineExpired ||
+			error instanceof CompactionBudgetError ||
 			(error instanceof SummarizationError &&
 				isRetryableAssistantError(error.response, undefined, { discardPartialOutput: true }));
 		if (!fallback || !eligible) throw primaryError;
@@ -1277,6 +1286,10 @@ export async function compact(
 		// coalesced request, including previous history and the original turn prefix.
 		const fallbackSignal = fallback.start();
 		try {
+			fallbackSignal.throwIfAborted();
+			if (maxSummaryTokens - suffixTokens < 1) {
+				throw new CompactionBudgetError("Compaction output allowance cannot fit the retained file references");
+			}
 			const request = await raceWithAbortSignal(fallback.resolve(fallbackSignal), fallbackSignal);
 			fallbackSignal.throwIfAborted();
 			const instructions = [

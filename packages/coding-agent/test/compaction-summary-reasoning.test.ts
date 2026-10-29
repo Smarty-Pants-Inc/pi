@@ -128,7 +128,18 @@ describe("generateSummary reasoning options", () => {
 		});
 	});
 
-	it("preserves the previous summary without an empty history request for a split turn", async () => {
+	it("summarizes a prior checkpoint before the split turn prefix", async () => {
+		const historySummary = "compacted checkpoint history";
+		const prefixSummary = "compacted turn prefix";
+		completeSimpleMock
+			.mockResolvedValueOnce({
+				...mockSummaryResponse,
+				content: [{ type: "text", text: historySummary }],
+			})
+			.mockResolvedValueOnce({
+				...mockSummaryResponse,
+				content: [{ type: "text", text: prefixSummary }],
+			});
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
 			messagesToSummarize: [],
@@ -140,15 +151,39 @@ describe("generateSummary reasoning options", () => {
 			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
 		};
 
-		const result = await compact(preparation, createModel(false), "test-key");
+		const result = await compact(preparation, createModel(true), "test-key", undefined, undefined, undefined, "low");
+		const calls = completeSimpleMock.mock.calls;
+		expect(calls).toHaveLength(2);
 
-		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
-		expect(result.summary).toContain("previous checkpoint");
-		const requestContext = completeSimpleMock.mock.calls[0][1] as TranscriptContext;
-		const prompt = JSON.stringify(requestContext.messages);
+		const historyContext = calls[0][1] as TranscriptContext;
+		const historyPrompt = JSON.stringify(historyContext.messages);
+		expect(historyPrompt).toContain("<previous-summary>\\nprevious checkpoint\\n</previous-summary>");
+		expect(historyPrompt).toContain("Checkpoint output allowance: at most");
+		expect(historyPrompt).not.toContain("Summarize this.");
+		expect(calls[0][2]).toMatchObject({ apiKey: "test-key", reasoning: "low", cacheRetention: "none" });
+
+		const prefixContext = calls[1][1] as TranscriptContext;
+		const prefixPrompt = JSON.stringify(prefixContext.messages);
 		// Regression test for #9652: clear boundaries and continuation wording avoid the reasoning-extraction false positive.
-		expect(prompt).toContain("# Conversation\\n[User]: Summarize this.");
-		expect(prompt).toContain("# Instructions\\nThe messages above are earlier context from an ongoing conversation.");
+		expect(prefixPrompt).toContain("# Conversation\\n[User]: Summarize this.");
+		expect(prefixPrompt).toContain(
+			"# Instructions\\nThe messages above are earlier context from an ongoing conversation.",
+		);
+		expect(prefixPrompt).toContain("Checkpoint output allowance: at most");
+		expect(prefixPrompt).not.toContain("previous checkpoint");
+		expect(calls[1][2]).toMatchObject({
+			apiKey: "test-key",
+			reasoning: "low",
+			cacheRetention: "none",
+			maxTokens: expect.any(Number),
+		});
+		const allocations = calls.map((call) => call[2]?.maxTokens);
+		expect(allocations.every((tokens) => typeof tokens === "number" && tokens > 0)).toBe(true);
+		expect((allocations[0] ?? 0) + (allocations[1] ?? 0)).toBeLessThanOrEqual(8000);
+
+		expect(result.summary).toContain(historySummary);
+		expect(result.summary).toContain(prefixSummary);
+		expect(result.summary).not.toContain("previous checkpoint");
 	});
 
 	it("rejects tool calls from conversation summaries", async () => {

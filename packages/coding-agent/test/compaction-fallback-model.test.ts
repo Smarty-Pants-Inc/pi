@@ -64,6 +64,8 @@ async function fixture(
 		fallbackModel?: string;
 		missingKey?: boolean;
 		previous?: boolean;
+		previousAtTurnStart?: string;
+		prefixOnly?: boolean;
 		readFiles?: string[];
 		hangSetup?: boolean;
 		sessionDir?: string;
@@ -144,8 +146,10 @@ async function fixture(
 		const id = user("older source");
 		manager.appendCompaction("PREVIOUS_REFERENCE /evidence/previous.json", id, 500);
 	}
-	user("HISTORY_SOURCE /evidence/original.json");
-	manager.appendMessage(response(primary, "HISTORY_ANSWER"));
+	if (!options.prefixOnly) {
+		user("HISTORY_SOURCE /evidence/original.json");
+		manager.appendMessage(response(primary, "HISTORY_ANSWER"));
+	}
 	for (const [index, path] of (options.readFiles ?? []).entries()) {
 		const id = `read-${index}`;
 		manager.appendMessage({
@@ -161,8 +165,14 @@ async function fixture(
 			timestamp: 1,
 		});
 	}
-	user("TURN_PREFIX_TASK task-17478 active requirement");
+	const turnId = user("TURN_PREFIX_TASK task-17478 active requirement /evidence/prefix.json");
 	manager.appendMessage(response(primary, "PREFIX_WORK"));
+	if (options.previousAtTurnStart) {
+		manager.appendCompaction(options.previousAtTurnStart, turnId, 20000, {
+			readFiles: ["/evidence/previous.json"],
+			modifiedFiles: [],
+		});
+	}
 	const tailId = manager.appendMessage({
 		...response(primary, "RETAINED_TAIL_NOT_TO_RECONSTRUCT"),
 		usage: {
@@ -213,6 +223,78 @@ describe("native compaction single fallback", () => {
 			primaryTimeoutMs: 300000,
 			fallbackTimeoutMs: 240000,
 		});
+	});
+
+	// pi#325 finding 2: the prior kept boundary can be this same turn's start.
+	it("re-summarizes a legacy checkpoint above 8000 tokens before the new split prefix", async () => {
+		const previous =
+			`PREVIOUS_TASK /evidence/previous.json\n${"completed history ".repeat(2600)}\n` +
+			"<read-files>\n/evidence/previous.json\n</read-files>";
+		const f = await fixture(
+			({ model, context }) => {
+				const prompt = context.messages.map((message) => contentText(message.content)).join(" ");
+				return response(
+					model,
+					prompt.includes("<previous-summary>")
+						? "PREVIOUS_TASK /evidence/previous.json"
+						: "TURN_PREFIX_TASK task-17478 active requirement /evidence/prefix.json PREFIX_WORK",
+				);
+			},
+			{ previousAtTurnStart: previous },
+		);
+		const selected = { ...primary, contextWindow: 200000 };
+		f.session.agent.state.model = selected;
+		const preparation = prepareCompaction(f.manager.getBranch(), f.settings.getCompactionSettings(selected))!;
+		expect(Math.ceil(previous.length / 4)).toBeGreaterThan(8000);
+		expect(Math.ceil(previous.length / 4)).toBeLessThan(13107);
+		expect(preparation.messagesToSummarize).toEqual([]);
+		expect(preparation.isSplitTurn).toBe(true);
+		expect(preparation.previousSummary).toBe(previous);
+		expect(preparation.firstKeptEntryId).toBe(f.tailId);
+		const result = await settle(f.session.compact(), 0);
+		expect(result).toHaveProperty("value");
+		expect(f.requests.map(({ model }) => model.id)).toEqual([primary.id, primary.id]);
+		const prompts = f.requests.map(({ context }) =>
+			context.messages.map((message) => contentText(message.content)).join(" "),
+		);
+		expect(prompts[0]).toContain(previous);
+		expect(prompts[1]).toContain("TURN_PREFIX_TASK task-17478");
+		expect(prompts[1]).toContain("PREFIX_WORK");
+		expect(prompts.join(" ")).not.toContain("RETAINED_TAIL_NOT_TO_RECONSTRUCT");
+		const saved = f.manager
+			.getEntries()
+			.filter((entry) => entry.type === "compaction")
+			.at(-1)!;
+		expect(saved.firstKeptEntryId).toBe(f.tailId);
+		for (const text of [
+			"PREVIOUS_TASK",
+			"TURN_PREFIX_TASK task-17478",
+			"/evidence/previous.json",
+			"/evidence/prefix.json",
+		])
+			expect(saved.summary).toContain(text);
+		expect(saved.details).toHaveProperty("summaryTokensEstimate", Math.ceil(saved.summary.length / 4));
+		expect(Math.ceil(saved.summary.length / 4)).toBeLessThanOrEqual(8000);
+		expect(f.manager.getEntry(f.tailId)).toBeDefined();
+		expect(f.manager.buildSessionContext().messages).toMatchObject([
+			{ role: "compactionSummary", summary: saved.summary },
+			{ role: "assistant", content: [{ type: "text", text: "RETAINED_TAIL_NOT_TO_RECONSTRUCT" }] },
+		]);
+		expect(f.session.model).toBe(selected);
+		expect(f.hooks.preparations).toBe(1);
+	});
+
+	// pi#325: no prior checkpoint still requires only the prefix request.
+	it("keeps the no-prior-history split path to one primary request", async () => {
+		const f = await fixture(({ model }) => response(model), { prefixOnly: true });
+		expect(await settle(f.session.compact(), 0)).toHaveProperty(
+			"value.summary",
+			"No prior history.\n\n---\n\n**Turn Context (split turn):**\n\nCOMPLETE_CHECKPOINT",
+		);
+		expect(f.requests.map(({ model }) => model.id)).toEqual([primary.id]);
+		expect(f.requests[0].context.messages.map((message) => contentText(message.content)).join(" ")).toContain(
+			"# Conversation",
+		);
 	});
 
 	it("uses primary concise prompts and the two shared retries when primary recovers", async () => {
@@ -308,6 +390,7 @@ describe("native compaction single fallback", () => {
 		]);
 	});
 
+	// pi#325: an unsuccessful prefix must not erase or double-count completed history usage.
 	it("retains usage of a successful history subcall when prefix failure needs fallback", async () => {
 		const f = await fixture(({ model }, index) => {
 			if (index !== 1 && model.id === primary.id) return transient(model);
@@ -324,17 +407,27 @@ describe("native compaction single fallback", () => {
 		expect(result).toHaveProperty("value.usage.input", 18);
 		expect(result).toHaveProperty("value.usage.output", 5);
 		expect(result).toHaveProperty("value.usage.totalTokens", 23);
+		expect(f.requests.map(({ model }) => model.id)).toEqual([
+			primary.id,
+			primary.id,
+			primary.id,
+			primary.id,
+			fallback.id,
+		]);
 	});
 
-	it.each(["401 unauthorized", "403 permission denied", "insufficient_quota billing exhausted", "prompt is too long"])(
-		"does not fall back for %s",
-		async (error) => {
-			const f = await fixture(({ model }) => response(model, "PARTIAL", error));
-			expect(await settle(f.session.compact())).toHaveProperty("error");
-			expect(f.requests).toHaveLength(1);
-			expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
-		},
-	);
+	it.each([
+		"401 unauthorized",
+		"403 permission denied",
+		"insufficient_quota billing exhausted",
+		"prompt is too long",
+		"400 invalid request",
+	])("does not fall back for %s", async (error) => {
+		const f = await fixture(({ model }) => response(model, "PARTIAL", error));
+		expect(await settle(f.session.compact())).toHaveProperty("error");
+		expect(f.requests).toHaveLength(1);
+		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
+	});
 
 	it.each(["aborted", "length", "tool", "provider_limit", "provider_stream_observer_error"] as const)(
 		"rejects excluded %s summary",
@@ -352,6 +445,17 @@ describe("native compaction single fallback", () => {
 			expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
 		},
 	);
+
+	// pi#325: native budget failures must not broaden arbitrary/context error admission.
+	it.each(["stream", "context"] as const)("does not fall back for a thrown %s error", async (kind) => {
+		const f = await fixture(() => {
+			throw new Error("503 arbitrary stream exception");
+		});
+		if (kind === "context") f.session.agent.state.model = { ...primary, contextWindow: 1 };
+		expect(await settle(f.session.compact(), 0)).toHaveProperty("error");
+		expect(f.requests.map(({ model }) => model.id)).toEqual(kind === "stream" ? [primary.id] : []);
+		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
+	});
 
 	it.each(["invalid", "unknown/model", "missing-key", "denied"])("rejects fallback admission %s", async (kind) => {
 		const f = await fixture(({ model }) => transient(model), {
@@ -474,6 +578,79 @@ describe("native compaction single fallback", () => {
 		expect(result.value).toHaveProperty("details.durationMs", expect.any(Number));
 	});
 
+	// pi#325: validation fallback counts every completed primary part exactly once.
+	it.each(["history", "prefix", "split"] as const)("retains primary usage after oversized %s output", async (part) => {
+		const f = await fixture(
+			({ model }, index) => {
+				const message = response(
+					model,
+					model.id === fallback.id ? "BOUNDED_CHECKPOINT" : "PRIMARY_DRAFT".repeat(100),
+				);
+				message.usage = {
+					input: 7 * index,
+					output: 3 * index,
+					cacheRead: 2 * index,
+					cacheWrite: index,
+					totalTokens: 13 * index,
+					cost: {
+						input: index,
+						output: 2 * index,
+						cacheRead: 3 * index,
+						cacheWrite: 4 * index,
+						total: 10 * index,
+					},
+				};
+				return message;
+			},
+			{ prefixOnly: part === "prefix" },
+		);
+		f.settings.applyOverrides({
+			compaction: { maxSummaryTokens: 100, keepRecentTokens: part === "history" ? 20 : 1 },
+		});
+		const result = await settle(f.session.compact(), 0);
+		expect(result).toHaveProperty("value.summary", "BOUNDED_CHECKPOINT");
+		const sum = part === "split" ? 6 : 3;
+		expect(result).toHaveProperty("value.usage", {
+			input: 7 * sum,
+			output: 3 * sum,
+			cacheRead: 2 * sum,
+			cacheWrite: sum,
+			totalTokens: 13 * sum,
+			cost: { input: sum, output: 2 * sum, cacheRead: 3 * sum, cacheWrite: 4 * sum, total: 10 * sum },
+		});
+		expect(f.requests.map(({ model }) => model.id)).toEqual(
+			part === "split" ? [primary.id, primary.id, fallback.id] : [primary.id, fallback.id],
+		);
+		const prompt = f.requests
+			.at(-1)!
+			.context.messages.map((message) => contentText(message.content))
+			.join(" ");
+		if (part !== "history") expect(prompt).toContain("TURN_PREFIX_TASK task-17478");
+		if (part !== "prefix") expect(prompt).toContain("HISTORY_SOURCE");
+		expect(prompt).not.toContain("PRIMARY_DRAFT");
+		expect(prompt).not.toContain("HISTORY_DRAFT");
+		expect(prompt).not.toContain("RETAINED_TAIL_NOT_TO_RECONSTRUCT");
+		expect(f.events.filter((event) => event.type === "summarization_retry_scheduled")).toEqual([]);
+		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(f.hooks.preparations).toBe(1);
+		expect(f.session.model).toBe(primary);
+	});
+
+	// pi#325 finding 2: a coalesced request need not reserve the split separator.
+	it("uses one fallback when the primary split allowance cannot fit but a coalesced checkpoint can", async () => {
+		const f = await fixture(({ model }) => response(model, "OK"));
+		f.settings.applyOverrides({ compaction: { maxSummaryTokens: 10 } });
+		expect(await settle(f.session.compact(), 0)).toHaveProperty("value.summary", "OK");
+		expect(f.requests.map(({ model }) => model.id)).toEqual([fallback.id]);
+		expect(f.requests[0].options?.maxTokens).toBe(10);
+		const prompt = f.requests[0].context.messages.map((message) => contentText(message.content)).join(" ");
+		expect(prompt).toContain("HISTORY_SOURCE");
+		expect(prompt).toContain("TURN_PREFIX_TASK task-17478");
+		expect(prompt).not.toContain("RETAINED_TAIL_NOT_TO_RECONSTRUCT");
+		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(f.hooks.preparations).toBe(1);
+	});
+
 	it.each(["primary", "fallback"])("rejects oversized %s output without truncation or checkpoint", async (phase) => {
 		const f = await fixture(({ model }) =>
 			phase === "fallback" && model.id === primary.id ? transient(model) : response(model, "x".repeat(2000)),
@@ -481,7 +658,7 @@ describe("native compaction single fallback", () => {
 		f.settings.applyOverrides({ compaction: { maxSummaryTokens: 100 } });
 		const result = await settle(f.session.compact());
 		expect(result).toHaveProperty("error");
-		expect(f.requests).toHaveLength(phase === "primary" ? 2 : 4);
+		expect(f.requests).toHaveLength(phase === "primary" ? 3 : 4);
 		expect(f.events.at(-1)).toMatchObject({
 			type: "compaction_end",
 			aborted: false,
@@ -489,6 +666,35 @@ describe("native compaction single fallback", () => {
 		});
 		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
 	});
+
+	// pi#325: a budget failure admits one fallback, never retries that fallback.
+	it.each(["length", "transient", "validation"] as const)(
+		"terminates a budget fallback's %s failure",
+		async (kind) => {
+			const f = await fixture(
+				({ model }) => {
+					if (model.id === primary.id || kind === "validation") return response(model, "OVERSIZED".repeat(100));
+					if (kind === "transient") return transient(model);
+					return { ...response(model, "INCOMPLETE_FALLBACK"), stopReason: "length" };
+				},
+				{ prefixOnly: true },
+			);
+			f.settings.applyOverrides({ compaction: { maxSummaryTokens: 100 } });
+			const result = await settle(f.session.compact(), 0);
+			expect(result).toHaveProperty("error");
+			if (!("error" in result) || !(result.error instanceof AggregateError))
+				throw new Error("Expected aggregate failure");
+			expect(result.error.errors).toHaveLength(2);
+			expect(result.error.errors[0].message).toContain("exceeds maxSummaryTokens");
+			expect(f.requests.map(({ model }) => model.id)).toEqual([primary.id, fallback.id]);
+			expect(f.events.filter((event) => event.type === "summarization_retry_scheduled")).toEqual([]);
+			expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
+			expect(f.hooks.preparations).toBe(1);
+			expect(f.events.at(-1)).toMatchObject({ type: "compaction_end", aborted: false, willRetry: false });
+			await vi.advanceTimersByTimeAsync(600000);
+			expect(f.requests).toHaveLength(2);
+		},
+	);
 
 	it("persists distinct length and duration metrics for twenty native checkpoints in the existing journal", async () => {
 		const sessionDir = mkdtempSync(join(tmpdir(), "compaction-metrics-"));
@@ -545,9 +751,15 @@ describe("native compaction single fallback", () => {
 			readFiles: [`/evidence/${"active-path".repeat(100)}`],
 		});
 		f.settings.applyOverrides({ compaction: { maxSummaryTokens: 100 } });
-		expect(await settle(f.session.compact())).toHaveProperty("error");
+		const result = await settle(f.session.compact());
+		expect(result).toHaveProperty("error");
+		if (!("error" in result) || !(result.error instanceof AggregateError))
+			throw new Error("Expected primary and fallback budget failures");
+		expect(result.error.errors).toHaveLength(2);
+		expect(result.error.errors[1].message).toContain("cannot fit the retained file references");
 		expect(f.requests).toEqual([]);
 		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
+		expect(f.hooks.preparations).toBe(1);
 	});
 
 	// smarty-dev#17478: native deadline failures must publish terminal state, not only a watchdog receipt.
