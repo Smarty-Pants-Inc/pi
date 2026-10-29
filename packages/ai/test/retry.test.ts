@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { fauxAssistantMessage } from "../src/providers/faux.ts";
+import type { AssistantMessage } from "../src/types.ts";
 import { isRetryableAssistantError, type RetryPolicy, retryAssistantCall, retryDelayMs } from "../src/utils/retry.ts";
 
 const openAIExplicitRetryMessage =
@@ -221,6 +222,64 @@ describe("retryAssistantCall", () => {
 		const produce = vi.fn(async () => fauxAssistantMessage("ok"));
 		const res = await retryAssistantCall(produce, enabled, undefined);
 		expect(res.content).toEqual([{ type: "text", text: "ok" }]);
+		expect(produce).toHaveBeenCalledTimes(1);
+	});
+
+	// smarty-dev#17478: ordinary turns must keep the output veto; only discarded summaries opt in.
+	it.each([
+		{ content: [{ type: "text", text: "partial answer" }] },
+		{ content: [{ type: "thinking", thinking: "partial reasoning" }] },
+		{ content: [] },
+	] satisfies { content: AssistantMessage["content"] }[])(
+		"keeps partial output terminal by default: %j",
+		async ({ content }) => {
+			const failure = {
+				...fauxAssistantMessage(content, { stopReason: "error", errorMessage: "overloaded_error" }),
+				usage: { ...fauxAssistantMessage("").usage, output: 5, totalTokens: 5 },
+			};
+			const produce = vi.fn(async () => failure);
+			const result = await retryAssistantCall(produce, enabled, undefined);
+			expect(result.content).toEqual(content);
+			expect(result.usage).toBe(failure.usage);
+			expect(result.errorMessage).toBe("overloaded_error");
+			expect(produce).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	// smarty-dev#17478: the predicate changes classification, never the response being returned.
+	it("lets a discarded-output predicate retry and preserves the exhausted terminal response", async () => {
+		const failure = fauxAssistantMessage("discarded summary", {
+			stopReason: "error",
+			errorMessage: "overloaded_error: original provider detail",
+		});
+		const produce = vi.fn(async () => failure);
+		const onRetryFinished = vi.fn();
+		const result = await retryAssistantCall(
+			produce,
+			{ ...enabled, maxRetries: 1 },
+			undefined,
+			{ onRetryFinished },
+			(message) => isRetryableAssistantError(message, undefined, { discardPartialOutput: true }),
+		);
+		expect(produce).toHaveBeenCalledTimes(2);
+		expect(result.content).toEqual(failure.content);
+		expect(result.usage).toBe(failure.usage);
+		expect(result.errorMessage).toBe(failure.errorMessage);
+		expect(onRetryFinished).toHaveBeenCalledWith(false, 1, failure.errorMessage);
+	});
+
+	// smarty-dev#17478: discarding text/thinking must never authorize a partial tool call.
+	it("keeps tool-call output terminal even when partial output can be discarded", async () => {
+		const failure = fauxAssistantMessage([{ type: "toolCall", id: "partial", name: "write", arguments: {} }], {
+			stopReason: "error",
+			errorMessage: openAIResponsesEarlyEofMessage,
+		});
+		const produce = vi.fn(async () => failure);
+		const result = await retryAssistantCall(produce, enabled, undefined, undefined, (message) =>
+			isRetryableAssistantError(message, undefined, { discardPartialOutput: true }),
+		);
+		expect(result.content).toEqual(failure.content);
+		expect(result.errorMessage).toBe(failure.errorMessage);
 		expect(produce).toHaveBeenCalledTimes(1);
 	});
 

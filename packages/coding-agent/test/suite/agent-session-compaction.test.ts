@@ -1491,6 +1491,138 @@ describe("AgentSession compaction characterization", () => {
 		expect(runAutoCompactionSpy).not.toHaveBeenCalled();
 	});
 
+	// Regression test for #17478.
+	it.each(["manual", "automatic"] as const)(
+		"allows two built-in compaction retries with exponential backoff (%s)",
+		async (mode) => {
+			const harness = await createHarness({
+				settings: { retry: { enabled: false } },
+			});
+			harnesses.push(harness);
+			seedCompactableSession(harness);
+			const error = fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" });
+			harness.setResponses([
+				error,
+				error,
+				fauxAssistantMessage("recovered summary"),
+				fauxAssistantMessage("unexpected fourth summary call"),
+			]);
+			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+			vi.useFakeTimers();
+			const operation =
+				mode === "manual" ? harness.session.compact() : sessionInternals._runAutoCompaction("threshold", false);
+
+			try {
+				await vi.advanceTimersByTimeAsync(2000);
+				expect(harness.faux.state.callCount).toBe(2);
+				expect(harness.eventsOfType("summarization_retry_scheduled")).toMatchObject([
+					{ attempt: 1, maxAttempts: 2, delayMs: 2000 },
+					{ attempt: 2, maxAttempts: 2, delayMs: 4000 },
+				]);
+				await vi.advanceTimersByTimeAsync(3999);
+				expect(harness.faux.state.callCount).toBe(2);
+				await vi.advanceTimersByTimeAsync(1);
+				await operation;
+
+				expect(harness.faux.state.callCount).toBe(3);
+				expect(harness.getPendingResponseCount()).toBe(1);
+				expect(harness.eventsOfType("summarization_retry_finished")).toHaveLength(1);
+			} finally {
+				harness.session.abortCompaction();
+			}
+		},
+	);
+
+	// Regression test for #17478.
+	it("shares the two-retry allowance across history and turn-prefix summaries", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: false } },
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.sessionManager.appendMessage({ role: "user", content: "split turn", timestamp: Date.now() - 200 });
+		const retainedAssistant = createAssistant(harness, { stopReason: "stop", timestamp: Date.now() - 100 });
+		retainedAssistant.content = [{ type: "text", text: "retained assistant response" }];
+		harness.sessionManager.appendMessage(retainedAssistant);
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		const error = fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" });
+		harness.setResponses([
+			error,
+			fauxAssistantMessage("history summary"),
+			error,
+			error,
+			fauxAssistantMessage("must not exceed the shared retry allowance"),
+		]);
+		vi.useFakeTimers();
+		const compaction = expect(harness.session.compact()).rejects.toThrow("terminated");
+		await vi.advanceTimersByTimeAsync(4000);
+		await compaction;
+
+		expect(harness.faux.state.callCount).toBe(4);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
+		expect(harness.eventsOfType("summarization_retry_scheduled")).toMatchObject([
+			{ attempt: 1, maxAttempts: 2, delayMs: 2000 },
+			{ attempt: 1, maxAttempts: 1, delayMs: 2000 },
+		]);
+		expect(harness.eventsOfType("summarization_retry_finished")).toHaveLength(2);
+	});
+
+	// Regression test for #17478.
+	it.each(["provider abort", "length stop", "quota exhaustion"] as const)(
+		"does not retry a terminal summary response: %s",
+		async (failure) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			seedCompactableSession(harness);
+			const response =
+				failure === "provider abort"
+					? fauxAssistantMessage("", { stopReason: "aborted" })
+					: failure === "length stop"
+						? fauxAssistantMessage("incomplete summary", { stopReason: "length" })
+						: fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" });
+			harness.setResponses([response, fauxAssistantMessage("must not be requested")]);
+
+			await expect(harness.session.compact()).rejects.toThrow();
+
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(harness.eventsOfType("summarization_retry_scheduled")).toEqual([]);
+		},
+	);
+
+	// Regression test for #17478.
+	it("cancels a summarization retry during backoff", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" }),
+			fauxAssistantMessage("must not be retried after cancellation"),
+		]);
+		let unsubscribe = () => {};
+		const retryScheduled = new Promise<void>((resolve) => {
+			unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "summarization_retry_scheduled") return;
+				unsubscribe();
+				resolve();
+			});
+		});
+		vi.useFakeTimers();
+		const compaction = harness.session.compact();
+		try {
+			await retryScheduled;
+			harness.session.abortCompaction();
+			await expect(compaction).rejects.toThrow("Compaction cancelled");
+
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(harness.eventsOfType("summarization_retry_finished")).toHaveLength(1);
+			expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({ aborted: true });
+		} finally {
+			unsubscribe();
+			harness.session.abortCompaction();
+		}
+	});
+
 	it.each(["manual", "pre-prompt"] as const)("shares the %s deadline across all stages", async (mode) => {
 		for (const phase of ["history", "prefix", "retry", "backoff"] as const) {
 			const harness = await createHarness({

@@ -9,6 +9,7 @@ import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-a
 import {
 	contentText,
 	getCurrentSystemMessage,
+	isRetryableAssistantError,
 	normalizeContext,
 	type RetryCallbacks,
 	type RetryPolicy,
@@ -689,7 +690,17 @@ export async function completeSummarization(
 			};
 		}
 	};
-	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks);
+	// Failed summaries are never persisted or replayed as context, so their partial text/thinking
+	// can be discarded. Do not grant that permission to a tool-bearing context (smarty-dev#17478).
+	const discardPartialOutput = context.messages.every(
+		(message) =>
+			message.role !== "toolResult" &&
+			(message.role !== "system" || !message.toolsAdded?.length) &&
+			(message.role !== "assistant" || message.content.every((block) => block.type !== "toolCall")),
+	);
+	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks, (response) =>
+		isRetryableAssistantError(response, undefined, { discardPartialOutput }),
+	);
 }
 
 /**
