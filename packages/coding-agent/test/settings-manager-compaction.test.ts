@@ -1,9 +1,19 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { renderConfigSchemas } from "../scripts/generate-schemas.ts";
+import { SETTINGS_DEFAULTS } from "../src/core/settings-defaults.ts";
 import { InMemorySettingsStorage, SettingsManager } from "../src/core/settings-manager.ts";
 
 const model = { provider: "provider", id: "family/model" };
 const modelKey = "provider/family/model";
-const defaults = { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 };
+const defaults = {
+	enabled: true,
+	reserveTokens: 16384,
+	keepRecentTokens: 20000,
+	maxSummaryTokens: 8000,
+	primaryTimeoutMs: 300000,
+	fallbackTimeoutMs: 240000,
+};
 
 // Regression coverage for #8133.
 describe("compaction model overrides", () => {
@@ -22,17 +32,41 @@ describe("compaction model overrides", () => {
 			},
 		});
 		expect(manager.getCompactionSettings(model)).toEqual({
-			enabled: true,
+			...defaults,
 			reserveTokens: 400000,
 			keepRecentTokens: 10000,
+			maxSummaryTokens: 8000,
 		});
 		expect(manager.getCompactionReserveTokens(model)).toBe(400000);
 		expect(manager.getCompactionKeepRecentTokens(model)).toBe(10000);
-		expect(manager.getCompactionSettings()).toEqual({ enabled: true, reserveTokens: 8192, keepRecentTokens: 10000 });
+		expect(manager.getCompactionSettings()).toEqual({
+			...defaults,
+			reserveTokens: 8192,
+			keepRecentTokens: 10000,
+			maxSummaryTokens: 8000,
+		});
 
 		manager.applyOverrides({ compaction: { modelOverrides: { [modelKey]: { keepRecentTokens: 30000 } } } });
 		expect(manager.getCompactionKeepRecentTokens(model)).toBe(30000);
 		expect(manager.getCompactionReserveTokens(model)).toBe(400000);
+	});
+
+	// smarty-dev#17478: output limits must not change the reserve or follow model overrides.
+	it("keeps the summary output allowance independent of model reserve overrides", () => {
+		const manager = SettingsManager.inMemory({
+			compaction: {
+				reserveTokens: 400000,
+				maxSummaryTokens: 2000,
+				modelOverrides: { [modelKey]: { reserveTokens: 1 } },
+			},
+		});
+		expect(manager.getCompactionSettings(model)).toEqual({
+			...defaults,
+			reserveTokens: 1,
+			maxSummaryTokens: 2000,
+		});
+		expect(manager.getCompactionSettings().reserveTokens).toBe(400000);
+		expect(manager.getCompactionSettings().maxSummaryTokens).toBe(2000);
 	});
 
 	it("falls back to built-in defaults for missing fields", () => {
@@ -82,14 +116,16 @@ describe("compaction model overrides", () => {
 		);
 		const manager = SettingsManager.fromStorage(storage);
 		expect(manager.getCompactionSettings(model)).toEqual({
-			enabled: true,
+			...defaults,
 			reserveTokens: 400000,
 			keepRecentTokens: 2000,
+			maxSummaryTokens: 8000,
 		});
 		expect(manager.getCompactionSettings({ provider: "provider", id: "other" })).toEqual({
-			enabled: true,
+			...defaults,
 			reserveTokens: 1024,
 			keepRecentTokens: 4096,
+			maxSummaryTokens: 8000,
 		});
 		await manager.reload();
 		expect(manager.getCompactionKeepRecentTokens(model)).toBe(2000);
@@ -179,7 +215,11 @@ describe("compaction model overrides", () => {
 		const manager = SettingsManager.inMemory({
 			compaction: { reserveTokens: 0, keepRecentTokens: 0 },
 		});
-		expect(manager.getCompactionSettings(model)).toEqual({ enabled: true, reserveTokens: 0, keepRecentTokens: 0 });
+		expect(manager.getCompactionSettings(model)).toEqual({
+			...defaults,
+			reserveTokens: 0,
+			keepRecentTokens: 0,
+		});
 		manager.applyOverrides({
 			compaction: {
 				reserveTokens: 1000,
@@ -187,6 +227,51 @@ describe("compaction model overrides", () => {
 				modelOverrides: { [modelKey]: { reserveTokens: 0, keepRecentTokens: 0 } },
 			},
 		});
-		expect(manager.getCompactionSettings(model)).toEqual({ enabled: true, reserveTokens: 0, keepRecentTokens: 0 });
+		expect(manager.getCompactionSettings(model)).toEqual({
+			...defaults,
+			reserveTokens: 0,
+			keepRecentTokens: 0,
+		});
+	});
+});
+
+// smarty-dev#17478: configured phase budgets cannot bypass the nine-minute ceiling.
+describe("compaction phase settings", () => {
+	it("shares central defaults with the generated settings schema", () => {
+		const settings = SettingsManager.inMemory();
+		expect(settings.getCompactionTimeouts()).toEqual({ primaryTimeoutMs: 300000, fallbackTimeoutMs: 240000 });
+		expect(defaults.primaryTimeoutMs).toBe(SETTINGS_DEFAULTS.compaction.primaryTimeoutMs);
+		expect(defaults.fallbackTimeoutMs).toBe(SETTINGS_DEFAULTS.compaction.fallbackTimeoutMs);
+		expect(readFileSync(new URL("../schemas/settings.schema.json", import.meta.url), "utf8")).toBe(
+			renderConfigSchemas().get("schemas/settings.schema.json"),
+		);
+	});
+
+	it.each([
+		{ primaryTimeoutMs: 280000, fallbackTimeoutMs: 260000 },
+		{ primaryTimeoutMs: 1, fallbackTimeoutMs: 1 },
+		{ primaryTimeoutMs: 539999, fallbackTimeoutMs: 1 },
+	])("allows smaller budgets and reallocations: %j", (timeouts) => {
+		const settings = SettingsManager.inMemory({ compaction: timeouts });
+		expect(settings.getCompactionSettings(model)).toMatchObject(timeouts);
+	});
+
+	it.each([
+		{ primaryTimeoutMs: 300001 },
+		{ fallbackTimeoutMs: 240001 },
+		{ primaryTimeoutMs: 300000, fallbackTimeoutMs: 300000 },
+	])("rejects an effective sum above 540000ms: %j", (timeouts) => {
+		expect(() => SettingsManager.inMemory({ compaction: timeouts }).getCompactionSettings()).toThrow("540000ms");
+	});
+
+	describe.each(["primaryTimeoutMs", "fallbackTimeoutMs"] as const)("%s", (field) => {
+		it.each([null, 0, -1, 1.5, "300000", true, {}, [], Number.NaN, Infinity, -Infinity])(
+			"rejects invalid runtime budgets: %s",
+			(value) => {
+				const settings = SettingsManager.inMemory();
+				settings.applyOverrides({ compaction: { [field]: value } });
+				expect(() => settings.getCompactionSettings()).toThrow(`compaction.${field}`);
+			},
+		);
 	});
 });

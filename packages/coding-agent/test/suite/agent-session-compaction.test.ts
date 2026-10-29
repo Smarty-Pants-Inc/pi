@@ -3,6 +3,7 @@ import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
+	type FauxProviderState,
 	fauxAssistantMessage,
 	fauxToolCall,
 	getCurrentSystemPrompt,
@@ -712,7 +713,14 @@ describe("AgentSession compaction characterization", () => {
 			await harness.session.prompt("run the large tool");
 
 			expect(order.slice(0, 2)).toEqual(["compaction", "provider"]);
-			expect(observedSettings[0]).toEqual({ enabled: true, reserveTokens: 400, keepRecentTokens: 1750 });
+			expect(observedSettings[0]).toEqual({
+				enabled: true,
+				reserveTokens: 400,
+				keepRecentTokens: 1750,
+				maxSummaryTokens: 8000,
+				primaryTimeoutMs: 300000,
+				fallbackTimeoutMs: 240000,
+			});
 			expect(harness.eventsOfType("agent_start")).toHaveLength(agentStartsBefore + 1);
 			expect(harness.eventsOfType("compaction_start").at(-1)).toEqual({
 				type: "compaction_start",
@@ -1623,97 +1631,154 @@ describe("AgentSession compaction characterization", () => {
 		}
 	});
 
-	it.each(["manual", "pre-prompt"] as const)("shares the %s deadline across all stages", async (mode) => {
-		for (const phase of ["history", "prefix", "retry", "backoff"] as const) {
-			const harness = await createHarness({
-				models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
-				settings: {
-					compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 100 },
-					retry: { enabled: true, maxRetries: 5, baseDelayMs: 30_000 },
-				},
-			});
-			harnesses.push(harness);
-			seedCompactableSession(harness);
-			harness.sessionManager.appendMessage({ role: "user", content: "split turn", timestamp: Date.now() - 200 });
-			harness.sessionManager.appendMessage({
-				...createAssistant(harness, { totalTokens: 1001, timestamp: Date.now() - 100 }),
-				content: [{ type: "text", text: "retained assistant response" }],
-			});
-			harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
-			const before = structuredClone(harness.sessionManager.getEntries());
-			const signals: (AbortSignal | undefined)[] = [];
-			let releaseLate = (_message: AssistantMessage) => {};
-			const late = new Promise<AssistantMessage>((resolve) => {
-				releaseLate = resolve;
-			});
-			let releaseFirst = () => {};
-			let firstTimer: ReturnType<typeof setTimeout> | undefined;
-			const step = (_context: TranscriptContext, options: SimpleStreamOptions | undefined) => {
-				signals.push(options?.signal);
-				if (signals.length === 1 && phase !== "history") {
-					const response =
-						phase === "prefix"
-							? fauxAssistantMessage("history summary")
-							: fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" });
-					const delay = phase === "prefix" ? 600_000 : phase === "backoff" ? 1_199_000 : 0;
-					if (delay === 0) return response;
-					return new Promise<AssistantMessage>((resolve) => {
-						releaseFirst = () => resolve(response);
-						firstTimer = setTimeout(releaseFirst, delay);
-					});
-				}
-				// Intentionally ignores abort until released: timeout must stop core
-				// waits without accepting this late result or starting another summary.
-				return late;
-			};
-			harness.setResponses([step, step]);
-			vi.useFakeTimers();
-			const operation =
-				mode === "manual" ? harness.session.compact() : harness.session.prompt("pending after timeout");
-			const outcome = operation.then(
-				() => undefined,
-				(error: unknown) => error,
-			);
-			try {
-				await vi.advanceTimersByTimeAsync(1_199_999);
-				const calls = phase === "prefix" || phase === "retry" ? 2 : 1;
-				expect(harness.faux.state.callCount).toBe(calls);
-				expect(signals[0]?.aborted).toBe(false);
-				expect(signals.every((signal) => signal === signals[0])).toBe(true);
-				expect(harness.session.isCompacting).toBe(true);
-				await vi.advanceTimersByTimeAsync(1);
-				expect(await outcome).toBeInstanceOf(Error);
-				expect(signals[0]?.aborted).toBe(true);
-				expect(signals[0]?.reason).toMatchObject({ name: "TimeoutError" });
-				expect(harness.session.isIdle).toBe(true);
-				expect(harness.sessionManager.getEntries()).toEqual(before);
-				expect(harness.eventsOfType("compaction_end")).toHaveLength(1);
-				expect(harness.eventsOfType("compaction_end")[0]).toMatchObject({
-					result: undefined,
-					aborted: false,
-					errorMessage: expect.stringContaining("20-minute deadline"),
+	// Regression test for #17478: history, prefix, retry, and backoff share the primary phase budget.
+	it.each(["manual", "pre-prompt"] as const)(
+		"shares the primary deadline across %s compaction stages",
+		async (mode) => {
+			for (const phase of ["history", "prefix", "retry", "backoff"] as const) {
+				const harness = await createHarness({
+					models: [
+						{ id: "faux-1", contextWindow: 1000, maxTokens: 100 },
+						{ id: "faux-fallback", contextWindow: 1000, maxTokens: 100 },
+					],
+					settings: {
+						compaction: {
+							enabled: true,
+							keepRecentTokens: 1,
+							reserveTokens: 100,
+							fallbackModel: "faux/faux-fallback",
+							primaryTimeoutMs: 300000,
+							fallbackTimeoutMs: 240000,
+						},
+						retry: { enabled: true, maxRetries: 5, baseDelayMs: 30_000 },
+					},
 				});
-				if (mode === "pre-prompt") {
-					expect(harness.session.getSteeringMessages()).toEqual(["pending after timeout"]);
-				}
-				releaseLate(fauxAssistantMessage("late summary must not be persisted"));
-				await vi.advanceTimersByTimeAsync(60_000);
-				expect(harness.faux.state.callCount).toBe(calls);
-				expect(harness.sessionManager.getEntries()).toEqual(before);
-				expect(harness.eventsOfType("summarization_retry_finished")).toHaveLength(
-					phase === "retry" || phase === "backoff" ? 1 : 0,
+				harnesses.push(harness);
+				seedCompactableSession(harness);
+				harness.sessionManager.appendMessage({ role: "user", content: "split turn", timestamp: Date.now() - 200 });
+				harness.sessionManager.appendMessage({
+					...createAssistant(harness, { totalTokens: 1001, timestamp: Date.now() - 100 }),
+					content: [{ type: "text", text: "retained assistant response" }],
+				});
+				harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+				const before = structuredClone(harness.sessionManager.getEntries());
+				const signals: (AbortSignal | undefined)[] = [];
+				const requestModels: string[] = [];
+				let releaseLate = (_message: AssistantMessage) => {};
+				const late = new Promise<AssistantMessage>((resolve) => {
+					releaseLate = resolve;
+				});
+				let releaseFirst = () => {};
+				let firstTimer: ReturnType<typeof setTimeout> | undefined;
+				const step = (
+					_context: TranscriptContext,
+					options: SimpleStreamOptions | undefined,
+					_state: FauxProviderState,
+					requestModel: Model<string>,
+				) => {
+					signals.push(options?.signal);
+					requestModels.push(requestModel.id);
+					if (requestModel.id !== "faux-1") return late;
+					const primaryCalls = requestModels.filter((model) => model === "faux-1").length;
+					if (primaryCalls === 1 && phase !== "history") {
+						const response =
+							phase === "prefix"
+								? fauxAssistantMessage("history summary")
+								: fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" });
+						const delay = phase === "prefix" ? 240_000 : phase === "backoff" ? 299_000 : 0;
+						if (delay === 0) return response;
+						return new Promise<AssistantMessage>((resolve) => {
+							releaseFirst = () => resolve(response);
+							firstTimer = setTimeout(releaseFirst, delay);
+						});
+					}
+					// Intentionally ignores abort until released: timeout must reject late results.
+					return late;
+				};
+				harness.setResponses([step, step, step]);
+				vi.useFakeTimers();
+				const operation =
+					mode === "manual" ? harness.session.compact() : harness.session.prompt("pending after timeout");
+				const outcome = operation.then(
+					() => undefined,
+					(error: unknown) => error,
 				);
-			} finally {
-				harness.session.abortCompaction();
-				clearTimeout(firstTimer);
-				releaseFirst();
-				releaseLate(fauxAssistantMessage("fixture cleanup"));
-				await outcome;
-				await vi.advanceTimersByTimeAsync(0);
-				vi.useRealTimers();
+				try {
+					await vi.advanceTimersByTimeAsync(299_999);
+					const primaryCalls = phase === "prefix" || phase === "retry" ? 2 : 1;
+					expect(requestModels).toEqual(Array(primaryCalls).fill("faux-1"));
+					expect(signals).toHaveLength(primaryCalls);
+					expect(signals.every((signal) => signal === signals[0])).toBe(true);
+					expect(signals[0]?.aborted).toBe(false);
+					expect(harness.session.isCompacting).toBe(true);
+					const retryEvents = harness.eventsOfType("summarization_retry_scheduled");
+					expect(retryEvents).toHaveLength(phase === "retry" || phase === "backoff" ? 1 : 0);
+					if (retryEvents.length > 0) {
+						expect(retryEvents[0]).toMatchObject({ attempt: 1, maxAttempts: 2, delayMs: 2000 });
+					}
+
+					await vi.advanceTimersByTimeAsync(1);
+					expect(requestModels).toEqual([...Array(primaryCalls).fill("faux-1"), "faux-fallback"]);
+					const primarySignal = signals[0];
+					const fallbackSignal = signals[primaryCalls];
+					expect(signals.slice(0, primaryCalls).every((signal) => signal === primarySignal)).toBe(true);
+					expect(primarySignal?.aborted).toBe(true);
+					expect(primarySignal?.reason).toMatchObject({
+						name: "TimeoutError",
+						message: "Primary compaction exceeded its 300000ms deadline",
+					});
+					expect(fallbackSignal).not.toBe(primarySignal);
+					expect(fallbackSignal?.aborted).toBe(false);
+					expect(harness.eventsOfType("compaction_end")).toEqual([]);
+					await vi.advanceTimersByTimeAsync(239_999);
+					expect(fallbackSignal?.aborted).toBe(false);
+					expect(harness.eventsOfType("compaction_end")).toEqual([]);
+					await vi.advanceTimersByTimeAsync(1);
+					const terminalError = await outcome;
+					const stageFailure =
+						"Primary compaction failed: Primary compaction exceeded its 300000ms deadline; fallback compaction failed: Fallback compaction exceeded its 240000ms deadline";
+					expect(terminalError).toBeInstanceOf(Error);
+					if (mode === "manual") {
+						if (!(terminalError instanceof AggregateError)) {
+							throw new Error("Manual compaction should expose the primary and fallback failures");
+						}
+						expect(terminalError.message).toBe(stageFailure);
+					}
+					expect(fallbackSignal?.aborted).toBe(true);
+					expect(fallbackSignal?.reason).toMatchObject({
+						name: "TimeoutError",
+						message: "Fallback compaction exceeded its 240000ms deadline",
+					});
+					expect(harness.session.isIdle).toBe(true);
+					expect(harness.sessionManager.getEntries()).toEqual(before);
+					expect(harness.eventsOfType("compaction_end")).toHaveLength(1);
+					expect(harness.eventsOfType("compaction_end")[0]).toMatchObject({
+						result: undefined,
+						aborted: false,
+						errorMessage: expect.stringContaining(stageFailure),
+					});
+					if (mode === "pre-prompt") {
+						expect(harness.session.getSteeringMessages()).toEqual(["pending after timeout"]);
+					}
+					releaseLate(fauxAssistantMessage("late summary must not be persisted"));
+					await vi.advanceTimersByTimeAsync(60_000);
+					expect(harness.faux.state.callCount).toBe(primaryCalls + 1);
+					expect(harness.sessionManager.getEntries()).toEqual(before);
+					expect(harness.eventsOfType("summarization_retry_finished")).toHaveLength(
+						phase === "retry" || phase === "backoff" ? 1 : 0,
+					);
+				} finally {
+					harness.session.abortCompaction();
+					clearTimeout(firstTimer);
+					releaseFirst();
+					releaseLate(fauxAssistantMessage("fixture cleanup"));
+					await outcome;
+					await vi.advanceTimersByTimeAsync(0);
+					vi.useRealTimers();
+				}
 			}
-		}
-	});
+		},
+	);
 
 	it("does not trigger threshold compaction below the threshold or when disabled", async () => {
 		const belowThresholdHarness = await createHarness({
