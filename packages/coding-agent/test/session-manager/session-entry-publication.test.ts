@@ -61,7 +61,22 @@ it("owns message, custom data, details, and context edits without freezing calle
 	expect(SessionManager.open(manager.getSessionFile()!).getEntries()).toEqual(history.getEntries());
 	const context = manager.buildSessionProjection().messages[0];
 	if (context.role !== "user" || !Array.isArray(context.content)) throw new Error("missing projected user");
-	if (context.content[0].type === "text") context.content[0].text = "local model view";
+	// smarty-dev#14893: immutable edited payloads are shared; only the runtime shell is mutable.
+	expect(Object.isFrozen(context.content)).toBe(true);
+	const nextContext = manager.buildSessionProjection().messages[0];
+	if (nextContext.role !== "user") throw new Error("missing projected user");
+	expect(nextContext.content).toBe(context.content);
+	const block = context.content[0];
+	if (block.type === "text") {
+		expect(() => {
+			block.text = "local model view";
+		}).toThrow(TypeError);
+	}
+	context.content = "local model view";
+	expect(manager.buildSessionProjection().messages[0]).toMatchObject({
+		role: "user",
+		content: [{ type: "text", text: "edited" }],
+	});
 	expect(JSON.stringify(history.getEntries())).toBe(JSON.stringify(JSON.parse(before).entries));
 });
 
