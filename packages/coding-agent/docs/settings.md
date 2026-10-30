@@ -135,8 +135,21 @@ See [Compaction Reference](compaction.md) for trigger, summarization, and valida
 | `terminal.trueColor` | `boolean \| "auto"` | `"auto"` | Override true-color detection. |
 | `images.autoResize` | boolean | `true` | Resize images to at most 2000 by 2000 pixels before sending them to a model. |
 | `images.blockImages` | boolean | `false` | Prevent images from being sent to models. |
+| `images.requestBudgetBytes` | positive safe integer | `12582912` (12 MiB) | Target maximum serialized request size before older history images are omitted. |
 | `markdown.codeBlockIndent` | string | `"  "` | Prefix used to indent rendered code blocks. |
 | `markdown.mermaid` | `"off" \| "final" \| "streaming"` | `"streaming"` | Mermaid rendering mode. |
+
+When the actual serialized request JSON exceeds `images.requestBudgetBytes`, Pi replaces older history image blocks with placeholders in that request until it fits. This omission is per request: saved session history is unchanged, and non-image content is preserved. Pi omits the oldest images first, retaining the newest images and images in the latest user message until they are unavoidable to remove. The effective budget is capped at 16 MiB, or at a lower model `maxRequestBytes` limit when known. A larger model limit or `images.requestBudgetBytes` value does not raise the 16 MiB hard cap. After omission, a request that still exceeds the effective limit fails.
+
+Configure the target in `settings.json`:
+
+```json
+{
+  "images": {
+    "requestBudgetBytes": 12582912
+  }
+}
+```
 
 See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and platform details.
 

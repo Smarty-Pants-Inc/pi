@@ -184,6 +184,19 @@ describe("generated configuration schemas", () => {
 		}
 	});
 
+	// Regression for Smarty-Pants-Inc/smarty-dev#16938.
+	it("requires a positive safe integer image request budget", () => {
+		const validator = Compile(SettingsSchema);
+		for (const value of [0, -1, 1.5, "12582912", null, Number.MAX_SAFE_INTEGER + 1]) {
+			expect(validator.Check({ images: { requestBudgetBytes: value } }), `requestBudgetBytes=${String(value)}`).toBe(
+				false,
+			);
+		}
+		for (const value of [1, 12_582_912, Number.MAX_SAFE_INTEGER]) {
+			expect(validator.Check({ images: { requestBudgetBytes: value } })).toBe(true);
+		}
+	});
+
 	it("rejects settings values that runtime accessors reject", () => {
 		const validator = Compile(SettingsSchema);
 		for (const invalid of [

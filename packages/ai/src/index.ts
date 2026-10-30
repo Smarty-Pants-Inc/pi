@@ -48,6 +48,7 @@ export * from "./utils/event-stream.ts";
 export * from "./utils/json-parse.ts";
 export * from "./utils/overflow.ts";
 export { ProviderRequestLimitError } from "./utils/provider-retry.ts";
+export * from "./utils/request-size.ts";
 export * from "./utils/retry.ts";
 export { contentText, getSystemMessageText, renderSystemMessageUpdate } from "./utils/text.ts";
 export * from "./utils/transcript.ts";

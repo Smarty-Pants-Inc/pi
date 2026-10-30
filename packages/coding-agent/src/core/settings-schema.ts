@@ -156,6 +156,14 @@ const ImageSettingsSchema = Type.Object({
 			default: SETTINGS_DEFAULTS.images.blockImages,
 		}),
 	),
+	requestBudgetBytes: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: Number.MAX_SAFE_INTEGER,
+			description: "Target serialized request size before image omission; capped at 16 MiB or a lower model limit.",
+			default: SETTINGS_DEFAULTS.images.requestBudgetBytes,
+		}),
+	),
 });
 
 function thinkingBudgetsSettings(options?: TSchemaOptions) {

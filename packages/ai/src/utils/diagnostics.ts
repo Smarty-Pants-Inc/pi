@@ -19,6 +19,7 @@ export const ASSISTANT_DIAGNOSTIC_TYPES = [
 	"anthropic_input_transformations",
 	"anthropic_strict_tools_fallback",
 	"anthropic_model_fallback",
+	"request_images_omitted",
 ] as const;
 
 export type AssistantMessageDiagnosticType = (typeof ASSISTANT_DIAGNOSTIC_TYPES)[number];
@@ -31,6 +32,10 @@ export interface AssistantMessageDiagnostic {
 	thinkingBlocksDropped?: number;
 	/** `anthropic_model_fallback` only: Pi's count of observed fallback markers, including start markers. */
 	fallbackCount?: number;
+	/** `request_images_omitted` only: Pi's count of image blocks omitted from the final request. */
+	imagesOmitted?: number;
+	/** `request_images_omitted` only: UTF-8 JSON bytes saved, including omission notices. */
+	bytesSaved?: number;
 }
 
 const DIAGNOSTIC_TYPES: ReadonlySet<string> = new Set(ASSISTANT_DIAGNOSTIC_TYPES);
@@ -38,6 +43,8 @@ const DIAGNOSTIC_TYPES: ReadonlySet<string> = new Set(ASSISTANT_DIAGNOSTIC_TYPES
 /** Bounds of the owned counts; provider-supplied numeric values are never published. */
 const MAX_THINKING_BLOCKS_DROPPED = 100_000;
 const MAX_FALLBACK_COUNT = 100_000;
+const MAX_IMAGES_OMITTED = 100_000;
+const MAX_REQUEST_BYTES_SAVED = 1024 * 1024 * 1024;
 
 /** Diagnostics Pi created or rebuilt; re-projection keeps their local timestamps. */
 const ownedDiagnostics = new WeakSet<object>();
@@ -52,6 +59,23 @@ export function formatThrownValue(value: unknown): string {
 export function createAssistantMessageDiagnostic(type: AssistantMessageDiagnosticType): AssistantMessageDiagnostic {
 	const diagnostic: AssistantMessageDiagnostic = { type, timestamp: Date.now() };
 	ownedDiagnostics.add(diagnostic);
+	return diagnostic;
+}
+
+function boundedRequestCount(value: unknown, maximum: number): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? Math.min(value, maximum) : undefined;
+}
+
+/** Build Pi's owned request-image omission summary; never pass provider counts to this helper. */
+export function createRequestImagesOmittedDiagnostic(
+	imagesOmitted: number,
+	bytesSaved: number,
+): AssistantMessageDiagnostic {
+	const diagnostic = createAssistantMessageDiagnostic("request_images_omitted");
+	const images = boundedRequestCount(imagesOmitted, MAX_IMAGES_OMITTED);
+	const bytes = boundedRequestCount(bytesSaved, MAX_REQUEST_BYTES_SAVED);
+	if (images !== undefined) diagnostic.imagesOmitted = images;
+	if (bytes !== undefined) diagnostic.bytesSaved = bytes;
 	return diagnostic;
 }
 
@@ -72,7 +96,10 @@ export function projectAssistantMessageDiagnostics(value: unknown): AssistantMes
 	const projected: AssistantMessageDiagnostic[] = [];
 	for (const diagnostic of value) {
 		if (typeof diagnostic !== "object" || diagnostic === null) continue;
-		const { type, timestamp, thinkingBlocksDropped, fallbackCount } = diagnostic as Record<string, unknown>;
+		const { type, timestamp, thinkingBlocksDropped, fallbackCount, imagesOmitted, bytesSaved } = diagnostic as Record<
+			string,
+			unknown
+		>;
 		if (typeof type !== "string" || !DIAGNOSTIC_TYPES.has(type)) continue;
 		const rebuilt = createAssistantMessageDiagnostic(type as AssistantMessageDiagnosticType);
 		const owned = ownedDiagnostics.has(diagnostic);
@@ -96,6 +123,12 @@ export function projectAssistantMessageDiagnostics(value: unknown): AssistantMes
 			fallbackCount >= 0
 		) {
 			rebuilt.fallbackCount = Math.min(fallbackCount, MAX_FALLBACK_COUNT);
+		}
+		if (owned && type === "request_images_omitted") {
+			const images = boundedRequestCount(imagesOmitted, MAX_IMAGES_OMITTED);
+			const bytes = boundedRequestCount(bytesSaved, MAX_REQUEST_BYTES_SAVED);
+			if (images !== undefined) rebuilt.imagesOmitted = images;
+			if (bytes !== undefined) rebuilt.bytesSaved = bytes;
 		}
 		projected.push(rebuilt);
 	}
