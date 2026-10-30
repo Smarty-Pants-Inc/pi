@@ -266,6 +266,11 @@ export interface ProviderFailureInput {
  */
 export function classifyProviderFailure(input: ProviderFailureInput): AssistantRecovery {
 	const text = input.text ?? "";
+	// The local byte-size refusal is not a token overflow or a transient failure. Check the owned wording
+	// before numeric sizes such as "500 MiB" can accidentally match the generic HTTP-status retry patterns.
+	if (/^request too large: [\d.]+ MiB > [\d.]+ MiB; start a new session or reduce attachments$/.test(text)) {
+		return { retryable: false };
+	}
 	const status = validHttpStatus(input.status);
 	if (isOverflowText(text, status, input.provider)) return { recovery: "context_length_exceeded", retryable: false };
 	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(text)) return { retryable: false };

@@ -4,6 +4,7 @@
 
 import { describe, expect, it } from "vitest";
 import { formatProviderError, normalizeProviderError, providerErrorText } from "../src/utils/error-body.ts";
+import { RequestTooLargeError } from "../src/utils/request-size.ts";
 
 const PRIVATE = "blocked by gateway WAF for tenant corp-eu-west-7-tenant-plum";
 
@@ -42,6 +43,32 @@ describe("normalizeProviderError", () => {
 
 	it("never treats a non-HTTP numeric status as a status", () => {
 		expect(normalizeProviderError(Object.assign(new Error("x"), { status: 0, code: 503 })).status).toBeUndefined();
+	});
+
+	// pi#321: local request-size failures must bypass attached provider status/code classification.
+	it("keeps local request-size refusals ahead of provider response metadata", () => {
+		const requestBytes = 20 * 1024 * 1024;
+		const maxRequestBytes = 16 * 1024 * 1024;
+		const error = Object.assign(new RequestTooLargeError(requestBytes, maxRequestBytes), {
+			error: { status: 503, code: "server_is_overloaded" },
+		});
+		error.message = "mutable provider message";
+
+		expect(normalizeProviderError(error)).toEqual({
+			recovery: { retryable: false },
+			localMessage: new RequestTooLargeError(requestBytes, maxRequestBytes).message,
+		});
+	});
+
+	it("uses parsed provider status and codes for other errors", () => {
+		const error = Object.assign(new Error("Provider request failed"), {
+			error: { status: 503, code: "server_is_overloaded" },
+		});
+
+		expect(normalizeProviderError(error)).toEqual({
+			status: 503,
+			recovery: { recovery: "retryable", retryable: true, midstream: "overload" },
+		});
 	});
 });
 

@@ -397,7 +397,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 	const cacheWarmer = new CacheWarmer(
-		modelRuntime,
+		{
+			streamSimple: (model, context, options) => modelRuntime.streamSimple(model, context, options, settingsManager),
+			get providerRequestGuard() {
+				return modelRuntime.providerRequestGuard;
+			},
+		},
 		sessionManager,
 		() => settingsManager.getCacheWarmingMode(),
 		async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
@@ -494,7 +499,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (options?.sessionId === sessionManager.getSessionId()) {
 				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
 			}
-			return modelRuntime.streamSimple(model, context, requestOptions);
+			return modelRuntime.streamSimple(model, context, requestOptions, settingsManager);
 		},
 		onPayload: transformProviderPayload,
 		onResponse: handleProviderResponse,

@@ -477,6 +477,13 @@
           "type": "boolean",
           "description": "When true, prevents all images from being sent to LLM providers.",
           "default": false
+        },
+        "requestBudgetBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Target serialized request size before image omission; capped at 16 MiB or a lower model limit.",
+          "default": 12582912
         }
       }
     },

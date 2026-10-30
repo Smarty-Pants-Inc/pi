@@ -5,6 +5,7 @@ import {
 	type ApiStreamOptions,
 	type AssistantImages,
 	type AssistantMessage,
+	type AssistantMessageEvent,
 	type AssistantMessageEventStream,
 	type AuthCheck,
 	type AuthInteraction,
@@ -22,6 +23,7 @@ import {
 	type CredentialStore,
 	clampThinkingLevel,
 	createModels,
+	createRequestImagesOmittedDiagnostic,
 	type DeferredCancelOptions,
 	type DeferredFetchOptions,
 	type DeferredHandle,
@@ -72,6 +74,7 @@ import {
 	protectOperationError,
 	protectOperationResult,
 } from "@earendil-works/pi-ai/utils/model-operations";
+import { fitRequestImages, RequestTooLargeError } from "@earendil-works/pi-ai/utils/request-size";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage, ReadOnlyAuthStorage } from "./auth-storage.ts";
@@ -184,13 +187,18 @@ function mergeHeaders(
 	return merged;
 }
 
-/** Configured pi-ai Models collection used by coding-agent and SDK consumers. */
+/**
+ * Configured pi-ai Models collection used by coding-agent and SDK consumers.
+ * Chat methods accept per-request settings as their fourth argument for image budgets, read at dispatch.
+ * Omitted settings use the live create-time settings, independent of later model-policy registrations.
+ */
 export class ModelRuntime implements Models {
 	/** One shared admission guard for an unattended dispatch, including warming and summaries. */
 	providerRequestGuard?: { beforeProviderRequest: () => void; signal: AbortSignal };
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	private readonly models: MutableModels;
 	private readonly policySettings = new Map<SettingsManager, number>();
+	private readonly requestSettings: SettingsManager;
 	private readonly credentials: RuntimeCredentials;
 	private readonly defaultBuiltins: ReadonlyMap<string, Provider>;
 	private readonly builtins = new Map<string, Provider>();
@@ -223,8 +231,10 @@ export class ModelRuntime implements Models {
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
 		ordinaryOwner?: OrdinaryOwnerContext,
+		requestSettings = SettingsManager.inMemory(),
 	) {
 		this.#ordinaryOwner = ordinaryOwner;
+		this.requestSettings = requestSettings;
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
@@ -276,6 +286,12 @@ export class ModelRuntime implements Models {
 			}
 			return withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt);
 		});
+		const settingsManager =
+			options.settingsManager ??
+			SettingsManager.create(
+				process.cwd(),
+				options.authPath ? dirname(options.authPath) : modelsPath ? dirname(modelsPath) : getAgentDir(),
+			);
 		const runtime = new ModelRuntime(
 			credentials,
 			config,
@@ -284,14 +300,9 @@ export class ModelRuntime implements Models {
 			providers,
 			!owner && process.env.PI_OFFLINE === undefined,
 			owner,
+			settingsManager,
 		);
-		runtime.addModelPolicy(
-			options.settingsManager ??
-				SettingsManager.create(
-					process.cwd(),
-					options.authPath ? dirname(options.authPath) : modelsPath ? dirname(modelsPath) : getAgentDir(),
-				),
-		);
+		runtime.addModelPolicy(settingsManager);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
 		const refreshFromNetwork = runtime.modelNetworkEnabled && options.allowModelNetwork === true;
@@ -921,10 +932,67 @@ export class ModelRuntime implements Models {
 		};
 	}
 
+	/** Size the adapter's assembled payload after the caller's transform, without changing stored history. */
+	private streamWithImageBudget(
+		transcript: Context,
+		options: StreamOptions,
+		settingsManager: SettingsManager,
+		dispatch: (options: StreamOptions) => AssistantMessageEventStream,
+	): AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> } {
+		let imagesOmitted = 0;
+		let bytesSaved = 0;
+		let diagnostic: ReturnType<typeof createRequestImagesOmittedDiagnostic> | undefined;
+		const source = dispatch({
+			...options,
+			onPayload: async (payload, requestModel) => {
+				const transformed = await options.onPayload?.(payload, requestModel);
+				try {
+					const fitted = fitRequestImages(
+						transformed === undefined ? payload : transformed,
+						requestModel,
+						transcript,
+						settingsManager.getImageRequestBudgetBytes(),
+					);
+					imagesOmitted = Math.max(imagesOmitted, fitted.imagesOmitted);
+					bytesSaved = Math.max(bytesSaved, fitted.bytesSaved);
+					return fitted.payload;
+				} catch (error) {
+					if (error instanceof RequestTooLargeError) {
+						imagesOmitted = Math.max(imagesOmitted, error.imagesOmitted);
+						bytesSaved = Math.max(bytesSaved, error.bytesSaved);
+					}
+					throw error;
+				}
+			},
+		});
+		const terminal = (message: AssistantMessage): AssistantMessage => {
+			if (imagesOmitted === 0) return message;
+			diagnostic ??= createRequestImagesOmittedDiagnostic(imagesOmitted, bytesSaved);
+			return {
+				...message,
+				diagnostics: [
+					...(message.diagnostics ?? []).filter((entry) => entry.type !== "request_images_omitted"),
+					diagnostic,
+				],
+			};
+		};
+		return {
+			async *[Symbol.asyncIterator]() {
+				for await (const event of source) {
+					if (event.type === "done") yield { ...event, message: terminal(event.message) };
+					else if (event.type === "error") yield { ...event, error: terminal(event.error) };
+					else yield event;
+				}
+			},
+			result: async () => terminal(await source.result()),
+		};
+	}
+
 	stream<TApi extends Api>(
 		model: Model<TApi>,
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
+		settingsManager = this.requestSettings,
 	): AssistantMessageEventStream {
 		const prepare = this.prepareRequest(model, options as (StreamOptions & ModelsRequestTransforms) | undefined);
 		const transcript = normalizeContext(context);
@@ -936,7 +1004,9 @@ export class ModelRuntime implements Models {
 				prepared.options.signal?.throwIfAborted();
 				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 				this.#ordinaryOwner?.assertSubmission();
-				return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
+				return this.streamWithImageBudget(transcript, prepared.options, settingsManager, (budgeted) =>
+					prepared.provider.stream(prepared.model, transcript, budgeted as ApiStreamOptions<TApi>),
+				);
 			},
 			options?.signal,
 		);
@@ -946,11 +1016,17 @@ export class ModelRuntime implements Models {
 		model: Model<TApi>,
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
+		settingsManager = this.requestSettings,
 	): Promise<AssistantMessage> {
-		return this.stream(model, context, options).result();
+		return this.stream(model, context, options, settingsManager).result();
 	}
 
-	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
+	streamSimple(
+		model: Model<Api>,
+		context: Context,
+		options?: ModelsSimpleStreamOptions,
+		settingsManager = this.requestSettings,
+	): AssistantMessageEventStream {
 		const prepare = this.prepareRequest(model, options);
 		const transcript = normalizeContext(context);
 		if (isVirtualModel(model)) {
@@ -973,7 +1049,12 @@ export class ModelRuntime implements Models {
 					// resolves its own, so they are not sent to the wrong vendor.
 					const { apiKey, headers, env, ...rest } = options ?? {};
 					const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
-					return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
+					return this.streamSimple(
+						route.model,
+						context,
+						{ ...rest, ...auth, maxTokens, reasoning },
+						settingsManager,
+					);
 				},
 				options?.signal,
 			);
@@ -986,14 +1067,21 @@ export class ModelRuntime implements Models {
 				prepared.options.signal?.throwIfAborted();
 				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 				this.#ordinaryOwner?.assertSubmission();
-				return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
+				return this.streamWithImageBudget(transcript, prepared.options, settingsManager, (budgeted) =>
+					prepared.provider.streamSimple(prepared.model, transcript, budgeted as SimpleStreamOptions),
+				);
 			},
 			options?.signal,
 		);
 	}
 
-	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage> {
-		return this.streamSimple(model, context, options).result();
+	completeSimple(
+		model: Model<Api>,
+		context: Context,
+		options?: ModelsSimpleStreamOptions,
+		settingsManager = this.requestSettings,
+	): Promise<AssistantMessage> {
+		return this.streamSimple(model, context, options, settingsManager).result();
 	}
 
 	streamDeferred(

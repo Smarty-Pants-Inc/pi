@@ -397,6 +397,36 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("image request budget", () => {
+		// Regression for Smarty-Pants-Inc/smarty-dev#16938.
+		it("defaults to 12 MiB and uses the merged project override", () => {
+			expect(SettingsManager.inMemory().getImageRequestBudgetBytes()).toBe(12_582_912);
+
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ images: { autoResize: false, requestBudgetBytes: 20_000_000 } }),
+			);
+			writeFileSync(
+				join(projectDir, ".pi", "settings.json"),
+				JSON.stringify({ images: { requestBudgetBytes: 8_000_000 } }),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getImageRequestBudgetBytes()).toBe(8_000_000);
+			expect(manager.getImageAutoResize()).toBe(false);
+		});
+
+		it.each([null, 0, -1, 1.5, "12582912", true, Number.MAX_SAFE_INTEGER + 1])(
+			"rejects invalid values: %j",
+			(value) => {
+				writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ images: { requestBudgetBytes: value } }));
+				expect(() => SettingsManager.create(projectDir, agentDir).getImageRequestBudgetBytes()).toThrow(
+					"Expected a positive safe integer",
+				);
+			},
+		);
+	});
+
 	describe("httpIdleTimeoutMs", () => {
 		it("should default to 5 minutes", () => {
 			const manager = SettingsManager.create(projectDir, agentDir);
