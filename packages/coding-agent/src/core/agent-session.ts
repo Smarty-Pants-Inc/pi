@@ -2008,15 +2008,19 @@ export class AgentSession {
 		}
 	};
 
-	/** Emit an agent event to extensions, then public listeners, then persist it. */
+	/** Emit an agent event to extensions, then public listeners, then persist it. Message-end errors are rethrown after persistence. */
 	private async _dispatchAgentEvent(event: AgentEvent): Promise<void> {
-		const finalizedToolResult = event.type === "message_end" && event.message.role === "toolResult";
+		const finalizedMessageEnd = event.type === "message_end";
+		let dispatchError: { error: unknown } | undefined;
 		// Emit to extensions first, then notify public listeners.
 		if (!this._shutdownCancellation.signal.aborted) {
 			try {
 				await raceWithAbortSignal(this._emitExtensionEvent(event), this._shutdownCancellation.signal);
 			} catch (error) {
-				if (!this._shutdownCancellation.signal.aborted) throw error;
+				if (!this._shutdownCancellation.signal.aborted) {
+					if (!finalizedMessageEnd) throw error;
+					dispatchError = { error };
+				}
 			}
 		}
 		// Cancellation releases extension waits, not final event publication/persistence.
@@ -2024,14 +2028,15 @@ export class AgentSession {
 		try {
 			this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 		} catch (error) {
-			if (!finalizedToolResult) throw error;
+			if (!finalizedMessageEnd) throw error;
 			listenerError = { error };
 		}
 
-		// Listeners still mutate before persistence; their failure cannot discard a finalized result.
-		// Storage and ownership failures remain outside the listener-error catch and propagate normally.
+		// Listeners still mutate before persistence; their failure cannot discard a finalized message.
+		// Storage and ownership failures remain outside the event-error catch and propagate normally.
 		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
 		else await this._persistAgentEvent(event);
+		if (dispatchError) throw dispatchError.error;
 		if (listenerError) throw listenerError.error;
 	}
 
