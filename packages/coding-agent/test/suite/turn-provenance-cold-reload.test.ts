@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
 import { getInputReceipt, promptReceived, receiveInput } from "../../src/core/received-input.ts";
@@ -138,14 +139,23 @@ it.each(mutations)("rejects %s after selecting a cold turn as the active branch"
 	expectHistory(userEntry(SessionManager.open(branchedFile), id), text, receipt);
 });
 
-// pi#160 / smarty-dev#12863 counterexample, following smarty-dev#10720: provider request
-// hooks still need mutable detached input, even when canonical reloaded history is frozen.
+// pi#160 / smarty-dev#12863 counterexample, following smarty-dev#10720 and #14893: provider request
+// hooks still need mutable detached user and non-user input, even when reloaded history is frozen.
 it("lets a request hook mutate its detached copy without changing reloaded keyboard history", async () => {
 	const text = "keyboard-attested request input\n".repeat(128);
 	const { file, id, receipt } = await persistedKeyboardSession(text, true);
 	const manager = SessionManager.open(file);
 	expect(isColdEntry(userEntry(manager, id))).toBe(true);
 	manager.branch(id);
+	const assistantId = manager.appendMessage(fauxAssistantMessage("ordinary assistant history"));
+	const toolId = manager.appendMessage({
+		role: "toolResult",
+		toolCallId: "ordinary-call",
+		toolName: "read",
+		content: [{ type: "text", text: "ordinary tool history" }],
+		isError: false,
+		timestamp: Date.now(),
+	});
 	let hookRan = false;
 	let providerRan = false;
 	const resumed = await createHarness({
@@ -162,6 +172,18 @@ it("lets a request hook mutate its detached copy without changing reloaded keybo
 			user.content[0].text = "hook nested edit";
 			user.content.push({ type: "text", text: "hook append" });
 			user.content = [...user.content, { type: "text", text: "hook replacement" }];
+			for (const role of ["assistant", "toolResult"] as const) {
+				const message = request.context.messages.find((message) => message.role === role);
+				if (
+					(message?.role !== "assistant" && message?.role !== "toolResult") ||
+					message.content[0]?.type !== "text"
+				) {
+					throw new Error(`missing ${role} request history`);
+				}
+				expect(message.content[0].text).toBe(`ordinary ${role === "assistant" ? "assistant" : "tool"} history`);
+				message.content[0].text = `hook ${role} edit`;
+				message.content.push({ type: "text", text: `hook ${role} append` });
+			}
 			hookRan = true;
 		},
 	});
@@ -177,6 +199,15 @@ it("lets a request hook mutate its detached copy without changing reloaded keybo
 					{ type: "text", text: "hook replacement" },
 				],
 			});
+			for (const role of ["assistant", "toolResult"] as const) {
+				expect(context.messages.find((message) => message.role === role)?.content).toEqual([
+					{ type: "text", text: `hook ${role} edit` },
+					{ type: "text", text: `hook ${role} append` },
+				]);
+			}
+			expect(JSON.stringify(context)).not.toMatch(
+				/"(?:provenance|receipt|principal|channel|turnId|submissionToken)"\s*:/,
+			);
 			providerRan = true;
 			return fauxAssistantMessage("detached request reply");
 		},
@@ -187,4 +218,75 @@ it("lets a request hook mutate its detached copy without changing reloaded keybo
 	expect(resumed.session.getLastAssistantText()).toBe("detached request reply");
 	expectHistory(userEntry(manager, id), text, receipt);
 	expectHistory(userEntry(SessionManager.open(file), id), text, receipt);
+	for (const source of [manager, SessionManager.open(file)]) {
+		const projection = source.buildSessionProjection();
+		for (const [entryId, original] of [
+			[assistantId, "ordinary assistant history"],
+			[toolId, "ordinary tool history"],
+		]) {
+			expect(source.getEntry(entryId)).toMatchObject({ message: { content: [{ type: "text", text: original }] } });
+			expect(projection.entries.find((entry) => entry.sourceEntry.id === entryId)?.messages[0]).toMatchObject({
+				content: [{ type: "text", text: original }],
+			});
+		}
+	}
+});
+
+// smarty-dev#14893: no custom prepareRequest hook must mean no deep copy at that boundary.
+// emitContext independently detaches later, so observe the actual prepareRequest return, then provider values.
+it("reuses large cached payloads at request preparation when no custom hook can mutate them", async () => {
+	const text = "cached payload\n".repeat(128 * 1024);
+	const manager = SessionManager.inMemory();
+	const assistantId = manager.appendMessage(fauxAssistantMessage(text));
+	const toolId = manager.appendMessage({
+		role: "toolResult",
+		toolCallId: "large-call",
+		toolName: "read",
+		content: [{ type: "text", text }],
+		isError: false,
+		timestamp: Date.now(),
+	});
+	const h = await createHarness({
+		sessionManager: manager,
+		models: [{ id: "large-context", contextWindow: 4_000_000 }],
+		settings: { compaction: { enabled: false } },
+	});
+	harnesses.push(h);
+	const prepareRequest = h.session.agent.prepareRequest!;
+	const preparedMessages: AgentMessage[][] = [];
+	h.session.agent.prepareRequest = async (request, signal) => {
+		const prepared = await prepareRequest(request, signal);
+		if (prepared?.context) preparedMessages.push(prepared.context.messages);
+		return prepared || undefined;
+	};
+	h.setResponses(
+		[1, 2].map(() => (context) => {
+			for (const role of ["assistant", "toolResult"] as const) {
+				expect(context.messages.find((message) => message.role === role)?.content).toEqual([
+					{ type: "text", text },
+				]);
+			}
+			return fauxAssistantMessage("no hook reply");
+		}),
+	);
+	for (const prompt of ["first request", "second request"]) {
+		await h.session.prompt(prompt);
+		expect(h.session.getLastAssistantText()).toBe("no hook reply");
+	}
+	expect(preparedMessages).toHaveLength(2);
+	for (const messages of preparedMessages) {
+		for (const entryId of [assistantId, toolId]) {
+			const entry = manager.getEntry(entryId);
+			if (entry?.type !== "message" || (entry.message.role !== "assistant" && entry.message.role !== "toolResult")) {
+				throw new Error("missing cached history");
+			}
+			const prepared = messages.find((message) => message.role === entry.message.role);
+			if (prepared?.role !== "assistant" && prepared?.role !== "toolResult") {
+				throw new Error("missing prepared history");
+			}
+			expect(Object.isFrozen(prepared)).toBe(false);
+			expect(prepared.content).toBe(entry.message.content);
+			expect(Object.isFrozen(prepared.content)).toBe(true);
+		}
+	}
 });

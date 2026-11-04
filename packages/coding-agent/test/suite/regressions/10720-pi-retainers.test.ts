@@ -60,9 +60,12 @@ function userText(message: AgentMessage | undefined): string | undefined {
 	return message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
 }
 
-// pi#160: the stored user message reused by the session projection, which persistence deep-freezes.
+// pi#160: read the canonical stored user message, which persistence deep-freezes.
 function storedUserMessage(harness: Harness): AgentMessage | undefined {
-	return harness.sessionManager.buildSessionProjection().messages.find((message) => message.role === "user");
+	const entry = harness.sessionManager
+		.getEntries()
+		.find((value) => value.type === "message" && value.message.role === "user");
+	return entry?.type === "message" ? entry.message : undefined;
 }
 
 function createLoader(cwd: string): DefaultResourceLoader {
@@ -180,7 +183,7 @@ describe("Pi session retainers (smarty-dev#10720)", () => {
 	});
 
 	// #11897: in-place request-hook edits are not safe to discard after overflow.
-	// pi#160: the projected user message is the frozen persisted one; the hook edits a mutable copy.
+	// pi#160: canonical stored history is frozen; the hook edits a mutable runtime copy.
 	it("detects in-place request-hook edits and sends them unchanged when they fit", async () => {
 		let hookSawFrozen: boolean | undefined;
 		const harness = await createHarness({
@@ -250,7 +253,7 @@ describe("Pi session retainers (smarty-dev#10720)", () => {
 		}
 	});
 
-	// pi#160 counterexample: a hook that leaves the frozen projected input untouched keeps it reprojectable.
+	// pi#160 counterexample: a hook that leaves the request input untouched keeps it reprojectable.
 	it("keeps untouched frozen projected input reprojectable", async () => {
 		let expected: string | undefined;
 		const harness = await createHarness({
