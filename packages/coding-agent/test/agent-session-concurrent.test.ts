@@ -6,7 +6,7 @@ import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentEvent } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
@@ -490,6 +490,45 @@ describe("AgentSession concurrent prompt guard", () => {
 			["system", "user", "assistant"],
 			["system", "user", "assistant"],
 		]);
+	});
+
+	// smarty-dev#18512: terminal message-end handler failures must not drop journal entries.
+	it.each([
+		{ role: "user", failure: "listener" },
+		{ role: "assistant", failure: "listener" },
+		{ role: "user", failure: "extension" },
+		{ role: "assistant", failure: "extension" },
+	] as const)("persists $role message_end when $failure throws", async ({ role, failure }) => {
+		await createSession();
+		const message =
+			role === "user"
+				? { role: "user" as const, content: "test", timestamp: Date.now() }
+				: createAssistantMessage("test");
+		const event: AgentEvent = { type: "message_end", message };
+		const dispatchSession = session as unknown as {
+			_dispatchAgentEvent: (event: AgentEvent) => Promise<void>;
+			_emit: (event: AgentEvent) => void;
+			_emitExtensionEvent: (event: AgentEvent) => Promise<void>;
+		};
+		const originalEmit = dispatchSession._emit;
+		const originalExtensionDispatch = dispatchSession._emitExtensionEvent;
+		const error = new Error(`${failure} failure`);
+		if (failure === "listener") {
+			dispatchSession._emit = () => {
+				throw error;
+			};
+		} else {
+			dispatchSession._emitExtensionEvent = async () => {
+				throw error;
+			};
+		}
+
+		await expect(dispatchSession._dispatchAgentEvent(event)).rejects.toBe(error);
+		dispatchSession._emit = originalEmit;
+		dispatchSession._emitExtensionEvent = originalExtensionDispatch;
+		expect(session.sessionManager.getEntries()).toContainEqual(
+			expect.objectContaining({ type: "message", message: expect.objectContaining({ role }) }),
+		);
 	});
 
 	it("should persist message_end events in order with slow extension handlers", async () => {
