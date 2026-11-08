@@ -1320,7 +1320,7 @@ export class AgentSession {
 					throw error;
 				this.#ordinaryOwner?.assertNativeTokenReservation();
 				const revision = this.sessionManager.revision();
-				const outcome = await this._runAutoCompaction("overflow", false);
+				const outcome = await this._runAutoCompaction("overflow", false, requestModel.contextWindow);
 				if (outcome === "failed" || outcome === "aborted") {
 					this._stopAfterCompactionFailure = true;
 					this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
@@ -1690,7 +1690,9 @@ export class AgentSession {
 		reason: "manual" | "threshold" | "overflow",
 		settings: CompactionSettings,
 		signal: AbortSignal,
+		overflowContextWindow?: number,
 	): Promise<{ pathEntries: SessionEntry[]; preparation: CompactionPreparation | undefined }> {
+		let committedContextEdits = false;
 		if (this._extensionRunner.hasHandlers("session_before_prepare_compact")) {
 			const boundary = await this._extensionRunner.emitBoundary(
 				{ type: "session_before_prepare_compact", reason, signal },
@@ -1709,10 +1711,27 @@ export class AgentSession {
 					throw new Error("session_before_prepare_compact only accepts context_edit entries");
 				}
 				this._commitBoundaryDrafts(boundary.entries, boundary.entryReceipts);
+				committedContextEdits = true;
 			}
 		}
 
 		const pathEntries = this.sessionManager.getBranch();
+		if (committedContextEdits) {
+			const projection = this.sessionManager.buildSessionProjection();
+			const contextTokens = estimateProjectedContextTokens(projection, pathEntries).tokens;
+			const model = this.model;
+			if (reason === "threshold" && model && !shouldCompact(contextTokens, model.contextWindow, settings)) {
+				return { pathEntries, preparation: undefined };
+			}
+			if (
+				reason === "overflow" &&
+				overflowContextWindow !== undefined &&
+				overflowContextWindow > 0 &&
+				contextTokens <= overflowContextWindow
+			) {
+				return { pathEntries, preparation: undefined };
+			}
+		}
 		return { pathEntries, preparation: prepareCompaction(pathEntries, settings) };
 	}
 
@@ -6121,7 +6140,7 @@ export class AgentSession {
 			// Case 2: the response completed successfully. Compact, but do not retry because
 			// agent.continue() cannot continue from a completed assistant response.
 			if (!willRetry) {
-				return await this._runAutoCompaction("overflow", false);
+				return await this._runAutoCompaction("overflow", false, contextOverflow ? contextWindow : undefined);
 			}
 
 			if (this._overflowRecoveryAttempted) {
@@ -6148,7 +6167,11 @@ export class AgentSession {
 			// Persistently omit the selected final attempt before post-run recovery compaction.
 			this._overflowRecoveryAttempted = true;
 			this._omitRecoveryAttempt(assistantMessage, toolResults);
-			const retry = await this._runAutoCompaction("overflow", willRetry);
+			const retry = await this._runAutoCompaction(
+				"overflow",
+				willRetry,
+				contextOverflow ? contextWindow : undefined,
+			);
 			if (retry === true) this._failedResponse = assistantMessage;
 			return retry;
 		}
@@ -6201,7 +6224,11 @@ export class AgentSession {
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
 	 * @returns A continuation decision, or an explicit failed/aborted outcome.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<CompactionOutcome> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		overflowContextWindow?: number,
+	): Promise<CompactionOutcome> {
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
 		if (this.isCompacting) return "failed";
@@ -6222,7 +6249,12 @@ export class AgentSession {
 			let pathEntries: SessionEntry[];
 			let preparation: CompactionPreparation | undefined;
 			if (this._extensionRunner.hasHandlers("session_before_prepare_compact")) {
-				({ pathEntries, preparation } = await this._prepareCompaction(reason, settings, budget.signal));
+				({ pathEntries, preparation } = await this._prepareCompaction(
+					reason,
+					settings,
+					budget.signal,
+					overflowContextWindow,
+				));
 			} else {
 				pathEntries = this.sessionManager.getBranch();
 				preparation = prepareCompaction(pathEntries, settings);
