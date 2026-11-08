@@ -906,6 +906,16 @@ export interface SessionBeforeCompactEvent {
 	signal: AbortSignal;
 }
 
+/** Fired before reading the branch to prepare a context compaction. */
+export interface SessionBeforePrepareCompactEvent {
+	type: "session_before_prepare_compact";
+	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
+	reason: "manual" | "threshold" | "overflow";
+	entries: ContextEditEntryDraft[];
+	context: BoundaryContextPreview;
+	signal: AbortSignal;
+}
+
 /** Fired after context compaction succeeds */
 export interface SessionCompactEvent {
 	type: "session_compact";
@@ -978,6 +988,7 @@ export type SessionEvent =
 	| SessionBeforeSwitchEvent
 	| SessionBeforeForkEvent
 	| SessionBeforeCompactEvent
+	| SessionBeforePrepareCompactEvent
 	| SessionCompactEvent
 	| SessionCompactFailedEvent
 	| SessionShutdownEvent
@@ -1669,6 +1680,10 @@ export interface SessionBeforeCompactResult {
 	compaction?: CompactionResult;
 }
 
+export interface SessionBeforePrepareCompactResult {
+	entries?: ContextEditEntryDraft[];
+}
+
 export interface SessionBeforeTreeResult {
 	cancel?: boolean;
 	summary?: {
@@ -1786,6 +1801,10 @@ export interface ExtensionAPI {
 	on(
 		event: "session_before_compact",
 		handler: ExtensionHandler<SessionBeforeCompactEvent, SessionBeforeCompactResult>,
+	): () => void;
+	on(
+		event: "session_before_prepare_compact",
+		handler: ExtensionHandler<SessionBeforePrepareCompactEvent, SessionBeforePrepareCompactResult>,
 	): () => void;
 	on(event: "session_compact", handler: ExtensionHandler<SessionCompactEvent>): () => void;
 	on(event: "session_compact_failed", handler: ExtensionHandler<SessionCompactFailedEvent>): () => void;

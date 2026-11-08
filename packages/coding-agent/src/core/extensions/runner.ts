@@ -87,6 +87,7 @@ import type {
 	ResourcesDiscoverResult,
 	SessionBeforeCompactResult,
 	SessionBeforeForkResult,
+	SessionBeforePrepareCompactEvent,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionBoundaryDraft,
@@ -207,6 +208,7 @@ type RunnerEmitEvent = Exclude<
 	| BeforeProviderRequestEvent
 	| BeforeProviderHeadersEvent
 	| BeforeAgentStartEvent
+	| SessionBeforePrepareCompactEvent
 	| MessageEndEvent
 	| ResourcesDiscoverEvent
 	| InputEvent
@@ -239,7 +241,10 @@ export type ExtensionErrorListener = (error: ExtensionError) => void;
 
 type BoundaryBaseEvent =
 	| Omit<TurnEndEvent, "entries" | "continue" | "context">
-	| Omit<AgentBeforeSettleEvent, "entries" | "continue" | "context">;
+	| Omit<AgentBeforeSettleEvent, "entries" | "continue" | "context">
+	| Omit<SessionBeforePrepareCompactEvent, "entries" | "context">;
+
+type BoundaryEvent = TurnEndEvent | AgentBeforeSettleEvent | SessionBeforePrepareCompactEvent;
 
 interface BoundaryDispatchResult {
 	entries: SessionBoundaryDraft[];
@@ -1247,12 +1252,15 @@ export class ExtensionRunner {
 						// Uncloneable extension data must still follow the usual preview validation.
 					}
 				}
-				const event = {
-					...structuredClone(baseEvent),
-					entries: structuredClone(entries),
-					continue: shouldContinue,
-					context,
-				} as TurnEndEvent | AgentBeforeSettleEvent;
+				const eventBase =
+					"signal" in baseEvent
+						? { ...structuredClone({ ...baseEvent, signal: undefined }), signal: baseEvent.signal }
+						: structuredClone(baseEvent);
+				const event = (
+					baseEvent.type === "session_before_prepare_compact"
+						? { ...eventBase, entries: structuredClone(entries), context }
+						: { ...eventBase, entries: structuredClone(entries), continue: shouldContinue, context }
+				) as BoundaryEvent;
 				const previousReceipts = entryReceipts;
 				const slots = boundaryReceiptSlots(event.entries, entryReceipts);
 				let receivedSelection = false;
@@ -1272,7 +1280,8 @@ export class ExtensionRunner {
 					entries = received.entries;
 					entryReceipts = received.receipts;
 					receivedSelection = true;
-					const returnedContinue = handlerResult?.continue;
+					const returnedContinue =
+						baseEvent.type === "session_before_prepare_compact" ? undefined : handlerResult?.continue;
 					if (returnedContinue !== undefined) shouldContinue = returnedContinue;
 				} catch (err) {
 					signal?.throwIfAborted();

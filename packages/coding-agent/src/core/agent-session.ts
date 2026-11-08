@@ -89,6 +89,7 @@ import {
 	assertContextFitsWindow,
 	type CompactionPreparation,
 	type CompactionResult,
+	type CompactionSettings,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
@@ -1652,7 +1653,7 @@ export class AgentSession {
 
 	private _buildBoundaryContext(
 		drafts: SessionBoundaryDraft[],
-		boundary: "turn_end" | "agent_before_settle",
+		boundary: "turn_end" | "agent_before_settle" | "session_before_prepare_compact",
 		receipts?: (TurnReceipt | undefined)[],
 	): BoundaryContextPreview {
 		const projection =
@@ -1683,6 +1684,36 @@ export class AgentSession {
 		const appended = this._applyBoundaryDrafts(this.sessionManager, drafts, receipts);
 		this._refreshFinalizedContext();
 		for (const entry of appended) this._emit({ type: "entry_appended", entry });
+	}
+
+	private async _prepareCompaction(
+		reason: "manual" | "threshold" | "overflow",
+		settings: CompactionSettings,
+		signal: AbortSignal,
+	): Promise<{ pathEntries: SessionEntry[]; preparation: CompactionPreparation | undefined }> {
+		if (this._extensionRunner.hasHandlers("session_before_prepare_compact")) {
+			const boundary = await this._extensionRunner.emitBoundary(
+				{ type: "session_before_prepare_compact", reason, signal },
+				(drafts, receipts) => {
+					if (drafts.some((draft) => draft.type !== "context_edit")) {
+						throw new Error("session_before_prepare_compact only accepts context_edit entries");
+					}
+					return this._buildBoundaryContext(drafts, "session_before_prepare_compact", receipts);
+				},
+				() => this._getPendingBoundaryMessages(),
+				signal,
+			);
+			signal.throwIfAborted();
+			if (boundary.valid && boundary.entries.length > 0) {
+				if (boundary.entries.some((entry) => entry.type !== "context_edit")) {
+					throw new Error("session_before_prepare_compact only accepts context_edit entries");
+				}
+				this._commitBoundaryDrafts(boundary.entries, boundary.entryReceipts);
+			}
+		}
+
+		const pathEntries = this.sessionManager.getBranch();
+		return { pathEntries, preparation: prepareCompaction(pathEntries, settings) };
 	}
 
 	private _reportInvalidBoundaryContinuation(event: "turn_end" | "agent_before_settle"): void {
@@ -5680,9 +5711,15 @@ export class AgentSession {
 			}
 
 			const settings = this.settingsManager.getCompactionSettings(model);
-			const pathEntries = this.sessionManager.getBranch();
-
-			const preparation = prepareCompaction(pathEntries, settings);
+			let pathEntries: SessionEntry[];
+			let preparation: CompactionPreparation | undefined;
+			if (attempt || !this._extensionRunner.hasHandlers("session_before_prepare_compact")) {
+				// Original compactions retain their tighter branch-identity fence and skip extension drafts.
+				pathEntries = this.sessionManager.getBranch();
+				preparation = prepareCompaction(pathEntries, settings);
+			} else {
+				({ pathEntries, preparation } = await this._prepareCompaction("manual", settings, budget.signal));
+			}
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -6182,8 +6219,14 @@ export class AgentSession {
 				return false;
 			}
 
-			const pathEntries = this.sessionManager.getBranch();
-			const preparation = prepareCompaction(pathEntries, settings);
+			let pathEntries: SessionEntry[];
+			let preparation: CompactionPreparation | undefined;
+			if (this._extensionRunner.hasHandlers("session_before_prepare_compact")) {
+				({ pathEntries, preparation } = await this._prepareCompaction(reason, settings, budget.signal));
+			} else {
+				pathEntries = this.sessionManager.getBranch();
+				preparation = prepareCompaction(pathEntries, settings);
+			}
 			if (!preparation) {
 				return false;
 			}
