@@ -1639,6 +1639,88 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.faux.state.callCount).toBe(0);
 	});
 
+	// Regression test for #334.
+	it("compacts and retries provider-reported overflow after pre-prepare edits", async () => {
+		let largeResultEntryId = "";
+		const preparationEvents: SessionBeforePrepareCompactEvent[] = [];
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_prepare_compact", (event) => {
+						preparationEvents.push(event);
+						return {
+							entries: [
+								{
+									type: "context_edit",
+									targetId: largeResultEntryId,
+									replacement: { content: [{ type: "text", text: "[old result repaired]" }] },
+								},
+							],
+						};
+					});
+					pi.on("session_before_compact", (event) => ({
+						compaction: {
+							summary: "edited context compacted",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		const manager = harness.sessionManager;
+		const now = Date.now() - 10_000;
+		manager.appendMessage({ role: "user", content: [{ type: "text", text: "old request" }], timestamp: now });
+		const toolCall = createAssistant(harness, { stopReason: "toolUse", totalTokens: 20, timestamp: now + 1 });
+		const readCall = fauxToolCall("read", { path: "old.txt" });
+		toolCall.content = [readCall];
+		manager.appendMessage(toolCall);
+		largeResultEntryId = manager.appendMessage({
+			role: "toolResult",
+			toolCallId: readCall.id,
+			toolName: "read",
+			content: [{ type: "text", text: `old-data ${"x".repeat(20_000)}` }],
+			isError: false,
+			timestamp: now + 2,
+		});
+		const previousAssistant = createAssistant(harness, { totalTokens: 20, timestamp: now + 3 });
+		previousAssistant.content = [{ type: "text", text: "previous response" }];
+		manager.appendMessage(previousAssistant);
+		harness.session.agent.state.messages = manager.buildSessionProjection().messages;
+		const contextWindow = harness.getModel().contextWindow;
+		expect(
+			manager.buildSessionProjection().messages.reduce((total, message) => total + estimateTokens(message), 0),
+		).toBeLessThan(contextWindow);
+
+		const overflow = fauxAssistantMessage("", {
+			stopReason: "error",
+			errorMessage: "provider reported context overflow",
+		});
+		overflow.recovery = { recovery: "context_length_exceeded", retryable: false };
+		harness.setResponses([overflow, fauxAssistantMessage("prompt answered after compaction")]);
+
+		await harness.session.prompt("answer this after compaction");
+		await harness.session.agent.waitForIdle();
+
+		expect(preparationEvents).toHaveLength(1);
+		expect(preparationEvents[0]?.reason).toBe("overflow");
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "context_edit")).toHaveLength(2);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			reason: "overflow",
+			aborted: false,
+			willRetry: true,
+		});
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.session.getLastAssistantText()).toBe("prompt answered after compaction");
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
 	it("ignores stale pre-compaction assistant usage on pre-prompt checks", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

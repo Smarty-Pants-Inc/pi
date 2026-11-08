@@ -6140,7 +6140,7 @@ export class AgentSession {
 			// Case 2: the response completed successfully. Compact, but do not retry because
 			// agent.continue() cannot continue from a completed assistant response.
 			if (!willRetry) {
-				return await this._runAutoCompaction("overflow", false, contextOverflow ? contextWindow : undefined);
+				return await this._runAutoCompaction("overflow", false);
 			}
 
 			if (this._overflowRecoveryAttempted) {
@@ -6167,11 +6167,7 @@ export class AgentSession {
 			// Persistently omit the selected final attempt before post-run recovery compaction.
 			this._overflowRecoveryAttempted = true;
 			this._omitRecoveryAttempt(assistantMessage, toolResults);
-			const retry = await this._runAutoCompaction(
-				"overflow",
-				willRetry,
-				contextOverflow ? contextWindow : undefined,
-			);
+			const retry = await this._runAutoCompaction("overflow", willRetry);
 			if (retry === true) this._failedResponse = assistantMessage;
 			return retry;
 		}

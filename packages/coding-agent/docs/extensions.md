@@ -125,6 +125,8 @@ Handlers are awaited in stream order, so slow handlers delay stream consumption.
 
 `turn_end` and `agent_before_settle` are actionable boundaries. Their handlers can chain proposed `custom`, `custom_message`, `context_edit`, or `compaction` entries and return `continue: true` for one next model request. Guard continuation conditions because an unconditional continuation can loop. Use the exported event declarations for the complete validation and ordering contract.
 
+`session_before_prepare_compact` runs before Pi builds a manual or automatic compaction plan. Inspect `event.reason` and `event.context`; handlers may return `entries` containing only `context_edit` drafts to repair or omit context before summarization. Pi commits those edits before preparing the plan. Use `session_before_compact` to cancel compaction or provide a summary.
+
 <a id="cache_warming_decision"></a>
 
 `cache_warming_decision` can override an idle prompt-cache refresh with `{ action: "warm" }` or `{ action: "stop" }`. The last handler that returns an action wins.
