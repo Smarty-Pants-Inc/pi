@@ -959,8 +959,51 @@ function buildContextEntriesFromPath(path: SessionEntry[]): SessionEntry[] {
 function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | undefined): AgentMessage[] {
 	const messages = sessionEntryToContextMessages(entry);
 	if (!edit) return messages;
-	const replacement = publishedSessionEntries.has(edit) ? structuredClone(edit.replacement) : edit.replacement;
+	const replacement: unknown = publishedSessionEntries.has(edit)
+		? structuredClone(edit.replacement)
+		: edit.replacement;
 	if (replacement === null) return [];
+
+	const replacementContent =
+		typeof replacement === "string"
+			? replacement
+			: replacement !== null && typeof replacement === "object" && "content" in replacement
+				? replacement.content
+				: undefined;
+	const targetRole = messages[0]?.role;
+	const content: ContextEditableContent | undefined =
+		typeof replacementContent === "string"
+			? [{ type: "text", text: replacementContent }]
+			: Array.isArray(replacementContent) &&
+					replacementContent.every((block: unknown) => {
+						if (!block || typeof block !== "object" || Array.isArray(block)) return false;
+						const contentBlock = block as Record<string, unknown>;
+						switch (contentBlock.type) {
+							case "text":
+								return typeof contentBlock.text === "string";
+							case "image":
+								return (
+									targetRole !== "assistant" &&
+									typeof contentBlock.data === "string" &&
+									typeof contentBlock.mimeType === "string"
+								);
+							case "thinking":
+								return targetRole === "assistant" && typeof contentBlock.thinking === "string";
+							case "toolCall":
+								return (
+									targetRole === "assistant" &&
+									typeof contentBlock.name === "string" &&
+									contentBlock.arguments !== null &&
+									typeof contentBlock.arguments === "object" &&
+									!Array.isArray(contentBlock.arguments)
+								);
+							default:
+								return false;
+						}
+					})
+				? (replacementContent as ContextEditableContent)
+				: undefined;
+	if (content === undefined) return messages;
 
 	return messages.map((message) => {
 		if (
@@ -971,10 +1014,6 @@ function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | undef
 		) {
 			return message;
 		}
-		const content =
-			(message.role === "assistant" || message.role === "toolResult") && typeof replacement.content === "string"
-				? [{ type: "text" as const, text: replacement.content }]
-				: replacement.content;
 		return { ...message, content } as AgentMessage;
 	});
 }

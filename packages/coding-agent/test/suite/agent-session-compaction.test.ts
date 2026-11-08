@@ -15,7 +15,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { estimateTokens } from "../../src/core/compaction/index.ts";
+import { estimateProjectedContextTokens, estimateTokens } from "../../src/core/compaction/index.ts";
+import type { ContextEditEntryDraft, SessionBeforePrepareCompactEvent } from "../../src/index.ts";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
@@ -196,6 +197,276 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.messages[1]?.role).toBe("compactionSummary");
 	});
 
+	it("repairs over-window context before preflight compaction and preserves the prompt", async () => {
+		let largeResultEntryId = "";
+		const preparationEvents: SessionBeforePrepareCompactEvent[] = [];
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { compaction: { reserveTokens: 99_990, keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_prepare_compact", (event) => {
+						preparationEvents.push(event);
+						if (preparationEvents.length > 1) return;
+						return {
+							entries: [
+								{
+									type: "context_edit",
+									targetId: largeResultEntryId,
+									replacement: { content: [{ type: "text", text: "[omitted old tool result]" }] },
+								},
+							],
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.setModel({ ...harness.getModel(), contextWindow: 100_000, maxTokens: 100 });
+
+		const manager = harness.sessionManager;
+		const now = Date.now() - 10_000;
+		manager.appendMessage({ role: "user", content: [{ type: "text", text: "old request" }], timestamp: now });
+		const toolCall = createAssistant(harness, { stopReason: "toolUse", totalTokens: 20, timestamp: now + 1 });
+		const readCall = fauxToolCall("read", { path: "old.txt" });
+		toolCall.content = [readCall];
+		manager.appendMessage(toolCall);
+		const largeResult = `LARGE-OLD-TOOL-RESULT ${"old-data ".repeat(60_000)}`;
+		largeResultEntryId = manager.appendMessage({
+			role: "toolResult",
+			toolCallId: readCall.id,
+			toolName: "read",
+			content: [{ type: "text", text: largeResult }],
+			isError: false,
+			timestamp: now + 2,
+		});
+		const previousAssistant = createAssistant(harness, { totalTokens: 1_200, timestamp: now + 3 });
+		previousAssistant.content = [{ type: "text", text: "previous response" }];
+		manager.appendMessage(previousAssistant);
+		harness.session.agent.state.messages = manager.buildSessionProjection().messages;
+
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Expected a persisted session");
+		const originalEntries = structuredClone(manager.getEntries());
+		const originalBytes = readFileSync(file);
+		expect(harness.session.getContextUsage()).toMatchObject({ tokens: 1_200, contextWindow: 100_000 });
+		const summaryRequests: string[] = [];
+		const promptRequests: string[] = [];
+		const responseFactory = (context: TranscriptContext): AssistantMessage => {
+			const serialized = JSON.stringify(context) ?? "";
+			const includesPrompt = context.messages.some(
+				(message) => message.role === "user" && getMessageText(message) === "retained prompt",
+			);
+			if (includesPrompt) {
+				promptRequests.push(serialized);
+				return fauxAssistantMessage("retained prompt answer");
+			}
+			summaryRequests.push(serialized);
+			harness.appendResponses([responseFactory]);
+			return fauxAssistantMessage("repaired summary");
+		};
+		harness.setResponses([responseFactory]);
+
+		await harness.session.prompt("retained prompt");
+		await harness.session.agent.waitForIdle();
+
+		expect(preparationEvents.length).toBeGreaterThanOrEqual(harness.eventsOfType("compaction_start").length);
+		expect(preparationEvents[0]?.reason).toBe("threshold");
+		expect(preparationEvents[0]?.signal.aborted).toBe(false);
+		expect(summaryRequests.length).toBeGreaterThan(0);
+		expect(summaryRequests.every((request) => !request.includes(largeResult))).toBe(true);
+		expect(promptRequests.length).toBeGreaterThan(0);
+		expect(promptRequests.every((request) => request.includes("retained prompt"))).toBe(true);
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(harness.session.getLastAssistantText()).toBe("retained prompt answer");
+		expect(manager.getEntries().filter((entry) => entry.type === "context_edit")).toHaveLength(1);
+		expect(manager.getEntries().slice(0, originalEntries.length)).toEqual(originalEntries);
+		expect(readFileSync(file).subarray(0, originalBytes.length)).toEqual(originalBytes);
+	});
+
+	it.each([
+		{ reason: "threshold" as const, reserveTokens: 3_000, previousUsage: 0 },
+		{ reason: "overflow" as const, reserveTokens: 0, previousUsage: 1_200 },
+	])(
+		"skips $reason compaction when preparation edits bring over-window context under its limit",
+		async ({ reason, reserveTokens, previousUsage }) => {
+			let largeResultEntryId = "";
+			const preparationEvents: SessionBeforePrepareCompactEvent[] = [];
+			const harness = await createHarness({
+				models: [{ id: "faux-1", contextWindow: 5_000, maxTokens: 100 }],
+				settings: { compaction: { reserveTokens, keepRecentTokens: 1 } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_prepare_compact", (event) => {
+							preparationEvents.push(event);
+							if (preparationEvents.length > 1) return;
+							return {
+								entries: [
+									{
+										type: "context_edit",
+										targetId: largeResultEntryId,
+										replacement: { content: [{ type: "text", text: "[omitted old tool result]" }] },
+									},
+								],
+							};
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+
+			const manager = harness.sessionManager;
+			const now = Date.now() - 10_000;
+			manager.appendMessage({ role: "user", content: [{ type: "text", text: "old request" }], timestamp: now });
+			const toolCall = createAssistant(harness, { stopReason: "toolUse", totalTokens: 20, timestamp: now + 1 });
+			const readCall = fauxToolCall("read", { path: "old.txt" });
+			toolCall.content = [readCall];
+			manager.appendMessage(toolCall);
+			const largeResult = `LARGE-OLD-TOOL-RESULT ${"old-data ".repeat(60_000)}`;
+			largeResultEntryId = manager.appendMessage({
+				role: "toolResult",
+				toolCallId: readCall.id,
+				toolName: "read",
+				content: [{ type: "text", text: largeResult }],
+				isError: false,
+				timestamp: now + 2,
+			});
+			const previousAssistant = createAssistant(harness, { totalTokens: previousUsage, timestamp: now + 3 });
+			previousAssistant.content = [{ type: "text", text: "previous response" }];
+			manager.appendMessage(previousAssistant);
+			harness.session.agent.state.messages = manager.buildSessionProjection().messages;
+
+			const contextWindow = harness.getModel().contextWindow;
+			const threshold = contextWindow - reserveTokens;
+			expect(
+				manager.buildSessionProjection().messages.reduce((total, message) => total + estimateTokens(message), 0),
+			).toBeGreaterThan(contextWindow);
+			let summaryRequests = 0;
+			let promptRequests = 0;
+			harness.setResponses([
+				(context: TranscriptContext) => {
+					const includesPrompt = context.messages.some(
+						(message) => message.role === "user" && getMessageText(message) === "retained prompt",
+					);
+					if (includesPrompt) {
+						promptRequests++;
+						return fauxAssistantMessage("retained prompt answer");
+					}
+					summaryRequests++;
+					throw new Error("summary provider must not be called after context repair");
+				},
+			]);
+
+			await harness.session.prompt("retained prompt");
+			await harness.session.agent.waitForIdle();
+
+			expect(preparationEvents).toHaveLength(1);
+			expect(preparationEvents[0]?.reason).toBe(reason);
+			expect(summaryRequests).toBe(0);
+			expect(promptRequests).toBe(1);
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(harness.session.getLastAssistantText()).toBe("retained prompt answer");
+			expect(manager.getEntries().filter((entry) => entry.type === "context_edit")).toHaveLength(1);
+			expect(manager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);
+			expect(harness.eventsOfType("compaction_start")).toEqual([]);
+			expect(harness.eventsOfType("compaction_end")).toEqual([]);
+			expect(
+				estimateProjectedContextTokens(manager.buildSessionProjection(), manager.getBranch()).tokens,
+			).toBeLessThanOrEqual(reason === "overflow" ? contextWindow : threshold);
+		},
+	);
+
+	it("rejects invalid pre-compaction drafts without committing them", async () => {
+		const preparationEvents: SessionBeforePrepareCompactEvent[] = [];
+		const invalidDraft = {
+			type: "context_edit",
+			targetId: "missing-entry",
+			replacement: null,
+		} satisfies ContextEditEntryDraft;
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_prepare_compact", (event) => {
+						preparationEvents.push(event);
+						return { entries: [invalidDraft] };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("before invalid draft");
+		await harness.session.prompt("second prompt for compaction");
+		harness.setResponses([fauxAssistantMessage("normal summary")]);
+
+		await harness.session.compact();
+
+		expect(preparationEvents).toHaveLength(1);
+		expect(preparationEvents[0]?.reason).toBe("manual");
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "context_edit")).toHaveLength(0);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("emits the pre-compaction boundary once for threshold compaction", async () => {
+		const preparationEvents: SessionBeforePrepareCompactEvent[] = [];
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_prepare_compact", (event) => {
+						preparationEvents.push(event);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("first threshold turn");
+		await harness.session.prompt("second threshold turn");
+		useSummaryStreamFn(harness, "threshold summary");
+		const internals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await expect(internals._runAutoCompaction("threshold", false)).resolves.toBe(false);
+
+		expect(preparationEvents).toHaveLength(1);
+		expect(preparationEvents[0]?.reason).toBe("threshold");
+		expect(harness.eventsOfType("compaction_start")).toHaveLength(1);
+	});
+
+	it("emits the pre-compaction boundary for overflow recovery", async () => {
+		const preparationEvents: SessionBeforePrepareCompactEvent[] = [];
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_prepare_compact", (event) => {
+						preparationEvents.push(event);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("before overflow");
+		await harness.session.prompt("second prompt before overflow");
+		const overflow = createAssistant(harness, {
+			stopReason: "error",
+			errorMessage: "context window exceeded",
+			totalTokens: 0,
+		});
+		overflow.recovery = { recovery: "context_length_exceeded", retryable: false };
+		harness.sessionManager.appendMessage(overflow);
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionProjection().messages;
+		harness.setResponses([fauxAssistantMessage("overflow summary")]);
+		const internals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await expect(internals._checkCompaction(overflow, false)).resolves.toBe(true);
+
+		expect(preparationEvents).toHaveLength(1);
+		expect(preparationEvents[0]?.reason).toBe("overflow");
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
 	it("checkpoints the replayed system state and folds summarized and retained system patches into it", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -274,6 +545,7 @@ describe("AgentSession compaction characterization", () => {
 
 		expect(harness.getPendingResponseCount()).toBe(0);
 		expect(result.summary).toBe("history summary\n\n---\n\n**Turn Context (split turn):**\n\nturn prefix summary");
+		expect(manager.getEntries().filter((entry) => entry.type === "context_edit")).toHaveLength(0);
 		expect(harness.session.sessionManager).toBe(manager);
 		expect(manager.getSessionId()).toBe(originalId);
 		expect(manager.getSessionFile()).toBe(file);
@@ -1365,6 +1637,88 @@ describe("AgentSession compaction characterization", () => {
 			willRetry: false,
 		});
 		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	// Regression test for #334.
+	it("compacts and retries provider-reported overflow after pre-prepare edits", async () => {
+		let largeResultEntryId = "";
+		const preparationEvents: SessionBeforePrepareCompactEvent[] = [];
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_prepare_compact", (event) => {
+						preparationEvents.push(event);
+						return {
+							entries: [
+								{
+									type: "context_edit",
+									targetId: largeResultEntryId,
+									replacement: { content: [{ type: "text", text: "[old result repaired]" }] },
+								},
+							],
+						};
+					});
+					pi.on("session_before_compact", (event) => ({
+						compaction: {
+							summary: "edited context compacted",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		const manager = harness.sessionManager;
+		const now = Date.now() - 10_000;
+		manager.appendMessage({ role: "user", content: [{ type: "text", text: "old request" }], timestamp: now });
+		const toolCall = createAssistant(harness, { stopReason: "toolUse", totalTokens: 20, timestamp: now + 1 });
+		const readCall = fauxToolCall("read", { path: "old.txt" });
+		toolCall.content = [readCall];
+		manager.appendMessage(toolCall);
+		largeResultEntryId = manager.appendMessage({
+			role: "toolResult",
+			toolCallId: readCall.id,
+			toolName: "read",
+			content: [{ type: "text", text: `old-data ${"x".repeat(20_000)}` }],
+			isError: false,
+			timestamp: now + 2,
+		});
+		const previousAssistant = createAssistant(harness, { totalTokens: 20, timestamp: now + 3 });
+		previousAssistant.content = [{ type: "text", text: "previous response" }];
+		manager.appendMessage(previousAssistant);
+		harness.session.agent.state.messages = manager.buildSessionProjection().messages;
+		const contextWindow = harness.getModel().contextWindow;
+		expect(
+			manager.buildSessionProjection().messages.reduce((total, message) => total + estimateTokens(message), 0),
+		).toBeLessThan(contextWindow);
+
+		const overflow = fauxAssistantMessage("", {
+			stopReason: "error",
+			errorMessage: "provider reported context overflow",
+		});
+		overflow.recovery = { recovery: "context_length_exceeded", retryable: false };
+		harness.setResponses([overflow, fauxAssistantMessage("prompt answered after compaction")]);
+
+		await harness.session.prompt("answer this after compaction");
+		await harness.session.agent.waitForIdle();
+
+		expect(preparationEvents).toHaveLength(1);
+		expect(preparationEvents[0]?.reason).toBe("overflow");
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "context_edit")).toHaveLength(2);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			reason: "overflow",
+			aborted: false,
+			willRetry: true,
+		});
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.session.getLastAssistantText()).toBe("prompt answered after compaction");
+		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
 	it("ignores stale pre-compaction assistant usage on pre-prompt checks", async () => {
