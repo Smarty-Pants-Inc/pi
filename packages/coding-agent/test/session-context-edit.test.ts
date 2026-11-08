@@ -3,9 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateProjectedContextTokens,
+	estimateTokens,
 	prepareCompaction,
 } from "../src/core/compaction/index.ts";
-import { SessionManager } from "../src/core/session-manager.ts";
+import { type ContextEditEntry, SessionManager } from "../src/core/session-manager.ts";
 
 function assistant(text: string): AssistantMessage {
 	return {
@@ -127,6 +128,81 @@ describe("session context edits", () => {
 			role: "assistant",
 			content: [{ type: "text", text: "imported replacement" }],
 		});
+	});
+
+	// smarty-dev#19445: historical raw-string tool-result replacements must remain estimator-safe.
+	it("normalizes historical raw-string replacements before estimating tool results", () => {
+		const source = SessionManager.inMemory();
+		const targetId = source.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-raw",
+			toolName: "read",
+			content: [{ type: "text", text: "original result" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		const editId = source.appendContextEdit(targetId, null);
+		const header = source.getHeader();
+		if (!header) throw new Error("expected session header");
+		const imported = structuredClone(source.getEntries()).map((entry) =>
+			entry.id === editId
+				? { ...entry, replacement: "[omitted large result]" as unknown as ContextEditEntry["replacement"] }
+				: entry,
+		);
+		const session = SessionManager.inMemory(process.cwd(), undefined, [structuredClone(header), ...imported]);
+
+		const projected = session.buildSessionProjection().messages[0];
+		expect(projected).toMatchObject({
+			role: "toolResult",
+			content: [{ type: "text", text: "[omitted large result]" }],
+		});
+		expect(estimateTokens(projected)).toBeGreaterThan(0);
+		expect(
+			estimateProjectedContextTokens(session.buildSessionProjection(), session.getBranch()).tokens,
+		).toBeGreaterThan(0);
+		expect(session.getEntry(editId)).toMatchObject({ replacement: "[omitted large result]" });
+	});
+
+	it("ignores malformed historical replacements without projecting invalid tool content", () => {
+		const source = SessionManager.inMemory();
+		const firstTargetId = source.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-missing-content",
+			toolName: "read",
+			content: [{ type: "text", text: "keep first result" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		const firstEditId = source.appendContextEdit(firstTargetId, null);
+		const secondTargetId = source.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-invalid-block",
+			toolName: "read",
+			content: [{ type: "text", text: "keep second result" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		const secondEditId = source.appendContextEdit(secondTargetId, null);
+		const header = source.getHeader();
+		if (!header) throw new Error("expected session header");
+		const imported = structuredClone(source.getEntries()).map((entry) =>
+			entry.id === firstEditId
+				? { ...entry, replacement: {} as ContextEditEntry["replacement"] }
+				: entry.id === secondEditId
+					? { ...entry, replacement: { content: [null] } as unknown as ContextEditEntry["replacement"] }
+					: entry,
+		);
+		const session = SessionManager.inMemory(process.cwd(), undefined, [structuredClone(header), ...imported]);
+
+		const projected = session.buildSessionProjection().messages;
+		expect(projected.map((message) => message.role)).toEqual(["toolResult", "toolResult"]);
+		expect(projected.map((message) => (message.role === "toolResult" ? message.content : undefined))).toEqual([
+			[{ type: "text", text: "keep first result" }],
+			[{ type: "text", text: "keep second result" }],
+		]);
+		for (const message of projected) expect(estimateTokens(message)).toBeGreaterThan(0);
+		expect(session.getEntry(firstEditId)).toMatchObject({ replacement: {} });
+		expect(session.getEntry(secondEditId)).toMatchObject({ replacement: { content: [null] } });
 	});
 
 	it("keeps edits branch-relative", () => {
