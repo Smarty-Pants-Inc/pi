@@ -971,7 +971,11 @@ describe("AgentSession compaction characterization", () => {
 			harness.setResponses([
 				fauxAssistantMessage(`old-history:${"a".repeat(800)}`),
 				fauxAssistantMessage(`recent-history:${"b".repeat(800)}`),
-				fauxAssistantMessage(fauxToolCall("large_result", {}), { stopReason: "toolUse" }),
+				// #19998: the result is now capped before planning. Retained call arguments keep
+				// this fixture above threshold so it still exercises summary/override behavior.
+				fauxAssistantMessage(fauxToolCall("large_result", { retainedArgument: "r".repeat(8000) }), {
+					stopReason: "toolUse",
+				}),
 				(context) => {
 					order.push("provider");
 					resumedRequest = JSON.stringify(context.messages);
@@ -999,7 +1003,8 @@ describe("AgentSession compaction characterization", () => {
 				reason: "threshold",
 			});
 			expect(resumedRequest).toContain("compacted history");
-			expect(resumedRequest).toContain("large-tool-result");
+			expect(resumedRequest).toContain("Tool result omitted from model context");
+			expect(resumedRequest).not.toContain(toolResult);
 			expect(harness.session.getLastAssistantText()).toBe("finished after compaction");
 		},
 	);
@@ -1049,7 +1054,10 @@ describe("AgentSession compaction characterization", () => {
 		harness.setResponses([
 			fauxAssistantMessage(`old-history:${"a".repeat(800)}`),
 			fauxAssistantMessage(`recent-history:${"b".repeat(800)}`),
-			fauxAssistantMessage(fauxToolCall("large_result", {}), { stopReason: "toolUse" }),
+			// #19998: force summary work independently of the newly capped result.
+			fauxAssistantMessage(fauxToolCall("large_result", { retainedArgument: "r".repeat(8000) }), {
+				stopReason: "toolUse",
+			}),
 			(context) => {
 				resumedRequest = JSON.stringify(context.messages);
 				return fauxAssistantMessage("finished after compaction");
@@ -1097,8 +1105,9 @@ describe("AgentSession compaction characterization", () => {
 				},
 			};
 			const harness: Harness = await createHarness({
-				models: [{ id: "faux-1", contextWindow: 2600, maxTokens: 100 }],
-				settings: { compaction: { enabled: true, reserveTokens: 400, keepRecentTokens: 1750 } },
+				// Keep the same 2200-token trigger, with room for the retained call plus replayed image.
+				models: [{ id: "faux-1", contextWindow: 4000, maxTokens: 100 }],
+				settings: { compaction: { enabled: true, reserveTokens: 1800, keepRecentTokens: 1750 } },
 				tools: [largeTool],
 				extensionFactories: [
 					(pi) => {
@@ -1137,7 +1146,10 @@ describe("AgentSession compaction characterization", () => {
 			harness.setResponses([
 				fauxAssistantMessage(`old-history:${"a".repeat(800)}`),
 				fauxAssistantMessage(`recent-history:${"b".repeat(800)}`),
-				fauxAssistantMessage(fauxToolCall("large_result", {}), { stopReason: "toolUse" }),
+				// #19998: failure/abort must still exercise a real summary after result repair.
+				fauxAssistantMessage(fauxToolCall("large_result", { retainedArgument: "r".repeat(8000) }), {
+					stopReason: "toolUse",
+				}),
 				...(outcome === "failed"
 					? [fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" })]
 					: []),

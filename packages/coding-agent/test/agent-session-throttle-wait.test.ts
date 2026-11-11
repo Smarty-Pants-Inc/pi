@@ -190,13 +190,16 @@ describe("AgentSession throttled limit wait", () => {
 		expect(last(session)).toMatchObject({ stopReason: "error", errorMessage: "prompt is too long" });
 	});
 
+	// pi#337: genuine context overflow explicitly authorizes the bounded context-repair fallback.
 	it("control: the same overflow without a throttle retry does start overflow compaction", async () => {
-		const { session } = await createSession([overflow, ok]);
+		const { session, requests } = await createSession([overflow, ok]);
 		const compact = vi
 			.spyOn(session as unknown as { _runAutoCompaction: () => Promise<boolean> }, "_runAutoCompaction")
 			.mockResolvedValue(false);
 		await session.prompt("Reply with only OK.");
-		expect(compact).toHaveBeenCalledWith("overflow", true);
+		expect(compact).toHaveBeenCalledTimes(1);
+		expect(compact).toHaveBeenCalledWith("overflow", true, undefined, true);
+		expect(requests.count).toBe(1);
 	});
 
 	it("a limit without a wait (throttled:false, Retry-After missing or over 30 s) is final after 1 request", async () => {
