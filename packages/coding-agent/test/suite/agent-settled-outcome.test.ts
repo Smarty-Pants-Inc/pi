@@ -77,14 +77,16 @@ describe("agent_settled outcome", () => {
 		"reports $expected when pre-turn threshold compaction stops the run ($stop)",
 		async ({ stop, expected }) => {
 			let failSummary = false;
+			let streamCalls = 0;
+			const preparedTokens: number[] = [];
 			const largeTool: AgentTool = {
 				name: "large_result",
 				label: "Large result",
-				description: "Returns enough content to cross the compaction threshold",
+				description: "Returns fitting results whose combined context crosses the compaction threshold",
 				parameters: Type.Object({}),
 				execute: async () => {
 					failSummary = stop === "failure";
-					return { content: [{ type: "text", text: `large-tool-result:${"x".repeat(8000)}` }], details: {} };
+					return { content: [{ type: "text", text: `large-tool-result:${"x".repeat(2000)}` }], details: {} };
 				},
 			};
 			const { harness, extensionOutcomes, publicOutcomes } = await createObservedHarness(
@@ -93,22 +95,31 @@ describe("agent_settled outcome", () => {
 					settings: { compaction: { enabled: true, reserveTokens: 400, keepRecentTokens: 1750 } },
 					tools: [largeTool],
 				},
-				stop === "extension cancel"
-					? [
-							(pi) => {
-								pi.on("session_before_compact", () => ({ cancel: true }));
-							},
-						]
-					: [],
+				[
+					(pi) => {
+						pi.on("session_before_compact", (event) => {
+							preparedTokens.push(event.preparation.tokensBefore);
+							if (stop === "extension cancel") return { cancel: true };
+						});
+					},
+				],
 			);
 			harness.setResponses([
 				fauxAssistantMessage(`old-history:${"a".repeat(800)}`),
 				fauxAssistantMessage(`recent-history:${"b".repeat(800)}`),
-				fauxAssistantMessage(fauxToolCall("large_result", {}), { stopReason: "toolUse" }),
+				// pi#337: one 8 KiB result is intentionally repaired before summarization.
+				// Three individually fitting results cross the threshold without triggering that repair.
+				fauxAssistantMessage(
+					Array.from({ length: 3 }, () => fauxToolCall("large_result", {})),
+					{
+						stopReason: "toolUse",
+					},
+				),
 				fauxAssistantMessage("must not run"),
 			]);
 			const streamFunction = harness.session.agent.streamFunction;
 			harness.session.agent.streamFunction = (...args) => {
+				streamCalls++;
 				if (failSummary) throw new Error("summary generator blew up");
 				return streamFunction(...args);
 			};
@@ -118,10 +129,24 @@ describe("agent_settled outcome", () => {
 			await harness.session.prompt("run the large tool");
 
 			expect(harness.faux.state.callCount).toBe(3);
-			expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
-				reason: "threshold",
-				aborted: stop === "extension cancel",
-			});
+			// Include the failing summary attempt, but never an ordinary continuation after the stop.
+			expect(streamCalls).toBe(stop === "failure" ? 4 : 3);
+			expect(harness.eventsOfType("tool_execution_end")).toHaveLength(3);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "context_edit")).toEqual([]);
+			expect(preparedTokens).toHaveLength(1);
+			expect(preparedTokens[0]).toBeGreaterThan(2600 - 400);
+			expect(preparedTokens[0]).toBeLessThanOrEqual(2600);
+			expect(harness.eventsOfType("compaction_start")).toEqual([{ type: "compaction_start", reason: "threshold" }]);
+			expect(harness.eventsOfType("compaction_end")).toEqual([
+				{
+					type: "compaction_end",
+					reason: "threshold",
+					result: undefined,
+					aborted: stop === "extension cancel",
+					willRetry: false,
+					errorMessage: stop === "failure" ? "Auto-compaction failed: summary generator blew up" : undefined,
+				},
+			]);
 			expect(extensionOutcomes).toEqual(["completed", "completed", expected]);
 			expect(publicOutcomes).toEqual(["completed", "completed", expected]);
 		},
