@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { join } from "node:path";
 import {
@@ -142,7 +142,9 @@ describe("AgentSession automatic bounded unsent replay", () => {
 		while (cleanups.length) await cleanups.pop()?.();
 	});
 
-	async function createReplayRuntime(options: { contextWindow?: number; compaction?: boolean } = {}) {
+	async function createReplayRuntime(
+		options: { contextWindow?: number; compaction?: boolean; extensions?: Array<(pi: ExtensionAPI) => void> } = {},
+	) {
 		const harness = await createHarness({
 			models: [{ id: "faux-1", contextWindow: options.contextWindow ?? 1_000_000, maxTokens: 100 }],
 			settings: {
@@ -175,6 +177,7 @@ describe("AgentSession automatic bounded unsent replay", () => {
 								context = ctx;
 							});
 						},
+						...(options.extensions ?? []),
 					],
 				},
 			});
@@ -196,7 +199,16 @@ describe("AgentSession automatic bounded unsent replay", () => {
 			sessionManager: SessionManager.create(harness.tempDir, join(harness.tempDir, "sessions")),
 		});
 		// Failure teardown also retains undelivered native input before cancelling.
-		cleanups.push(() => runtime.dispose({ operatorExit: true }));
+		cleanups.push(async () => {
+			const file = runtime.session.sessionFile;
+			await runtime.dispose({ operatorExit: true });
+			// Optional local evidence capture before harness teardown removes fixtures.
+			const evidence = process.env.PI337_F3_TRACE_DIR;
+			if (evidence && file) {
+				mkdirSync(evidence, { recursive: true });
+				writeFileSync(join(evidence, `${runtime.session.sessionId}.jsonl`), readFileSync(file));
+			}
+		});
 		await runtime.session.bindExtensions({});
 		return {
 			runtime,
@@ -424,6 +436,284 @@ describe("AgentSession automatic bounded unsent replay", () => {
 			expect(getContext().hasPendingMessages()).toBe(false);
 			expect(getContext().getInputState()).toMatchObject({ inputAdmissionCount: 0, queued: 0, drained: true });
 			expect(harness.faux.state.callCount).toBe(1);
+			expectPreservedJournal(runtime.session, saved, [saved.ids[0]]);
+		},
+	);
+
+	// PR #337 F3: exercise the public NativeExtensionRunner boundary contract.
+	// This portable fixture is not pi-better-compaction; the private integration
+	// probe separately runs the pinned extension's real callbacks.
+	it.each([
+		{ recovery: "block rejection", shape: "16 plus suffix" },
+		{ recovery: "affinity", shape: "16 plus suffix" },
+		{ recovery: "block rejection", shape: "300 KiB singleton plus suffix" },
+		{ recovery: "affinity", shape: "300 KiB singleton plus suffix" },
+	])(
+		"PR337 F3: $recovery retries the failed head before $shape and drains after recovery",
+		async ({ recovery, shape }) => {
+			const error =
+				recovery === "block rejection"
+					? "400 invalid signature in compaction block"
+					: "409 compaction_affinity_missing";
+			const trace: unknown[] = [];
+			let checkpoint: string | undefined;
+			let failedEntry: string | undefined;
+			let resendRequested = false;
+			let resends = 0;
+			const { runtime, harness } = await createReplayRuntime({
+				extensions: [
+					(pi) => {
+						pi.on("session_start", (_event, ctx) => {
+							checkpoint = ctx.sessionManager.getBranch().findLast((entry) => entry.type === "compaction")?.id;
+						});
+						pi.on("turn_end", (event, ctx) => {
+							if (!checkpoint || event.message.role !== "assistant" || event.message.errorMessage !== error)
+								return;
+							failedEntry = event.messageEntryId;
+							resendRequested = true;
+							trace.push({ boundary: "turn_end", failedEntry, queued: ctx.getInputState().queued });
+							return {
+								entries: [
+									{ type: "custom", customType: "test.replay-checkpoint-retired", data: { checkpoint } },
+									{ type: "context_edit", targetId: failedEntry, replacement: null },
+								],
+							};
+						});
+						pi.on("agent_before_settle", (event, ctx) => {
+							if (!resendRequested) return;
+							resendRequested = false;
+							resends++;
+							trace.push({
+								boundary: "agent_before_settle",
+								outcome: event.outcome,
+								queued: ctx.getInputState().queued,
+								canContinue: event.context.canContinue,
+							});
+							return { continue: true };
+						});
+					},
+				],
+			});
+			const singleton = shape.startsWith("300");
+			const payload = singleton ? `fitting recovered head: ${"x".repeat(300 * 1024)}` : "recovered head";
+			const saved = writeSavedInputs(
+				harness.tempDir,
+				[payload, ...Array.from({ length: 24 }, (_, index) => `follower ${index}`)],
+				harness.getModel(),
+				"followUp",
+			);
+			const manager = SessionManager.open(saved.file);
+			const kept = manager.getBranch().findLast((entry) => entry.type === "message");
+			if (!kept) throw new Error("Missing synthetic checkpoint boundary");
+			const checkpointId = manager.appendCompaction("Readable synthetic checkpoint summary", kept.id, 100);
+			saved.prefix = readFileSync(saved.file);
+			await runtime.switchSession(saved.file);
+			await runtime.session.bindExtensions({});
+			expect(checkpoint).toBe(checkpointId); // First-reload bootstrap saw the persisted checkpoint.
+			expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+			expect(runtime.session.recoveredInputCount).toBe(25);
+			expect(estimateTokens(saved.inputs[0].message)).toBeLessThan(1_000_000);
+			if (singleton) expect(Buffer.byteLength(JSON.stringify(saved.inputs[0]), "utf8")).toBeGreaterThan(MAX_BYTES);
+			runtime.session.setFollowUpMode("one-at-a-time");
+			const observed = observeAdmissions(runtime.session, saved);
+			const provider = answeringSavedInputs(saved);
+			const requestHeads: Array<string | undefined> = [];
+			harness.setResponses(
+				Array.from(
+					{ length: 28 },
+					(): FauxResponseFactory => (context, options, state, model) => {
+						// A compaction summary is serialized as a user message and can share a
+						// timestamp with saved input. Observe exact occurrences, not that summary.
+						provider.answer(
+							{
+								...context,
+								messages: context.messages.filter(
+									(message) =>
+										message.role !== "user" ||
+										saved.inputs.some(
+											(input) =>
+												input.message.timestamp === message.timestamp &&
+												input.message.content === message.content,
+										),
+								),
+							},
+							options,
+							state,
+							model,
+						);
+						const users = context.messages.filter((message) => message.role === "user");
+						requestHeads.push(saved.idByTimestamp.get(users.at(-1)?.timestamp ?? -1));
+						trace.push({
+							request: requestHeads.length,
+							fresh: provider.requests.at(-1),
+							head: requestHeads.at(-1),
+						});
+						if (requestHeads.length === 1) {
+							expect(runtime.session.agent.getQueuedMessages()).toHaveLength(singleton ? 0 : 15);
+							expect(runtime.session.recoveredInputCount).toBe(singleton ? 24 : 9);
+							return fauxAssistantMessage("", { stopReason: "error", errorMessage: error });
+						}
+						// A resend must answer the same failed input without consuming a follower.
+						if (requestHeads.length === 2) {
+							expect(users.at(-1)?.content).toBe(payload);
+							expect(
+								context.messages.some(
+									(message) => message.role === "assistant" && message.errorMessage === error,
+								),
+							).toBe(false);
+						}
+						return fauxAssistantMessage("recovered input answered");
+					},
+				),
+			);
+			const settled: string[] = [];
+			runtime.session.subscribe((event) => {
+				if (event.type === "agent_settled") settled.push(event.outcome);
+			});
+			await runtime.session.resumeUnsentInputs(); // Exactly one host resume, no manual continuation.
+			await expect
+				.poll(() => runtime.session.isIdle && !runtime.session.isSettling, { timeout: POLL_TIMEOUT })
+				.toBe(true);
+			observed.unsubscribe();
+			console.info(
+				"PR337_F3_BOUNDARY",
+				JSON.stringify({
+					recovery,
+					shape,
+					trace,
+					resends,
+					settled,
+					calls: harness.faux.state.callCount,
+					live: runtime.session.agent.getQueuedMessages().length,
+					durable: runtime.session.recoveredInputCount,
+					admissions: observed.admissions.map((batch) => batch.ids),
+				}),
+			);
+			expect.soft(resends).toBe(1);
+			expect.soft(requestHeads.slice(0, 2)).toEqual([saved.ids[0], saved.ids[0]]);
+			expect.soft(provider.requests[1]).toEqual([]);
+			expect.soft(harness.faux.state.callCount).toBe(26);
+			expect.soft(provider.delivered).toEqual(saved.ids);
+			expect.soft(runtime.session.pendingMessageCount).toBe(0);
+			expect.soft(runtime.session.recoveredInputCount).toBe(0);
+			expect.soft(runtime.session.agent.getQueuedMessages()).toEqual([]);
+			expect.soft(settled.every((outcome) => outcome === "completed")).toBe(true);
+			expect.soft(observed.admissions.flatMap((batch) => batch.ids)).toEqual(saved.ids);
+			for (const batch of observed.admissions) {
+				expect(batch.queuedIds).toEqual(batch.ids);
+				expect(batch.ids.length).toBeLessThanOrEqual(MAX_COUNT);
+				if (batch.ids.length > 1) expect(batch.bytes).toBeLessThanOrEqual(MAX_BYTES);
+			}
+			const entries = runtime.session.sessionManager.getEntries();
+			expect(
+				entries.filter((entry) => entry.type === "custom" && entry.customType === "test.replay-checkpoint-retired"),
+			).toHaveLength(1);
+			expect(entries.filter((entry) => entry.type === "context_edit")).toMatchObject([
+				{ targetId: failedEntry, replacement: null },
+			]);
+			expect(entries.filter((entry) => entry.type === "compaction")).toHaveLength(1);
+			expectPreservedJournal(runtime.session, saved, provider.delivered);
+		},
+	);
+
+	// PR #337 F3 counterexamples: recovery is bounded, not permission to drain
+	// unrelated accepted work after an extension declines or its resend fails.
+	it.each([
+		{ decision: "declines", singleton: false },
+		{ decision: "declines", singleton: true },
+		{ decision: "resend fails", singleton: false },
+		{ decision: "resend fails", singleton: true },
+	])(
+		"PR337 F3: extension $decision preserves all 24 followers (singleton: $singleton)",
+		async ({ decision, singleton }) => {
+			let pending = false;
+			let failedEntry: string | undefined;
+			let resends = 0;
+			const { runtime, harness } = await createReplayRuntime({
+				extensions: [
+					(pi) => {
+						pi.on("turn_end", (event) => {
+							if (
+								decision === "declines" ||
+								failedEntry ||
+								event.message.role !== "assistant" ||
+								event.message.stopReason !== "error"
+							)
+								return;
+							failedEntry = event.messageEntryId;
+							pending = true;
+							return { entries: [{ type: "context_edit", targetId: failedEntry, replacement: null }] };
+						});
+						pi.on("agent_before_settle", () => {
+							if (!pending) return;
+							pending = false;
+							resends++;
+							return { continue: true };
+						});
+					},
+				],
+			});
+			const saved = writeSavedInputs(
+				harness.tempDir,
+				[
+					singleton ? "x".repeat(300 * 1024) : "small recovered head",
+					...Array.from({ length: 24 }, (_, index) => `remain pending ${index}`),
+				],
+				harness.getModel(),
+				"followUp",
+			);
+			await runtime.switchSession(saved.file);
+			await runtime.session.bindExtensions({});
+			runtime.session.setFollowUpMode("one-at-a-time");
+			const provider = answeringSavedInputs(saved);
+			harness.setResponses(
+				Array.from(
+					{ length: 28 },
+					(): FauxResponseFactory => (context, options, state, model) => {
+						provider.answer(context, options, state, model);
+						return fauxAssistantMessage("", {
+							stopReason: "error",
+							errorMessage: "invalid request: permanent failure",
+						});
+					},
+				),
+			);
+			const settled: string[] = [];
+			runtime.session.subscribe((event) => {
+				if (event.type === "agent_settled") settled.push(event.outcome);
+			});
+			await runtime.session.resumeUnsentInputs();
+			await expect
+				.poll(() => runtime.session.isIdle && !runtime.session.isSettling, { timeout: POLL_TIMEOUT })
+				.toBe(true);
+			console.info(
+				"PR337_F3_BOUNDED_FAILURE",
+				JSON.stringify({
+					decision,
+					singleton,
+					resends,
+					settled,
+					requests: provider.requests,
+					live: runtime.session.agent.getQueuedMessages().length,
+					durable: runtime.session.recoveredInputCount,
+				}),
+			);
+			expect.soft(resends).toBe(decision === "declines" ? 0 : 1);
+			expect.soft(harness.faux.state.callCount).toBe(decision === "declines" ? 1 : 2);
+			expect(provider.delivered).toEqual([saved.ids[0]]);
+			expect(runtime.session.pendingMessageCount).toBe(24);
+			expect(runtime.session.agent.getQueuedMessages()).toHaveLength(singleton ? 0 : 15);
+			expect(runtime.session.recoveredInputCount).toBe(singleton ? 24 : 9);
+			expect(settled.at(-1)).toBe("error");
+			expectPreservedJournal(runtime.session, saved, [saved.ids[0]]);
+			runtime.session.prepareOperatorExit()();
+			await runtime.newSession();
+			await runtime.session.bindExtensions({});
+			await runtime.switchSession(saved.file);
+			await runtime.session.bindExtensions({});
+			expect(runtime.session.pendingMessageCount).toBe(24);
+			expect(runtime.session.recoveredInputCount).toBe(24);
+			expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
 			expectPreservedJournal(runtime.session, saved, [saved.ids[0]]);
 		},
 	);

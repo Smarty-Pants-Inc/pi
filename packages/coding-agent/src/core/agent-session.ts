@@ -1706,19 +1706,26 @@ export class AgentSession {
 		signal.throwIfAborted();
 		if (!Number.isFinite(contextWindow) || contextWindow <= 0) return [];
 		// Using four UTF-8 bytes per token, one result gets at most a quarter of the
-		// window's byte budget. Count serialized content, including all blocks and Unicode.
+		// window's byte budget. Count serialized non-image tool content, including Unicode;
+		// image payload bytes are not text tokens and keep their native image estimate.
 		const maxBytes = Math.max(1, Math.floor(contextWindow));
 		const candidates = this.sessionManager
 			.buildSessionProjection()
 			.entries.flatMap(({ sourceEntry, messages }) =>
 				messages.flatMap((message) => {
 					if (message.role !== "toolResult" && !(message.role === "user" && sourceEntry.unsentInputId)) return [];
-					const bytes = Buffer.byteLength(JSON.stringify(message.content), "utf8");
+					const content =
+						message.role === "toolResult"
+							? message.content.filter((block) => block.type !== "image")
+							: message.content;
+					const bytes = Buffer.byteLength(JSON.stringify(content), "utf8");
 					return [
 						{
 							id: sourceEntry.id,
 							bytes,
 							user: message.role === "user",
+							images:
+								message.role === "toolResult" ? message.content.filter((block) => block.type === "image") : [],
 							// Image base64 size is not a token estimate. Proactive user repair
 							// requires this input alone to exceed the entire advertised window.
 							oversized: message.role === "user" ? estimateTokens(message) > contextWindow : bytes > maxBytes,
@@ -1741,6 +1748,7 @@ export class AgentSession {
 							? `[Saved user input omitted from model context: ${candidate.bytes} UTF-8 bytes; raw session entry ${candidate.id}. The original accepted input remains in the session JSONL.]`
 							: `[Tool result omitted from model context: ${candidate.bytes} UTF-8 bytes; raw session entry ${candidate.id}. The original content remains in the session JSONL.]`,
 					},
+					...candidate.images,
 				],
 			};
 			const id = original
@@ -3246,6 +3254,14 @@ export class AgentSession {
 				if (!continueAfterRun && !(await this._runBeforeSettleBoundary())) break;
 				if (this._agentRunAbortRequested || this._stopAfterCompactionFailure) break;
 				const fromQueuedMessages = continueAfterRun === "queuedInput";
+				// A repaired same-head retry is still recovery. Switching to unrelated queued
+				// input makes the prior error terminal, even if that fresh input succeeds.
+				if (
+					this._lastActivityOutcome === "error" &&
+					this._failedResponse === undefined &&
+					(fromQueuedMessages || agent.state.messages.at(-1)?.role === "assistant")
+				)
+					this._unsentInputFailureRevision++;
 				if (this.#ordinaryOwner)
 					await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(true, fromQueuedMessages));
 				else await dispatch(true, fromQueuedMessages);
@@ -3254,6 +3270,10 @@ export class AgentSession {
 			runFailed = true;
 			throw error;
 		} finally {
+			// Settle-boundary recovery had its chance; only a remaining failure stops
+			// automatic durable batches. Never clear a prior terminal failure on success.
+			if (runFailed || this._compactionStopOutcome === "error" || this._lastActivityOutcome === "error")
+				this._unsentInputFailureRevision++;
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
 			this._failedResponse = undefined;
 			this._runSystemPromptOptions = undefined;
@@ -3501,9 +3521,6 @@ export class AgentSession {
 			this._compactionStopOutcome = compaction === "aborted" ? "aborted" : "error";
 			return false;
 		}
-		// Only an actual retry owns the failed response. Threshold compaction may instead
-		// continue ordinary live input; its success must not restart automatic replay.
-		if (message.stopReason === "error" && this._failedResponse !== message) this._unsentInputFailureRevision++;
 		if (compaction) return !this._agentRunAbortRequested;
 
 		// The low-level loop drains both queues before agent_end. Messages queued by
@@ -3522,10 +3539,11 @@ export class AgentSession {
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
-		// A terminal failed replay must not become a successful run by draining the
-		// rest of its accepted batch. Leave those linked occurrences in native custody.
-		if (this._lastActivityOutcome !== "completed" && this._hasQueuedReplayedInputs()) return false;
-		if (!this._extensionRunner.hasHandlers("agent_before_settle")) return this.agent.hasQueuedMessages();
+		// Let extensions recover the failed request before declaring replay terminal,
+		// but never implicitly drain its accepted followers to disguise that failure.
+		const failedReplay = this._lastActivityOutcome !== "completed" && this._hasQueuedReplayedInputs();
+		if (!this._extensionRunner.hasHandlers("agent_before_settle"))
+			return !failedReplay && this.agent.hasQueuedMessages();
 		this._isBeforeSettle = true;
 		this._abortDuringBeforeSettle = false;
 		try {
@@ -3544,8 +3562,11 @@ export class AgentSession {
 			this._flushPendingCustomMessages();
 			const finalContext = this._buildBoundaryContext([], "agent_before_settle");
 			if (this._abortDuringBeforeSettle) return false;
-			const shouldContinue = result.continue || this.agent.hasQueuedMessages();
-			if (shouldContinue && !finalContext.canContinue) {
+			const shouldContinue = result.continue || (!failedReplay && this.agent.hasQueuedMessages());
+			if (
+				shouldContinue &&
+				(!finalContext.canContinue || (failedReplay && finalContext.llmMessages.at(-1)?.role === "assistant"))
+			) {
 				if (result.continue) this._reportInvalidBoundaryContinuation("agent_before_settle");
 				return false;
 			}
@@ -6438,7 +6459,7 @@ export class AgentSession {
 			// Persistently omit the selected final attempt before post-run recovery compaction.
 			this._overflowRecoveryAttempted = true;
 			this._omitRecoveryAttempt(assistantMessage, toolResults);
-			const retry = await this._runAutoCompaction("overflow", willRetry);
+			const retry = await this._runAutoCompaction("overflow", willRetry, undefined, contextOverflow);
 			if (retry === true) this._failedResponse = assistantMessage;
 			return retry;
 		}
@@ -6495,6 +6516,7 @@ export class AgentSession {
 		reason: "overflow" | "threshold",
 		willRetry: boolean,
 		overflowContextWindow?: number,
+		contextOverflow = false,
 	): Promise<CompactionOutcome> {
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
@@ -6518,7 +6540,7 @@ export class AgentSession {
 				settings,
 				budget.signal,
 				overflowContextWindow,
-				reason === "overflow" && willRetry,
+				contextOverflow && willRetry,
 			);
 			if (!preparation) {
 				budget.signal.throwIfAborted();
