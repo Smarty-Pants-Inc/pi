@@ -82,6 +82,22 @@ What the LLM sees:
 
 On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. A retain-none compaction records its own ID as `firstKeptEntryId`; repeated compaction starts after that entry. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. Pi also recalculates `tokensBefore` from the rebuilt, context-edited session projection before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced. Omitted raw entries remain stored but do not affect cut selection, summaries, checkpoints, or token estimates.
 
+### Oversized Tool Results
+
+Before planning native manual or automatic compaction, Pi caps individual projected tool results. A result whose serialized content exceeds `contextWindow` UTF-8 bytes is replaced with a short `context_edit` stub. This is a quarter-window byte budget using the four-bytes-per-token estimate, not exact model tokenization. The stub records the projected byte count and original session entry ID. The full raw result remains unchanged in the append-only JSONL and is still available after reopening the session.
+
+On the existing provider-overflow recovery attempt, Pi can also stub the largest eligible retained contribution of at least 1 KiB even if it is below the advertised cap: providers can reject input below their advertised limit. This choice compares tool results with recovered accepted user inputs, so a small tool result cannot take precedence over a much larger accepted input. Smaller tool results remain unchanged unless they exceed the per-result cap. If repair makes the input fit and the short history needs no summary, Pi retries the original request without writing a compaction entry. This uses the same single recovery allowance; cancellation and repeated overflow still stop the run.
+
+### Oversized Recovered Input
+
+Recovered operator-exit input uses automatic batches of at most 16 occurrences and 256 KiB of serialized input. An individually larger input is a singleton batch; successful settlement automatically admits the next batch until no saved input remains. Cancellation, failed work, and native lifecycle/admission fences stop continuation without consuming ahead. See [Recover input saved on exit](sessions.md#recover-input-saved-on-exit).
+
+If one recovered accepted user input alone exceeds the model window under Pi's existing token estimate, native compaction preparation appends a `context_edit` stub with its UTF-8 byte count and original message entry ID. Only the model-visible projection changes. The complete accepted input and its original outbox delivery link remain unchanged in the append-only journal, including after reopening. Ordinary user messages that were not recovered outbox deliveries are not subject to this repair. A recovered image is not proactively stubbed merely because its base64 representation exceeds the replay byte cap: proactive repair uses the whole-window token estimate, including the existing image estimate. The tool-result quarter-window cap above is unchanged.
+
+If the provider actually reports a context overflow below its advertised window, the same one-shot recovery can repair the largest substantial eligible recovered user input or tool result. The original accepted message keeps its `unsentInputId` link; the appended stub names that raw message entry, and reopening preserves both the original content and the repaired model projection. A fitting accepted input that the provider accepts remains untouched.
+
+This uses the existing compaction preparation, captured original-owned appender, and cancellation checks. It adds no retry allowance, recovery episode, or separate spill store. If no summary is needed after repair, the existing compact/retry path can use the repaired projection directly; cancellation or repeated overflow still stops the run.
+
 ### Overflow and Length Recovery Ordering
 
 Recovery preserves the existing lifecycle and queue order. The completed attempt remains visible to `turn_end` and `agent_end`; post-run recovery then repairs persisted model context before a fresh retry:
@@ -91,7 +107,8 @@ persist final assistant response
 → extension/public turn_end
 → extension/public agent_end
 → append context_edit omissions for the selected attempt
-→ for overflow/length: run session_before_compact and append compaction on success
+→ repair oversized projected tool results before planning
+→ when a summary is needed: run session_before_compact and append compaction on success
 → start the retry as a fresh run
 ```
 

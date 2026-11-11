@@ -8,6 +8,10 @@ import type { UserMessageMetadata, UserMessageMetadataSource } from "./user-mess
 /** State-only session entry; never included in model context until delivery. */
 export const UNSENT_INPUT_TYPE = "pi.unsent-input";
 
+/** Per automatic replay batch; an individually over-budget head is delivered alone. */
+export const UNSENT_INPUT_REPLAY_MAX_COUNT = 16;
+export const UNSENT_INPUT_REPLAY_MAX_BYTES = 256 * 1024;
+
 /** Local resume authority, not authentication against a writer with the same UID. */
 export interface UnsentInputOrigin {
 	sessionId: string;

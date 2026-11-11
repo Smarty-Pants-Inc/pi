@@ -80,7 +80,14 @@ describe("operator exit and compaction settlement", () => {
 			if (mode !== "completion") {
 				h.setResponses([fauxAssistantMessage("original")]);
 				await h.session.prompt("original input");
-			} else h.setResponses([fauxAssistantMessage(fauxToolCall("large", {}), { stopReason: "toolUse" })]);
+			} else {
+				// #19998: native result capping must not remove this fixture's summary work.
+				h.setResponses([
+					fauxAssistantMessage(fauxToolCall("large", { retainedArgument: "r".repeat(45_000) }), {
+						stopReason: "toolUse",
+					}),
+				]);
+			}
 			if (mode === "completion")
 				h.session.subscribe((event) => {
 					if (event.type === "compaction_end" && event.result) h.session.abortCompaction();
@@ -91,7 +98,12 @@ describe("operator exit and compaction settlement", () => {
 					? h.session.compact()
 					: h.session.prompt(mode === "automatic" ? "large input ".repeat(6000) : "use large")
 			).catch((error: unknown) => error);
-			await entered.promise;
+			await Promise.race([
+				entered.promise,
+				run.then(() => {
+					throw new Error("Compaction fixture ended before summary preparation");
+				}),
+			]);
 			if (mode !== "completion") h.session.abortCompaction();
 			await run;
 			await h.session.waitForIdle();
@@ -240,8 +252,10 @@ describe("operator exit and compaction settlement", () => {
 		const second = restore(reopened);
 		const before = reopened.getEntryCount();
 		if (branch === "sibling" && origin === "local") {
-			expect(second.getFollowUpMessages()).toEqual(["branch-local saved input"]);
-			expect(second.agent.getQueuedMessages().map(getMessageText)).toEqual(["branch-local saved input"]);
+			// #19998: discovery is durable-only until the post-bind resume entry point.
+			expect(second.getFollowUpMessages()).toEqual(["1 recovered input remains saved in this session"]);
+			expect(second.recoveredInputCount).toBe(1);
+			expect(second.agent.getQueuedMessages()).toEqual([]);
 			expect(second.takeUnsentInputDrafts()).toEqual([]);
 			h.setResponses([fauxAssistantMessage("delivered on B")]);
 			await second.resumeUnsentInputs();
