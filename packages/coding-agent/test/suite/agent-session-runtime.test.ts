@@ -23,7 +23,7 @@ import type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "../../src/index.ts";
-import { createHarness } from "./harness.ts";
+import { createHarness, getMessageText } from "./harness.ts";
 
 // Deliberate contract assertions, also runnable against the pre-fix source for red evidence.
 const UNSENT_INPUT_REPLAY_MAX_COUNT = 16;
@@ -46,7 +46,7 @@ describe("AgentSessionRuntime characterization", () => {
 
 	async function createRuntimeForTest(
 		extensionFactory: ExtensionFactory,
-		options?: { cwd?: string; bootstrapModel?: boolean; bootstrapThinkingLevel?: boolean },
+		options?: { cwd?: string; bootstrapModel?: boolean; bootstrapThinkingLevel?: boolean; configuredAuth?: boolean },
 	) {
 		const tempDir =
 			options?.cwd ?? join(tmpdir(), `pi-runtime-suite-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -61,7 +61,9 @@ describe("AgentSessionRuntime characterization", () => {
 		faux.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two"), fauxAssistantMessage("three")]);
 
 		const authStorage = AuthStorage.inMemory();
-		await authStorage.modify(faux.getModel().provider, async () => ({ type: "api_key", key: "faux-key" }));
+		if (options?.configuredAuth !== false) {
+			await authStorage.modify(faux.getModel().provider, async () => ({ type: "api_key", key: "faux-key" }));
+		}
 
 		const runtimeOptions = {
 			agentDir: tempDir,
@@ -73,7 +75,7 @@ describe("AgentSessionRuntime characterization", () => {
 					(pi: ExtensionAPI) => {
 						pi.registerProvider(faux.getModel().provider, {
 							baseUrl: faux.getModel().baseUrl,
-							apiKey: "faux-key",
+							apiKey: options?.configuredAuth === false ? undefined : "faux-key",
 							api: faux.api,
 							models: faux.models.map((registeredModel) => ({
 								id: registeredModel.id,
@@ -537,6 +539,174 @@ describe("AgentSessionRuntime characterization", () => {
 			expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
 			expect(runtime.session.isIdle).toBe(true);
 		},
+	);
+
+	// smarty-dev#19998, frozen review Finding 1: resume must own the real input-admission
+	// interval before provider entry, including a successful handler that consumes startup input.
+	it.each(["completed", "handled", "failed", "aborted"] as const)(
+		"automatically resumes saved inputs after startup input preflight (%s)",
+		async (outcome) => {
+			let context!: ExtensionContext;
+			let entered = () => {};
+			const enteredPromise = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			let release = () => {};
+			const held = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let drained = () => {};
+			const drainedPromise = new Promise<void>((resolve) => {
+				drained = resolve;
+			});
+			const startupText = "ordinary startup prompt held before provider entry";
+			const { runtime, faux, tempDir } = await createRuntimeForTest(
+				(pi) => {
+					pi.on("session_start", (_event, ctx) => {
+						context = ctx;
+					});
+					pi.on("input", async (event) => {
+						if (event.text !== startupText) return { action: "continue" };
+						entered();
+						await held;
+						return { action: outcome === "handled" ? "handled" : "continue" };
+					});
+					pi.on("agent_settled", () => {
+						if (runtime.session.recoveredInputCount === 0) drained();
+					});
+				},
+				{ configuredAuth: outcome !== "failed" },
+			);
+			const savedText = "equal text, distinct startup recovery occurrences";
+			const saved = writeRecoveredSession(tempDir, 35, savedText, faux.getModel(), "followUp");
+			await runtime.switchSession(saved.file);
+			await runtime.session.bindExtensions({});
+			runtime.session.setAutoCompactionEnabled(false);
+			runtime.session.setFollowUpMode("all");
+			faux.setResponses(Array.from({ length: 8 }, () => fauxAssistantMessage("native startup/replay answer")));
+			const snapshots: Array<{ count: number; bytes: number }> = [];
+			const unsubscribe = runtime.session.subscribe((event) => {
+				if (event.type !== "queue_update") return;
+				const queued = [...runtime.session.agent.getQueuedMessages()];
+				snapshots.push({
+					count: queued.length,
+					bytes: queued.reduce((bytes, message) => bytes + Buffer.byteLength(JSON.stringify(message)), 0),
+				});
+			});
+			cleanups.push(unsubscribe);
+			const within = async (promise: Promise<unknown>, label: string) => {
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				try {
+					await Promise.race([
+						promise,
+						new Promise<never>((_resolve, reject) => {
+							timer = setTimeout(() => reject(new Error(label)), 2_000);
+						}),
+					]);
+				} finally {
+					clearTimeout(timer);
+				}
+			};
+			const wake = runtime.session.prompt(startupText);
+			// Attach rejection handling before cancellation/auth rejection can occur.
+			const wakeResult = wake.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			try {
+				await within(enteredPromise, "startup did not enter the native input handler");
+				expect(context.getInputState()).toEqual({
+					inputsFenced: false,
+					inputAdmissionCount: 1,
+					queued: 0,
+					drained: false,
+				});
+				expect(runtime.session.isIdle).toBe(false);
+				expect(runtime.session.isPromptPending).toBe(true);
+				expect(runtime.session.isStreaming).toBe(false);
+				expect(runtime.session.isSettling).toBe(false);
+				expect(faux.state.callCount).toBe(0);
+				// Exactly one host resume, while real SDK admission is held; no provider-start wait.
+				await expect(runtime.session.resumeUnsentInputs()).resolves.toBeUndefined();
+				expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+				expect(runtime.session.recoveredInputCount).toBe(35);
+				expect(faux.state.callCount).toBe(0);
+				if (outcome === "aborted") await runtime.session.abort();
+			} finally {
+				release();
+			}
+			const result = await wakeResult;
+			const succeeds = outcome === "completed" || outcome === "handled";
+			if (succeeds) expect(result).toBeUndefined();
+			else if (outcome === "aborted") expect(result).toMatchObject({ code: "INPUT_ADMISSION_ABORTED" });
+			else expect(result).toMatchObject({ message: expect.stringContaining("No API key found") });
+			let drainError: unknown;
+			if (succeeds) {
+				try {
+					await within(drainedPromise, "saved replay stranded after successful startup preflight");
+				} catch (error) {
+					drainError = error;
+				}
+			}
+			await within(runtime.session.waitForIdle(), "native startup/replay did not become idle");
+			const entries = runtime.session.sessionManager.getEntries();
+			const delivered = entries.filter((entry) => entry.unsentInputId);
+			const expectedIds = succeeds ? saved.ids : [];
+			expect(readFileSync(saved.file).subarray(0, saved.prefix.length).equals(saved.prefix)).toBe(true);
+			expect(
+				entries
+					.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE)
+					.map((entry) => entry.id),
+			).toEqual(saved.ids);
+			expect(new Set(saved.ids).size).toBe(35);
+			expect(
+				snapshots.every(
+					({ count, bytes }) => count <= UNSENT_INPUT_REPLAY_MAX_COUNT && bytes <= UNSENT_INPUT_REPLAY_MAX_BYTES,
+				),
+			).toBe(true);
+			expect(
+				entries.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						getMessageText(entry.message) === startupText,
+				),
+			).toHaveLength(outcome === "completed" ? 1 : 0);
+			if (drainError) {
+				console.error("startup-preflight-causal-state", {
+					outcome,
+					inputState: context.getInputState(),
+					isIdle: runtime.session.isIdle,
+					isStreaming: runtime.session.isStreaming,
+					providerCalls: faux.state.callCount,
+					recovered: runtime.session.recoveredInputCount,
+					outboxIds: saved.ids,
+					deliveredLinks: delivered.map((entry) => entry.unsentInputId),
+					rawPrefixUnchanged: true,
+				});
+			}
+			expect(delivered.map((entry) => entry.unsentInputId)).toEqual(expectedIds);
+			expect(new Set(delivered.map((entry) => entry.unsentInputId)).size).toBe(expectedIds.length);
+			expect(
+				delivered.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						getMessageText(entry.message) === savedText,
+				),
+			).toHaveLength(expectedIds.length);
+			expect(runtime.session.recoveredInputCount).toBe(succeeds ? 0 : 35);
+			expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+			expect(context.getInputState()).toEqual({
+				inputsFenced: false,
+				inputAdmissionCount: 0,
+				queued: 0,
+				drained: true,
+			});
+			expect(faux.state.callCount).toBe(succeeds ? (outcome === "handled" ? 6 : 7) : 0);
+			if (succeeds) expect(Math.max(...snapshots.map(({ count }) => count))).toBe(UNSENT_INPUT_REPLAY_MAX_COUNT);
+		},
+		10_000,
 	);
 
 	it("persists message_end assistant replacements to the session manager", async () => {

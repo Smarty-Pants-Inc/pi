@@ -558,6 +558,8 @@ interface InputAdmission {
 	release(): void;
 	/** Private observer: runs after admission transfers to a starting run, before native observers. */
 	transferred?: () => void;
+	/** A successful handled-only preflight has no agent settlement to own deferred replay. */
+	completed?: (successful: boolean) => Promise<void>;
 }
 
 /** Separate phase deadlines from operator cancellation so primary expiry can admit fallback. */
@@ -642,6 +644,8 @@ export class AgentSession {
 	private readonly _recoveredUnsentInputIds: string[] = [];
 	private _recoveredUnsentInputCursor = 0;
 	private _unsentInputResumeDeferred = false;
+	/** Automatic replay eligibility only: later successful live work cannot erase a terminal error. */
+	private _unsentInputFailureRevision = 0;
 	private readonly _unsentInputDrafts: AgentMessage[] = [];
 	private _queuedInputRevision = 0;
 	private _queueDrainError?: UnsupportedUnsentInputError;
@@ -3497,6 +3501,9 @@ export class AgentSession {
 			this._compactionStopOutcome = compaction === "aborted" ? "aborted" : "error";
 			return false;
 		}
+		// Only an actual retry owns the failed response. Threshold compaction may instead
+		// continue ordinary live input; its success must not restart automatic replay.
+		if (message.stopReason === "error" && this._failedResponse !== message) this._unsentInputFailureRevision++;
 		if (compaction) return !this._agentRunAbortRequested;
 
 		// The low-level loop drains both queues before agent_end. Messages queued by
@@ -3676,7 +3683,9 @@ export class AgentSession {
 			);
 	}
 
-	private _indexUnsentInputs(): void {
+	private _indexUnsentInputs(restoreDrafts = true): void {
+		this._recoveredUnsentInputIds.length = 0;
+		this._recoveredUnsentInputCursor = 0;
 		const branch = this.sessionManager.getBranch();
 		const consumed = new Set(branch.flatMap((entry) => (entry.unsentInputId ? [entry.unsentInputId] : [])));
 		const host = hostname();
@@ -3692,9 +3701,15 @@ export class AgentSession {
 				input.origin.host !== host ||
 				input.origin.uid !== uid
 			) {
-				const message = structuredClone(input.message);
-				if (message.role === "user" || message.role === "custom")
-					this._unsentInputDrafts.push({ role: "user", content: message.content, timestamp: message.timestamp });
+				if (restoreDrafts) {
+					const message = structuredClone(input.message);
+					if (message.role === "user" || message.role === "custom")
+						this._unsentInputDrafts.push({
+							role: "user",
+							content: message.content,
+							timestamp: message.timestamp,
+						});
+				}
 				continue;
 			}
 			this._recoveredUnsentInputIds.push(entry.id);
@@ -3705,12 +3720,12 @@ export class AgentSession {
 	private _materializeUnsentInputs(): number {
 		let count = 0;
 		let bytes = 0;
-		const consumed = new Set(
-			this.sessionManager.getBranch().flatMap((entry) => (entry.unsentInputId ? [entry.unsentInputId] : [])),
-		);
+		const branch = this.sessionManager.getBranch();
+		const activeIds = new Set(branch.map((entry) => entry.id));
+		const consumed = new Set(branch.flatMap((entry) => (entry.unsentInputId ? [entry.unsentInputId] : [])));
 		while (this.recoveredInputCount > 0 && count < UNSENT_INPUT_REPLAY_MAX_COUNT) {
 			const entryId = this._recoveredUnsentInputIds[this._recoveredUnsentInputCursor];
-			if (consumed.has(entryId)) {
+			if (!activeIds.has(entryId) || consumed.has(entryId)) {
 				this._recoveredUnsentInputCursor++;
 				continue;
 			}
@@ -3780,6 +3795,7 @@ export class AgentSession {
 
 	/** Replay successive bounded batches after publication, stopping on cancellation or failed work. */
 	async resumeUnsentInputs(): Promise<void> {
+		const failureRevision = this._unsentInputFailureRevision;
 		while (this.recoveredInputCount > 0) {
 			// Each next batch reacquires the caller's authority; settlement, replacement or
 			// cancellation cannot grant a continuation permission the original caller lost.
@@ -3792,18 +3808,24 @@ export class AgentSession {
 				this.agent.state.isStreaming ||
 				this.isBashRunning
 			) {
-				// Startup hooks may already own a wake. Retain only the durable IDs until that
-				// successful run settles; never fail bootstrap or drain behind a failed/aborted run.
-				if (!this._unsentInputResumeDeferred && (this.isStreaming || this.isSettling)) {
+				// Startup work may still own only admission, not an agent run. Wait for its
+				// successful completion too: handled-only input never emits agent_settled.
+				if (
+					!this._unsentInputResumeDeferred &&
+					(this.isStreaming || this.isSettling || this._inputAdmissions.size > 0)
+				) {
 					this._unsentInputResumeDeferred = true;
 					const cancellation = this._inheritedCancellation();
 					const fenceScope = this._inputFenceScope.getStore();
-					this._deferredSettledActions.push(async () => {
+					let runStarted = this.isStreaming || this.isSettling;
+					const resume = async () => {
 						this._unsentInputResumeDeferred = false;
 						if (
-							this._lastActivityOutcome !== "completed" ||
-							this._agentRunAbortRequested ||
-							this._stopAfterCompactionFailure
+							this._unsentInputFailureRevision !== failureRevision ||
+							(runStarted &&
+								(this._lastActivityOutcome !== "completed" ||
+									this._agentRunAbortRequested ||
+									this._stopAfterCompactionFailure))
 						)
 							return;
 						// A later lifecycle fence or cancellation cannot acquire the old caller's authority.
@@ -3819,7 +3841,26 @@ export class AgentSession {
 							)
 								throw error;
 						}
-					});
+					};
+					if (runStarted) this._deferredSettledActions.push(resume);
+					else {
+						const admissions = [...this._inputAdmissions];
+						let pending = admissions.length;
+						let successful = true;
+						for (const admission of admissions) {
+							const transferred = admission.transferred;
+							admission.transferred = () => {
+								runStarted = true;
+								transferred?.();
+							};
+							admission.completed = async (completed) => {
+								successful &&= completed;
+								if (--pending !== 0) return;
+								if (successful) await resume();
+								else this._unsentInputResumeDeferred = false;
+							};
+						}
+					}
 				}
 				this._emitQueueUpdate();
 				return;
@@ -3845,6 +3886,7 @@ export class AgentSession {
 			// Do not materialize ahead of failed, cancelled, or still-undelivered live input.
 			if (
 				!materialized ||
+				this._unsentInputFailureRevision !== failureRevision ||
 				this._lastActivityOutcome !== "completed" ||
 				this._agentRunAbortRequested ||
 				this._abortDuringBeforeSettle ||
@@ -4073,12 +4115,18 @@ export class AgentSession {
 	}
 
 	private async _withInputAdmission<T>(admission: InputAdmission, operation: () => Promise<T>): Promise<T> {
+		let successful = false;
 		try {
-			return await this._dispatchCancellationScope.run(admission.signal, () =>
+			const result = await this._dispatchCancellationScope.run(admission.signal, () =>
 				this._inputFenceScope.run(admission.fenceScope, () => this._inputAdmissionScope.run(admission, operation)),
 			);
+			successful = true;
+			return result;
 		} finally {
 			admission.release();
+			const completed = admission.completed;
+			admission.completed = undefined;
+			if (completed) await completed(successful && !admission.signal.aborted);
 		}
 	}
 
@@ -7895,6 +7943,10 @@ export class AgentSession {
 				// No summary, navigating to non-root
 				this.sessionManager.branch(newLeafId);
 			}
+
+			// The branch move is committed even if a later observer fails or is cancelled.
+			// Rebuild local recovery without offering constructor-restored foreign drafts twice.
+			this._indexUnsentInputs(false);
 
 			// Attach label to target entry when not summarizing (no summary entry to label)
 			if (label && !summaryText) {

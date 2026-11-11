@@ -428,6 +428,342 @@ describe("AgentSession automatic bounded unsent replay", () => {
 		},
 	);
 
+	// smarty-dev#19998, frozen review Finding 3: a successful unrelated live turn
+	// must not erase the permanent failure of a recovered singleton batch.
+	it("P1 finding 3: permanent singleton replay failure keeps fresh live execution but stops the 24 durable followers through reopen", async () => {
+		const { runtime, harness, getContext } = await createReplayRuntime();
+		const payload = `accepted singleton: ${"x".repeat(300 * 1024)}`;
+		const duplicate = "same text, separate pending occurrence";
+		const saved = writeSavedInputs(
+			harness.tempDir,
+			[
+				payload,
+				...Array.from({ length: 24 }, (_, index) => (index % 8 === 0 ? duplicate : `saved follower ${index}`)),
+			],
+			harness.getModel(),
+			"followUp",
+		);
+		expect(Buffer.byteLength(JSON.stringify(saved.inputs[0]), "utf8")).toBeGreaterThan(MAX_BYTES);
+		expect(estimateTokens(saved.inputs[0].message)).toBeLessThan(1_000_000);
+		await runtime.switchSession(saved.file);
+		await runtime.session.bindExtensions({});
+		runtime.session.setFollowUpMode("all");
+		const observed = observeAdmissions(runtime.session, saved);
+		const provider = answeringSavedInputs(saved);
+		const sequence: string[] = [];
+		const turns: string[] = [];
+		let freshDelivered = false;
+		let releaseHead = () => {};
+		const headReleased = new Promise<void>((resolve) => {
+			releaseHead = resolve;
+		});
+		let headEntered = () => {};
+		const headStarted = new Promise<void>((resolve) => {
+			headEntered = resolve;
+		});
+		runtime.session.subscribe((event) => {
+			if (event.type === "agent_settled") turns.push(event.outcome);
+		});
+		harness.setResponses([
+			async (context, options, state, model) => {
+				provider.answer(context, options, state, model);
+				sequence.push("recovered head: permanent non-overflow error");
+				headEntered();
+				await headReleased;
+				return fauxAssistantMessage("", {
+					stopReason: "error",
+					errorMessage: "invalid request: permanent failure",
+				});
+			},
+			...Array.from(
+				{ length: 26 },
+				(): FauxResponseFactory => (context, options, state, model) => {
+					// Live timestamps can coincide with a saved timestamp. Keep this
+					// recovered-only observer separate from the ordinary live occurrence.
+					provider.answer(
+						{
+							...context,
+							messages: context.messages.filter((message) => getMessageText(message) !== "fresh live input"),
+						},
+						options,
+						state,
+						model,
+					);
+					const fresh =
+						!freshDelivered &&
+						context.messages.some(
+							(message) => message.role === "user" && getMessageText(message) === "fresh live input",
+						);
+					if (fresh) freshDelivered = true;
+					sequence.push(
+						fresh
+							? "ordinary fresh live input: completed"
+							: `recovered followers: ${provider.requests.at(-1)?.length}`,
+					);
+					return fauxAssistantMessage(fresh ? "fresh ordinary answered" : "saved follower answered");
+				},
+			),
+		]);
+
+		const replay = runtime.session.resumeUnsentInputs(); // Exactly one explicit resume.
+		try {
+			await headStarted;
+			expect(runtime.session.model?.contextWindow).toBe(1_000_000);
+			expect(runtime.session.isStreaming).toBe(true);
+			expect(provider.requests).toEqual([[saved.ids[0]]]);
+			expect(observed.admissions.map((batch) => batch.ids)).toEqual([[saved.ids[0]]]);
+			expect(runtime.session.recoveredInputCount).toBe(24);
+			expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+			await runtime.session.followUp("fresh live input");
+			expect(runtime.session.agent.getQueuedMessages().map(getMessageText)).toEqual(["fresh live input"]);
+			expect(getContext().getInputState()).toMatchObject({ queued: 1, drained: false });
+		} finally {
+			releaseHead();
+			await replay;
+		}
+		await expect
+			.poll(() => runtime.session.isIdle && !runtime.session.isSettling, { timeout: POLL_TIMEOUT })
+			.toBe(true);
+		observed.unsubscribe();
+		console.info(
+			"P1_FINDING_3",
+			JSON.stringify({
+				sequence,
+				deliveredRecovered: provider.delivered.length,
+				remaining: runtime.session.pendingMessageCount,
+				settled: turns,
+			}),
+		);
+
+		// Soft checks retain the complete operator-exit/reopen custody observations
+		// even on the immutable RED baseline, without weakening the failure oracle.
+		expect.soft(freshDelivered).toBe(true);
+		expect
+			.soft(sequence)
+			.toEqual(["recovered head: permanent non-overflow error", "ordinary fresh live input: completed"]);
+		expect.soft(provider.delivered).toEqual([saved.ids[0]]);
+		expect.soft(observed.admissions.map((batch) => batch.ids)).toEqual([[saved.ids[0]]]);
+		expect.soft(harness.faux.state.callCount).toBe(2);
+		expect.soft(runtime.session.recoveredInputCount).toBe(24);
+		expect.soft(runtime.session.pendingMessageCount).toBe(24);
+		expect.soft(runtime.session.agent.getQueuedMessages()).toEqual([]);
+		expect.soft(getContext().hasPendingMessages()).toBe(false);
+		expect.soft(getContext().getInputState()).toMatchObject({ inputAdmissionCount: 0, queued: 0, drained: true });
+		expect(
+			runtime.session.messages.filter(
+				(message) => message.role === "user" && getMessageText(message) === "fresh live input",
+			),
+		).toHaveLength(1);
+		expect(
+			runtime.session.messages.filter(
+				(message) => message.role === "assistant" && getMessageText(message) === "fresh ordinary answered",
+			),
+		).toHaveLength(1);
+		expect(runtime.session.sessionManager.getEntries().filter((entry) => entry.type === "context_edit")).toEqual([]);
+		expect(runtime.session.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
+		expectPreservedJournal(runtime.session, saved, provider.delivered);
+		runtime.session.prepareOperatorExit()();
+		expectPreservedJournal(runtime.session, saved, provider.delivered);
+		await runtime.newSession();
+		await runtime.session.bindExtensions({});
+		await runtime.switchSession(saved.file);
+		await runtime.session.bindExtensions({});
+		expect.soft(runtime.session.recoveredInputCount).toBe(24);
+		expect.soft(runtime.session.pendingMessageCount).toBe(24);
+		expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+		expect(getContext().hasPendingMessages()).toBe(false);
+		expect(getContext().getInputState()).toMatchObject({ inputAdmissionCount: 0, queued: 0, drained: true });
+		expectPreservedJournal(runtime.session, saved, provider.delivered);
+		expect.soft(harness.faux.state.callCount).toBe(2);
+	});
+
+	// smarty-dev#19998: the replay stop must not change ordinary live-only input.
+	it("P1 finding 3: ordinary live-only permanent error still executes its accepted fresh follow-up", async () => {
+		const { runtime, harness, getContext } = await createReplayRuntime();
+		let releaseHead = () => {};
+		const headReleased = new Promise<void>((resolve) => {
+			releaseHead = resolve;
+		});
+		let headEntered = () => {};
+		const headStarted = new Promise<void>((resolve) => {
+			headEntered = resolve;
+		});
+		const sequence: string[] = [];
+		harness.setResponses([
+			async () => {
+				sequence.push("ordinary head: permanent non-overflow error");
+				headEntered();
+				await headReleased;
+				return fauxAssistantMessage("", {
+					stopReason: "error",
+					errorMessage: "invalid request: permanent failure",
+				});
+			},
+			(context) => {
+				expect(context.messages.filter((message) => message.role === "user").map(getMessageText)).toEqual([
+					"ordinary live head",
+					"fresh live input",
+				]);
+				sequence.push("ordinary fresh live input: completed");
+				return fauxAssistantMessage("fresh ordinary answered");
+			},
+		]);
+		const prompt = runtime.session.prompt("ordinary live head");
+		try {
+			await headStarted;
+			await runtime.session.followUp("fresh live input");
+			expect(runtime.session.agent.getQueuedMessages().map(getMessageText)).toEqual(["fresh live input"]);
+		} finally {
+			releaseHead();
+			await prompt;
+		}
+		await expect
+			.poll(() => runtime.session.isIdle && !runtime.session.isSettling, { timeout: POLL_TIMEOUT })
+			.toBe(true);
+		expect(sequence).toEqual(["ordinary head: permanent non-overflow error", "ordinary fresh live input: completed"]);
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(runtime.session.getLastAssistantText()).toBe("fresh ordinary answered");
+		expect(
+			runtime.session.messages.filter((message) => message.role === "assistant" && message.stopReason === "error"),
+		).toHaveLength(1);
+		expect(runtime.session.recoveredInputCount).toBe(0);
+		expect(runtime.session.pendingMessageCount).toBe(0);
+		expect(getContext().getInputState()).toMatchObject({ inputAdmissionCount: 0, queued: 0, drained: true });
+		expect(runtime.session.sessionManager.getEntries().filter((entry) => entry.unsentInputId)).toEqual([]);
+		expect(
+			runtime.session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
+		).toEqual([]);
+	});
+
+	// smarty-dev#19998: a transient context overflow that is actually repaired is
+	// not a terminal replay failure, even with unrelated live work interleaved.
+	it("P1 finding 3: successful bounded overflow repair plus fresh live success still drains the 24 durable followers", async () => {
+		const { runtime, harness } = await createReplayRuntime({ compaction: true });
+		const payload = `accepted singleton: ${"x".repeat(300 * 1024)}`;
+		const saved = writeSavedInputs(
+			harness.tempDir,
+			[
+				payload,
+				...Array.from({ length: 24 }, (_, index) =>
+					index % 8 === 0 ? "same text, separate pending occurrence" : `saved follower ${index}`,
+				),
+			],
+			harness.getModel(),
+			"followUp",
+		);
+		await runtime.switchSession(saved.file);
+		await runtime.session.bindExtensions({});
+		runtime.session.setFollowUpMode("all");
+		const observed = observeAdmissions(runtime.session, saved);
+		const provider = answeringSavedInputs(saved);
+		const overflow = fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long" });
+		overflow.recovery = { recovery: "context_length_exceeded", retryable: false };
+		let releaseHead = () => {};
+		const headReleased = new Promise<void>((resolve) => {
+			releaseHead = resolve;
+		});
+		let headEntered = () => {};
+		const headStarted = new Promise<void>((resolve) => {
+			headEntered = resolve;
+		});
+		const requests: Array<{ unchangedPayload: boolean; freshLive: boolean }> = [];
+		let overflowCount = 0;
+		let freshSuccess = false;
+		let rawPrefix = Buffer.alloc(0);
+		harness.setResponses(
+			Array.from(
+				{ length: 28 },
+				(): FauxResponseFactory => async (context, options, state, model) => {
+					// Observe recovered identities without treating a coincident live
+					// timestamp as the saved occurrence with that timestamp.
+					provider.answer(
+						{
+							...context,
+							messages: context.messages.filter((message) => getMessageText(message) !== "fresh live input"),
+						},
+						options,
+						state,
+						model,
+					);
+					const unchangedPayload = JSON.stringify(context.messages).includes(payload);
+					const freshLive = context.messages.some(
+						(message) => message.role === "user" && getMessageText(message) === "fresh live input",
+					);
+					requests.push({ unchangedPayload, freshLive });
+					if (requests.length === 1) {
+						rawPrefix = readFileSync(saved.file);
+						headEntered();
+						await headReleased;
+					}
+					// Reject unchanged giant content even inside a summary request.
+					if (unchangedPayload) {
+						overflowCount++;
+						return overflow;
+					}
+					if (freshLive) freshSuccess = true;
+					return fauxAssistantMessage(
+						freshLive ? "fresh ordinary answered after repair" : "saved follower answered",
+					);
+				},
+			),
+		);
+		const replay = runtime.session.resumeUnsentInputs(); // No second resume or manual repair.
+		try {
+			await headStarted;
+			expect(runtime.session.model?.contextWindow).toBe(1_000_000);
+			expect(estimateTokens(saved.inputs[0].message)).toBeLessThan(1_000_000);
+			expect(provider.requests).toEqual([[saved.ids[0]]]);
+			expect(observed.admissions.map((batch) => batch.ids)).toEqual([[saved.ids[0]]]);
+			expect(runtime.session.recoveredInputCount).toBe(24);
+			expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+			await runtime.session.followUp("fresh live input");
+			expect(runtime.session.agent.getQueuedMessages().map(getMessageText)).toEqual(["fresh live input"]);
+		} finally {
+			releaseHead();
+			await replay;
+		}
+		await expect.poll(() => runtime.session.pendingMessageCount, { timeout: POLL_TIMEOUT }).toBe(0);
+		await expect
+			.poll(() => runtime.session.isIdle && !runtime.session.isSettling, { timeout: POLL_TIMEOUT })
+			.toBe(true);
+		observed.unsubscribe();
+		expect(requests[0]).toEqual({ unchangedPayload: true, freshLive: false });
+		expect(requests.slice(1).every((request) => !request.unchangedPayload)).toBe(true);
+		expect(overflowCount).toBe(1);
+		expect(freshSuccess).toBe(true);
+		expect(provider.delivered).toEqual(saved.ids);
+		expectBoundedAdmissions(observed, saved);
+		expect(runtime.session.recoveredInputCount).toBe(0);
+		expect(
+			runtime.session.messages.filter(
+				(message) => message.role === "user" && getMessageText(message) === "fresh live input",
+			),
+		).toHaveLength(1);
+		const raw = runtime.session.sessionManager.getEntries().find((entry) => entry.unsentInputId === saved.ids[0]);
+		if (!raw || raw.type !== "message") throw new Error("Missing consumed recovered singleton");
+		expect(getMessageText(raw.message)).toBe(payload);
+		expect(
+			runtime.session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "context_edit" && entry.targetId === raw.id),
+		).toHaveLength(1);
+		expect(runtime.session.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
+		expect(readFileSync(saved.file).subarray(0, rawPrefix.length).equals(rawPrefix)).toBe(true);
+		expectPreservedJournal(runtime.session, saved, saved.ids);
+		runtime.session.prepareOperatorExit()();
+		const calls = harness.faux.state.callCount;
+		await runtime.newSession();
+		await runtime.session.bindExtensions({});
+		await runtime.switchSession(saved.file);
+		await runtime.session.bindExtensions({});
+		expect(runtime.session.recoveredInputCount).toBe(0);
+		expect(runtime.session.pendingMessageCount).toBe(0);
+		expect(harness.faux.state.callCount).toBe(calls);
+		expectPreservedJournal(runtime.session, saved, saved.ids);
+	});
+
 	it("keeps a fitting 300 KiB recovered user unchanged when the provider accepts it", async () => {
 		const { runtime, harness } = await createReplayRuntime({ compaction: true });
 		const payload = `accepted oversized input: ${"x".repeat(300 * 1024)}`;

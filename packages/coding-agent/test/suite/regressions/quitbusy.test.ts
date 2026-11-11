@@ -1,5 +1,6 @@
-import { readFileSync, writeFileSync } from "node:fs";
-import { hostname, userInfo } from "node:os";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir, userInfo } from "node:os";
+import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, streamSimple } from "@earendil-works/pi-ai/compat";
@@ -280,6 +281,190 @@ describe("operator exit and compaction settlement", () => {
 			expect(reopened.getEntryCount()).toBe(before);
 			expect(h.faux.state.callCount).toBe(1);
 		}
+	});
+
+	// smarty-dev#19998 Finding 2: navigation must refresh branch-local recovery without a new session.
+	it.each(["leave", "enter", "active"] as const)(
+		"P1 same-instance tree %s keeps replay on selected ancestry",
+		async (direction) => {
+			const directory = mkdtempSync(join(tmpdir(), "pi-replay-branch-"));
+			const manager = SessionManager.create(directory, directory);
+			const older = manager.appendMessage(fauxAssistantMessage("older assistant"));
+			const inputs: UnsentInput[] = ["branch accepted", "branch accepted"].map((content, index) => ({
+				origin: { sessionId: manager.getSessionId(), host: hostname(), uid: userInfo().uid },
+				mode: "followUp",
+				message: { role: "user", content, timestamp: index + 1 },
+			}));
+			const ids = inputs.map((input) => manager.appendCustomEntry(UNSENT_INPUT_TYPE, input));
+			const later = manager.appendMessage(fauxAssistantMessage("selectable later assistant"));
+			if (direction === "enter") manager.branch(older);
+			const raw = structuredClone(manager.getEntries());
+			const file = manager.getSessionFile()!;
+			const rawJournal = readFileSync(file, "utf8");
+			const h = await createHarness({
+				sessionManager: manager,
+				settings: { compaction: { enabled: false }, retry: { enabled: false } },
+			});
+			harnesses.push(h);
+			const session = h.session;
+			await session.bindExtensions({});
+			expect(session.recoveredInputCount).toBe(direction === "enter" ? 0 : 2);
+			expect(session.agent.getQueuedMessages()).toEqual([]);
+			const requests: string[][] = [];
+			h.setResponses(
+				Array.from({ length: 4 }, () => async (context) => {
+					requests.push(context.messages.filter((message) => message.role === "user").map(getMessageText));
+					return fauxAssistantMessage("branch reply");
+				}),
+			);
+			const target = direction === "leave" ? older : later;
+			expect(await session.navigateTree(target)).toMatchObject({ cancelled: false });
+			expect(manager.getLeafId()).toBe(target);
+			const selectedAncestry = manager.getBranch().map((entry) => entry.id);
+			expect(ids.every((id) => selectedAncestry.includes(id))).toBe(direction !== "leave");
+			await session.resumeUnsentInputs();
+			const deliveries = manager.getEntries().filter((entry) => entry.unsentInputId);
+			for (const entry of raw) expect(manager.getEntry(entry.id)).toEqual(entry);
+			expect(readFileSync(file, "utf8").startsWith(rawJournal)).toBe(true);
+			const trace = JSON.stringify({
+				direction,
+				target,
+				currentLeaf: manager.getLeafId(),
+				ids,
+				selectedAncestry,
+				deliveries,
+			});
+			if (direction === "leave") {
+				expect(deliveries, trace).toEqual([]);
+				expect(requests).toEqual([]);
+				expect(manager.getEntries()).toEqual(raw);
+				expect(readFileSync(file, "utf8")).toBe(rawJournal);
+				expect(await session.navigateTree(later)).toMatchObject({ cancelled: false });
+				expect(manager.getLeafId()).toBe(later);
+				await session.resumeUnsentInputs();
+			}
+			const delivered = manager.getEntries().filter((entry) => entry.unsentInputId);
+			expect(
+				delivered.map((entry) => entry.unsentInputId),
+				trace,
+			).toEqual(ids);
+			for (const [index, id] of ids.entries()) {
+				expect(manager.getEntry(id)).toEqual(raw.find((entry) => entry.id === id));
+				const entry = delivered[index];
+				expect(entry).toMatchObject({ type: "message", message: inputs[index].message });
+				expect(manager.getBranch(entry.id).some((ancestor) => ancestor.id === id)).toBe(true);
+			}
+			expect(requests).toHaveLength(2);
+			expect(requests.at(-1)).toEqual(["branch accepted", "branch accepted"]);
+			expect(manager.getEntries().slice(0, raw.length)).toEqual(raw);
+			expect(readFileSync(file, "utf8").startsWith(rawJournal)).toBe(true);
+			expect(
+				SessionManager.open(file)
+					.getEntries()
+					.filter((entry) => entry.unsentInputId),
+			).toEqual(delivered);
+			expect(session).toBe(h.session);
+			expect(session.isDisposed).toBe(false);
+			expect(session.recoveredInputCount).toBe(0);
+			expect(session.agent.getQueuedMessages()).toEqual([]);
+		},
+	);
+
+	// smarty-dev#19998 Finding 2: commit navigation at the awaited native settlement between batches.
+	it("P1 same-instance tree navigation between automatic batches abandons only the durable suffix", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-replay-branch-batches-"));
+		const manager = SessionManager.create(directory, directory);
+		const older = manager.appendMessage(fauxAssistantMessage("older assistant"));
+		const inputs: UnsentInput[] = Array.from({ length: 20 }, (_, index) => ({
+			origin: { sessionId: manager.getSessionId(), host: hostname(), uid: userInfo().uid },
+			mode: "followUp",
+			message: { role: "user", content: `saved branch occurrence ${index}`, timestamp: index + 1 },
+		}));
+		const ids = inputs.map((input) => manager.appendCustomEntry(UNSENT_INPUT_TYPE, input));
+		const later = manager.appendMessage(fauxAssistantMessage("later assistant"));
+		const raw = structuredClone(manager.getEntries());
+		const file = manager.getSessionFile()!;
+		const rawJournal = readFileSync(file, "utf8");
+		let session: AgentSession | undefined;
+		let navigated = false;
+		let boundary: { oldLeaf: string | null; selectedLeaf: string | null; ancestry: string[] } | undefined;
+		const h = await createHarness({
+			sessionManager: manager,
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_settled", async (event) => {
+						if (navigated) return;
+						if (!session) throw new Error("missing native session at settlement");
+						navigated = true;
+						expect(event.outcome).toBe("completed");
+						expect(session.isStreaming).toBe(false);
+						expect(session.agent.getQueuedMessages()).toEqual([]);
+						expect(session.recoveredInputCount).toBe(4);
+						expect(
+							manager
+								.getEntries()
+								.filter((entry) => entry.unsentInputId)
+								.map((entry) => entry.unsentInputId),
+						).toEqual(ids.slice(0, 16));
+						const oldLeaf = manager.getLeafId();
+						expect(await session.navigateTree(older)).toMatchObject({ cancelled: false });
+						boundary = {
+							oldLeaf,
+							selectedLeaf: manager.getLeafId(),
+							ancestry: manager.getBranch().map((entry) => entry.id),
+						};
+						expect(boundary.selectedLeaf).toBe(older);
+						expect(boundary.ancestry).toEqual([older]);
+					});
+				},
+			],
+		});
+		harnesses.push(h);
+		session = h.session;
+		await session.bindExtensions({});
+		const requests: string[][] = [];
+		h.setResponses(
+			Array.from({ length: 40 }, () => async (context) => {
+				requests.push(context.messages.filter((message) => message.role === "user").map(getMessageText));
+				return fauxAssistantMessage("saved occurrence answered");
+			}),
+		);
+		await session.resumeUnsentInputs();
+		expect(navigated).toBe(true);
+		const deliveries = manager.getEntries().filter((entry) => entry.unsentInputId);
+		for (const entry of raw) expect(manager.getEntry(entry.id)).toEqual(entry);
+		expect(readFileSync(file, "utf8").startsWith(rawJournal)).toBe(true);
+		const trace = JSON.stringify({
+			older,
+			later,
+			currentLeaf: manager.getLeafId(),
+			ids,
+			boundary,
+			links: deliveries.map((entry) => ({ id: entry.id, unsentInputId: entry.unsentInputId })),
+		});
+		expect(
+			deliveries.map((entry) => entry.unsentInputId),
+			trace,
+		).toEqual(ids.slice(0, 16));
+		expect(manager.getLeafId()).toBe(older);
+		expect(requests).toHaveLength(16);
+		expect(
+			requests.flat().some((text) => inputs.slice(16).some((input) => getMessageText(input.message) === text)),
+		).toBe(false);
+		// The suffix is still accepted work when that branch is selected again in this same instance.
+		if (!boundary?.oldLeaf) throw new Error("missing completed first-batch assistant leaf");
+		expect(await session.navigateTree(boundary.oldLeaf)).toMatchObject({ cancelled: false });
+		await session.resumeUnsentInputs();
+		expect(
+			manager
+				.getEntries()
+				.filter((entry) => entry.unsentInputId)
+				.map((entry) => entry.unsentInputId),
+		).toEqual(ids);
+		expect(session.recoveredInputCount).toBe(0);
+		expect(session.agent.getQueuedMessages()).toEqual([]);
+		expect(readFileSync(file, "utf8").startsWith(rawJournal)).toBe(true);
 	});
 
 	// smarty-dev#13108: --no-session requires explicit consent, never creates a session file.
