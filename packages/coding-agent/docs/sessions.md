@@ -17,6 +17,14 @@ Use `/name` or `--name` to assign a recognizable session name. Run `/session` to
 
 The session picker lets you search, rename, and delete sessions. It can also show paths, change sorting, and limit results to named sessions. See [Keybindings](keybindings.md#sessions) for its shortcuts.
 
+## Recover input saved on exit
+
+Operator exit saves accepted but undelivered input as `pi.unsent-input` entries in the session JSONL. Opening a session discovers those entries without putting them into live queues. Replay starts only after the host binds extensions and publishes the session. Input saved for another session, host, or user remains an editable draft rather than automatic work.
+
+Replay loads bounded batches: at most 16 saved inputs and 256 KiB of serialized saved input per batch. A single input above 256 KiB is delivered alone as its own batch, never left blocking the journal. After each successful batch settles, the next batch starts automatically in a fresh native run until the backlog is empty; no additional resume command or SDK call is needed. The remaining count appears with pending input, while the remaining payloads stay in the existing journal rather than live queues or model context. Separate accepted inputs are not deduplicated by their text. Successful delivery links its original outbox entry, so reopening does not deliver it again.
+
+If startup work is already running, replay waits for successful settlement instead of failing startup. Each batch rechecks native input admission and lifecycle authority. Failed or aborted work stops automatic continuation without consuming the durable remainder. A recovered user input that alone exceeds the model window uses the existing append-only `context_edit` repair: a short byte-count/source-entry stub replaces only model-visible content, while the full accepted input and its delivery link remain in the session JSONL. See [Compaction Reference](compaction.md#oversized-recovered-input).
+
 ## Choose how to branch
 
 Pi stores entries as a tree, so returning to an earlier point does not erase the branch you leave.

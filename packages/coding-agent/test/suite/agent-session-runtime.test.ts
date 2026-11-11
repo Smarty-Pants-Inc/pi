@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir, userInfo } from "node:os";
 import { join, parse } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
@@ -12,15 +12,22 @@ import {
 } from "../../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import { UNSENT_INPUT_TYPE } from "../../src/core/unsent-input.ts";
 import type {
 	AgentToolResult,
 	ExtensionAPI,
+	ExtensionContext,
 	ExtensionFactory,
 	SessionBeforeForkEvent,
 	SessionBeforeSwitchEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "../../src/index.ts";
+import { createHarness, getMessageText } from "./harness.ts";
+
+// Deliberate contract assertions, also runnable against the pre-fix source for red evidence.
+const UNSENT_INPUT_REPLAY_MAX_COUNT = 16;
+const UNSENT_INPUT_REPLAY_MAX_BYTES = 256 * 1024;
 
 type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent
@@ -39,7 +46,7 @@ describe("AgentSessionRuntime characterization", () => {
 
 	async function createRuntimeForTest(
 		extensionFactory: ExtensionFactory,
-		options?: { cwd?: string; bootstrapModel?: boolean; bootstrapThinkingLevel?: boolean },
+		options?: { cwd?: string; bootstrapModel?: boolean; bootstrapThinkingLevel?: boolean; configuredAuth?: boolean },
 	) {
 		const tempDir =
 			options?.cwd ?? join(tmpdir(), `pi-runtime-suite-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -54,7 +61,9 @@ describe("AgentSessionRuntime characterization", () => {
 		faux.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two"), fauxAssistantMessage("three")]);
 
 		const authStorage = AuthStorage.inMemory();
-		await authStorage.modify(faux.getModel().provider, async () => ({ type: "api_key", key: "faux-key" }));
+		if (options?.configuredAuth !== false) {
+			await authStorage.modify(faux.getModel().provider, async () => ({ type: "api_key", key: "faux-key" }));
+		}
 
 		const runtimeOptions = {
 			agentDir: tempDir,
@@ -66,7 +75,7 @@ describe("AgentSessionRuntime characterization", () => {
 					(pi: ExtensionAPI) => {
 						pi.registerProvider(faux.getModel().provider, {
 							baseUrl: faux.getModel().baseUrl,
-							apiKey: "faux-key",
+							apiKey: options?.configuredAuth === false ? undefined : "faux-key",
 							api: faux.api,
 							models: faux.models.map((registeredModel) => ({
 								id: registeredModel.id,
@@ -121,6 +130,584 @@ describe("AgentSessionRuntime characterization", () => {
 
 		return { runtime, faux, tempDir };
 	}
+
+	function writeRecoveredSession(
+		tempDir: string,
+		count: number,
+		text: string,
+		model: { provider: string; id: string },
+		mode: "steer" | "followUp" = "steer",
+	) {
+		const manager = SessionManager.create(tempDir, join(tempDir, "recovered"));
+		manager.appendModelChange(model.provider, model.id);
+		manager.appendMessage({ role: "user", content: "previous request", timestamp: Date.now() - 10_000 });
+		manager.appendMessage(fauxAssistantMessage("previous answer"));
+		const file = manager.getSessionFile()!;
+		const origin = { sessionId: manager.getSessionId(), host: hostname(), uid: userInfo().uid };
+		let parentId = manager.getLeafId();
+		const ids: string[] = [];
+		const lines = Array.from({ length: count }, (_, index) => {
+			const id = `saved-input-${index}`;
+			ids.push(id);
+			const entry = {
+				type: "custom",
+				id,
+				parentId,
+				timestamp: new Date().toISOString(),
+				customType: UNSENT_INPUT_TYPE,
+				data: {
+					mode,
+					message: { role: "user", content: text, timestamp: Date.now() + index },
+					origin,
+				},
+			};
+			parentId = id;
+			return JSON.stringify(entry);
+		});
+		writeFileSync(file, `${readFileSync(file, "utf8")}${lines.join("\n")}\n`);
+		return { file, ids, prefix: readFileSync(file) };
+	}
+
+	// smarty-dev#19998: a real destination journal must cross the runtime's receiving fence
+	// before any saved input is materialized. Identical accepted texts have distinct outbox IDs.
+	it("resumes 38,500 saved inputs with an empty bootstrap queue and successive bounded replay batches", async () => {
+		let context!: ExtensionContext;
+		let batches = 0;
+		const settledBatches: Array<{ recovered: number; pending: number; notice: string[]; hasPending: boolean }> = [];
+		const { runtime, faux, tempDir } = await createRuntimeForTest((pi) => {
+			pi.on("session_start", (_event, ctx) => {
+				context = ctx;
+			});
+			// Exercise the next automatic batch, then cancel through the real native boundary.
+			// Never run all 2,407 batches in this stress fixture or consume ahead after abort.
+			pi.on("agent_before_settle", (_event, ctx) => {
+				if (++batches === 2) ctx.abort();
+			});
+			pi.on("agent_settled", (_event, ctx) => {
+				settledBatches.push({
+					recovered: runtime.session.recoveredInputCount,
+					pending: runtime.session.pendingMessageCount,
+					notice: [...runtime.session.getFollowUpMessages()],
+					hasPending: ctx.hasPendingMessages(),
+				});
+			});
+		});
+		const text = "same text, distinct accepted occurrences";
+		const saved = writeRecoveredSession(tempDir, 38_500, text, faux.getModel());
+		faux.setResponses(Array.from({ length: 40 }, () => fauxAssistantMessage("replayed")));
+
+		await expect(runtime.switchSession(saved.file)).resolves.toEqual({ cancelled: false });
+		expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+		expect(runtime.session.getSteeringMessages()).toEqual([]);
+		expect(runtime.session.recoveredInputCount).toBe(38_500);
+		expect(runtime.session.pendingMessageCount).toBe(38_500);
+		expect(runtime.session.getFollowUpMessages()).toEqual(["38,500 recovered inputs remain saved in this session"]);
+		expect(faux.state.callCount).toBe(0);
+		await runtime.session.bindExtensions({});
+		expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+		expect(context.sessionManager.getSessionId()).toBe(runtime.session.sessionId);
+		expect(context.getInputState()).toEqual({
+			inputsFenced: false,
+			inputAdmissionCount: 0,
+			queued: 0,
+			drained: true,
+		});
+		// smarty-dev#19998: Fabric's idle wake must not mistake saved outboxes for live work.
+		expect(context.hasPendingMessages()).toBe(false);
+		expect(context.isIdle() && !context.isSettling() && !context.isPromptPending()).toBe(true);
+		const release = await runtime.session.fenceInputs();
+		try {
+			await expect(runtime.session.resumeUnsentInputs()).rejects.toMatchObject({ code: "INPUT_ADMISSION_FENCED" });
+			expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+		} finally {
+			release();
+		}
+		runtime.session.setSteeringMode("all");
+		let peakCount = 0;
+		let peakBytes = 0;
+		const unsubscribe = runtime.session.subscribe((event) => {
+			if (event.type !== "queue_update") return;
+			const queued = runtime.session.agent.getQueuedMessages();
+			peakCount = Math.max(peakCount, queued.length);
+			peakBytes = Math.max(
+				peakBytes,
+				queued.reduce((bytes, message) => bytes + Buffer.byteLength(JSON.stringify(message)), 0),
+			);
+		});
+		await runtime.session.resumeUnsentInputs();
+		unsubscribe();
+
+		expect(peakCount).toBe(UNSENT_INPUT_REPLAY_MAX_COUNT);
+		expect(peakBytes).toBeLessThanOrEqual(UNSENT_INPUT_REPLAY_MAX_BYTES);
+		expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+		expect(settledBatches).toHaveLength(2);
+		expect(settledBatches[0]).toEqual({
+			recovered: 38_484,
+			pending: 38_484,
+			notice: ["38,484 recovered inputs remain saved in this session"],
+			hasPending: false,
+		});
+		expect(settledBatches[1]).toEqual({
+			recovered: 38_468,
+			pending: 38_468,
+			notice: ["38,468 recovered inputs remain saved in this session"],
+			hasPending: false,
+		});
+		expect(runtime.session.recoveredInputCount).toBe(38_500 - 2 * UNSENT_INPUT_REPLAY_MAX_COUNT);
+		expect(runtime.session.pendingMessageCount).toBe(38_500 - 2 * UNSENT_INPUT_REPLAY_MAX_COUNT);
+		expect(runtime.session.getFollowUpMessages()).toEqual(["38,468 recovered inputs remain saved in this session"]);
+		expect(context.getInputState()).toEqual({
+			inputsFenced: false,
+			inputAdmissionCount: 0,
+			queued: 0,
+			drained: true,
+		});
+		expect(context.hasPendingMessages()).toBe(false);
+		expect(context.isIdle() && !context.isSettling() && !context.isPromptPending()).toBe(true);
+
+		await runtime.session.followUp("live input alongside saved recovery");
+		expect(runtime.session.pendingMessageCount).toBe(38_469);
+		expect(context.getInputState()).toMatchObject({ inputAdmissionCount: 0, queued: 1, drained: false });
+		expect(context.hasPendingMessages()).toBe(true);
+		await expect(context.fenceInputs()).rejects.toMatchObject({ code: "INPUT_ADMISSION_BUSY" });
+		expect(runtime.session.clearQueue()).toEqual({
+			steering: [],
+			followUp: ["live input alongside saved recovery"],
+		});
+		expect(runtime.session.pendingMessageCount).toBe(38_468);
+		expect(context.hasPendingMessages()).toBe(false);
+
+		let delivered = runtime.session.sessionManager.getEntries().filter((entry) => entry.unsentInputId);
+		expect(delivered.map((entry) => entry.unsentInputId)).toEqual(
+			saved.ids.slice(0, 2 * UNSENT_INPUT_REPLAY_MAX_COUNT),
+		);
+		expect(
+			delivered.filter(
+				(entry) => entry.type === "message" && entry.message.role === "user" && entry.message.content === text,
+			),
+		).toHaveLength(2 * UNSENT_INPUT_REPLAY_MAX_COUNT);
+		expect(readFileSync(saved.file).subarray(0, saved.prefix.length).equals(saved.prefix)).toBe(true);
+		runtime.session.prepareOperatorExit()();
+		expect(
+			runtime.session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
+		).toHaveLength(38_500);
+
+		// Reopening skips linked occurrences, not matching text. Admit two more automatic
+		// batches, then cancel again: all other IDs must remain durable and unconsumed.
+		batches = 0;
+		settledBatches.length = 0;
+		await runtime.newSession();
+		await runtime.session.bindExtensions({});
+		await runtime.switchSession(saved.file);
+		await runtime.session.bindExtensions({});
+		expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+		expect(runtime.session.recoveredInputCount).toBe(38_500 - 2 * UNSENT_INPUT_REPLAY_MAX_COUNT);
+		runtime.session.setSteeringMode("all");
+		await runtime.session.resumeUnsentInputs();
+		expect(settledBatches).toHaveLength(2);
+		delivered = runtime.session.sessionManager.getEntries().filter((entry) => entry.unsentInputId);
+		expect(delivered.map((entry) => entry.unsentInputId)).toEqual(
+			saved.ids.slice(0, 4 * UNSENT_INPUT_REPLAY_MAX_COUNT),
+		);
+		expect(new Set(delivered.map((entry) => entry.unsentInputId)).size).toBe(4 * UNSENT_INPUT_REPLAY_MAX_COUNT);
+		expect(runtime.session.recoveredInputCount).toBe(38_500 - 4 * UNSENT_INPUT_REPLAY_MAX_COUNT);
+		expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+		runtime.session.prepareOperatorExit()();
+		expect(
+			runtime.session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
+		).toHaveLength(38_500);
+		expect(readFileSync(saved.file).subarray(0, saved.prefix.length).equals(saved.prefix)).toBe(true);
+	}, 30_000);
+
+	// smarty-dev#19998: excluding durable recovery must not hide actual live input or relax its fence.
+	it.each(["steer", "followUp"] as const)(
+		"reports live %s admission and its queue as pending through the public extension context",
+		async (mode) => {
+			let context!: ExtensionContext;
+			let release = () => {};
+			const held = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_start", (_event, ctx) => {
+							context = ctx;
+						});
+						pi.on("input", async () => {
+							await held;
+							return { action: "continue" };
+						});
+					},
+				],
+			});
+			cleanups.push(harness.cleanup);
+			await harness.session.bindExtensions({});
+			expect(context.hasPendingMessages()).toBe(false);
+
+			const input = harness.session[mode]("live input");
+			try {
+				expect(context.getInputState()).toEqual({
+					inputsFenced: false,
+					inputAdmissionCount: 1,
+					queued: 0,
+					drained: false,
+				});
+				expect(context.hasPendingMessages()).toBe(true);
+				await expect(context.fenceInputs()).rejects.toMatchObject({ code: "INPUT_ADMISSION_BUSY" });
+			} finally {
+				release();
+				await input;
+			}
+
+			expect(context.getInputState()).toEqual({
+				inputsFenced: false,
+				inputAdmissionCount: 0,
+				queued: 1,
+				drained: false,
+			});
+			expect(context.hasPendingMessages()).toBe(true);
+			await expect(context.fenceInputs()).rejects.toMatchObject({ code: "INPUT_ADMISSION_BUSY" });
+			harness.session.clearQueue();
+			expect(context.hasPendingMessages()).toBe(false);
+		},
+	);
+
+	// smarty-dev#19998: the byte bound is independent of the occurrence-count bound.
+	it("automatically drains byte-bounded batches and never re-saves linked replay input", async () => {
+		const { runtime, faux, tempDir } = await createRuntimeForTest(() => {});
+		const saved = writeRecoveredSession(tempDir, 3, "🙂".repeat(35_000), faux.getModel());
+		await runtime.switchSession(saved.file);
+		await runtime.session.bindExtensions({});
+		let peakBytes = 0;
+		runtime.session.subscribe((event) => {
+			if (event.type === "queue_update")
+				peakBytes = Math.max(
+					peakBytes,
+					runtime.session.agent
+						.getQueuedMessages()
+						.reduce((bytes, message) => bytes + Buffer.byteLength(JSON.stringify(message)), 0),
+				);
+		});
+
+		await runtime.session.resumeUnsentInputs();
+
+		expect(peakBytes).toBeGreaterThan(130_000);
+		expect(peakBytes).toBeLessThanOrEqual(UNSENT_INPUT_REPLAY_MAX_BYTES);
+		expect(runtime.session.recoveredInputCount).toBe(0);
+		expect(
+			runtime.session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.unsentInputId)
+				.map((entry) => entry.unsentInputId),
+		).toEqual(saved.ids);
+		runtime.session.prepareOperatorExit()();
+		expect(
+			runtime.session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
+		).toHaveLength(3);
+		expect(readFileSync(saved.file).subarray(0, saved.prefix.length).equals(saved.prefix)).toBe(true);
+	});
+
+	// smarty-dev#19998: interrupted materialized input already has durable outbox custody.
+	it("does not duplicate outboxes when an interrupted replay batch is saved and reopened", async () => {
+		const { runtime, faux, tempDir } = await createRuntimeForTest(() => {});
+		const saved = writeRecoveredSession(tempDir, 25, "same accepted text", faux.getModel(), "followUp");
+		await runtime.switchSession(saved.file);
+		await runtime.session.bindExtensions({});
+		let aborted: Promise<void> | undefined;
+		faux.setResponses([
+			() => {
+				aborted = runtime.session.abort();
+				return fauxAssistantMessage("", { stopReason: "aborted" });
+			},
+		]);
+
+		await runtime.session.resumeUnsentInputs();
+		await aborted;
+
+		expect(faux.state.callCount).toBe(1);
+		expect(runtime.session.agent.getQueuedMessages()).toHaveLength(UNSENT_INPUT_REPLAY_MAX_COUNT - 1);
+		expect(runtime.session.recoveredInputCount).toBe(25 - UNSENT_INPUT_REPLAY_MAX_COUNT);
+		runtime.session.prepareOperatorExit()();
+		expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+		expect(
+			runtime.session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
+		).toHaveLength(25);
+		expect(
+			runtime.session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.unsentInputId)
+				.map((entry) => entry.unsentInputId),
+		).toEqual([saved.ids[0]]);
+
+		await runtime.newSession();
+		await runtime.session.bindExtensions({});
+		await runtime.switchSession(saved.file);
+		await runtime.session.bindExtensions({});
+		expect(runtime.session.recoveredInputCount).toBe(24);
+		expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+		faux.setResponses(Array.from({ length: 24 }, () => fauxAssistantMessage("accepted input answered")));
+		await runtime.session.resumeUnsentInputs();
+		const delivered = runtime.session.sessionManager.getEntries().filter((entry) => entry.unsentInputId);
+		expect(delivered.map((entry) => entry.unsentInputId)).toEqual(saved.ids);
+		expect(new Set(delivered.map((entry) => entry.unsentInputId)).size).toBe(25);
+		expect(runtime.session.recoveredInputCount).toBe(0);
+		expect(
+			runtime.session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
+		).toHaveLength(25);
+	});
+
+	// smarty-dev#19998: an item above the ordinary byte bound must be delivered alone, not starved.
+	it("delivers a single over-budget saved input as its own batch without changing raw history", async () => {
+		const { runtime, faux, tempDir } = await createRuntimeForTest(() => {});
+		// This fixture isolates the replay byte bound, not post-answer threshold summarization.
+		runtime.session.setAutoCompactionEnabled(false);
+		const saved = writeRecoveredSession(tempDir, 1, "x".repeat(UNSENT_INPUT_REPLAY_MAX_BYTES + 1), faux.getModel());
+		await runtime.switchSession(saved.file);
+		await runtime.session.bindExtensions({});
+
+		await expect(runtime.session.resumeUnsentInputs()).resolves.toBeUndefined();
+
+		expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+		expect(runtime.session.recoveredInputCount).toBe(0);
+		expect(runtime.session.pendingMessageCount).toBe(0);
+		expect(runtime.session.getFollowUpMessages()).toEqual([]);
+		expect(faux.state.callCount).toBe(1);
+		expect(
+			runtime.session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.unsentInputId)
+				.map((entry) => entry.unsentInputId),
+		).toEqual(saved.ids);
+		expect(readFileSync(saved.file).subarray(0, saved.prefix.length).equals(saved.prefix)).toBe(true);
+	});
+
+	// smarty-dev#19998: session_start work may already own the native run when the host resumes input.
+	it.each(["completed", "error", "aborted"] as const)(
+		"defers replay behind a busy startup wake (%s)",
+		async (outcome) => {
+			const { runtime, faux, tempDir } = await createRuntimeForTest(() => {});
+			const saved = writeRecoveredSession(tempDir, 2, "accepted before operator exit", faux.getModel());
+			await runtime.switchSession(saved.file);
+			await runtime.session.bindExtensions({});
+			let started = () => {};
+			const startedPromise = new Promise<void>((resolve) => {
+				started = resolve;
+			});
+			let release = () => {};
+			const released = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			faux.setResponses([
+				async () => {
+					started();
+					await released;
+					return outcome === "completed"
+						? fauxAssistantMessage("startup wake answered")
+						: fauxAssistantMessage("", {
+								stopReason: outcome,
+								errorMessage: outcome === "error" ? "permanent provider failure" : undefined,
+							});
+				},
+				fauxAssistantMessage("resumed accepted input"),
+				fauxAssistantMessage("resumed accepted input"),
+			]);
+			const wake = runtime.session.prompt("startup wake");
+			await startedPromise;
+			try {
+				await expect(runtime.session.resumeUnsentInputs()).resolves.toBeUndefined();
+				expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+				expect(runtime.session.recoveredInputCount).toBe(2);
+				expect(faux.state.callCount).toBe(1);
+			} finally {
+				release();
+				await wake;
+			}
+			const delivered = runtime.session.sessionManager.getEntries().filter((entry) => entry.unsentInputId);
+			expect(delivered).toHaveLength(outcome === "completed" ? 2 : 0);
+			expect(runtime.session.recoveredInputCount).toBe(outcome === "completed" ? 0 : 2);
+			expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+			expect(runtime.session.isIdle).toBe(true);
+		},
+	);
+
+	// smarty-dev#19998, frozen review Finding 1: resume must own the real input-admission
+	// interval before provider entry, including a successful handler that consumes startup input.
+	it.each(["completed", "handled", "failed", "aborted"] as const)(
+		"automatically resumes saved inputs after startup input preflight (%s)",
+		async (outcome) => {
+			let context!: ExtensionContext;
+			let entered = () => {};
+			const enteredPromise = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			let release = () => {};
+			const held = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let drained = () => {};
+			const drainedPromise = new Promise<void>((resolve) => {
+				drained = resolve;
+			});
+			const startupText = "ordinary startup prompt held before provider entry";
+			const { runtime, faux, tempDir } = await createRuntimeForTest(
+				(pi) => {
+					pi.on("session_start", (_event, ctx) => {
+						context = ctx;
+					});
+					pi.on("input", async (event) => {
+						if (event.text !== startupText) return { action: "continue" };
+						entered();
+						await held;
+						return { action: outcome === "handled" ? "handled" : "continue" };
+					});
+					pi.on("agent_settled", () => {
+						if (runtime.session.recoveredInputCount === 0) drained();
+					});
+				},
+				{ configuredAuth: outcome !== "failed" },
+			);
+			const savedText = "equal text, distinct startup recovery occurrences";
+			const saved = writeRecoveredSession(tempDir, 35, savedText, faux.getModel(), "followUp");
+			await runtime.switchSession(saved.file);
+			await runtime.session.bindExtensions({});
+			runtime.session.setAutoCompactionEnabled(false);
+			runtime.session.setFollowUpMode("all");
+			faux.setResponses(Array.from({ length: 8 }, () => fauxAssistantMessage("native startup/replay answer")));
+			const snapshots: Array<{ count: number; bytes: number }> = [];
+			const unsubscribe = runtime.session.subscribe((event) => {
+				if (event.type !== "queue_update") return;
+				const queued = [...runtime.session.agent.getQueuedMessages()];
+				snapshots.push({
+					count: queued.length,
+					bytes: queued.reduce((bytes, message) => bytes + Buffer.byteLength(JSON.stringify(message)), 0),
+				});
+			});
+			cleanups.push(unsubscribe);
+			const within = async (promise: Promise<unknown>, label: string) => {
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				try {
+					await Promise.race([
+						promise,
+						new Promise<never>((_resolve, reject) => {
+							timer = setTimeout(() => reject(new Error(label)), 2_000);
+						}),
+					]);
+				} finally {
+					clearTimeout(timer);
+				}
+			};
+			const wake = runtime.session.prompt(startupText);
+			// Attach rejection handling before cancellation/auth rejection can occur.
+			const wakeResult = wake.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			try {
+				await within(enteredPromise, "startup did not enter the native input handler");
+				expect(context.getInputState()).toEqual({
+					inputsFenced: false,
+					inputAdmissionCount: 1,
+					queued: 0,
+					drained: false,
+				});
+				expect(runtime.session.isIdle).toBe(false);
+				expect(runtime.session.isPromptPending).toBe(true);
+				expect(runtime.session.isStreaming).toBe(false);
+				expect(runtime.session.isSettling).toBe(false);
+				expect(faux.state.callCount).toBe(0);
+				// Exactly one host resume, while real SDK admission is held; no provider-start wait.
+				await expect(runtime.session.resumeUnsentInputs()).resolves.toBeUndefined();
+				expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+				expect(runtime.session.recoveredInputCount).toBe(35);
+				expect(faux.state.callCount).toBe(0);
+				if (outcome === "aborted") await runtime.session.abort();
+			} finally {
+				release();
+			}
+			const result = await wakeResult;
+			const succeeds = outcome === "completed" || outcome === "handled";
+			if (succeeds) expect(result).toBeUndefined();
+			else if (outcome === "aborted") expect(result).toMatchObject({ code: "INPUT_ADMISSION_ABORTED" });
+			else expect(result).toMatchObject({ message: expect.stringContaining("No API key found") });
+			let drainError: unknown;
+			if (succeeds) {
+				try {
+					await within(drainedPromise, "saved replay stranded after successful startup preflight");
+				} catch (error) {
+					drainError = error;
+				}
+			}
+			await within(runtime.session.waitForIdle(), "native startup/replay did not become idle");
+			const entries = runtime.session.sessionManager.getEntries();
+			const delivered = entries.filter((entry) => entry.unsentInputId);
+			const expectedIds = succeeds ? saved.ids : [];
+			expect(readFileSync(saved.file).subarray(0, saved.prefix.length).equals(saved.prefix)).toBe(true);
+			expect(
+				entries
+					.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE)
+					.map((entry) => entry.id),
+			).toEqual(saved.ids);
+			expect(new Set(saved.ids).size).toBe(35);
+			expect(
+				snapshots.every(
+					({ count, bytes }) => count <= UNSENT_INPUT_REPLAY_MAX_COUNT && bytes <= UNSENT_INPUT_REPLAY_MAX_BYTES,
+				),
+			).toBe(true);
+			expect(
+				entries.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						getMessageText(entry.message) === startupText,
+				),
+			).toHaveLength(outcome === "completed" ? 1 : 0);
+			if (drainError) {
+				console.error("startup-preflight-causal-state", {
+					outcome,
+					inputState: context.getInputState(),
+					isIdle: runtime.session.isIdle,
+					isStreaming: runtime.session.isStreaming,
+					providerCalls: faux.state.callCount,
+					recovered: runtime.session.recoveredInputCount,
+					outboxIds: saved.ids,
+					deliveredLinks: delivered.map((entry) => entry.unsentInputId),
+					rawPrefixUnchanged: true,
+				});
+			}
+			expect(delivered.map((entry) => entry.unsentInputId)).toEqual(expectedIds);
+			expect(new Set(delivered.map((entry) => entry.unsentInputId)).size).toBe(expectedIds.length);
+			expect(
+				delivered.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						getMessageText(entry.message) === savedText,
+				),
+			).toHaveLength(expectedIds.length);
+			expect(runtime.session.recoveredInputCount).toBe(succeeds ? 0 : 35);
+			expect(runtime.session.agent.getQueuedMessages()).toEqual([]);
+			expect(context.getInputState()).toEqual({
+				inputsFenced: false,
+				inputAdmissionCount: 0,
+				queued: 0,
+				drained: true,
+			});
+			expect(faux.state.callCount).toBe(succeeds ? (outcome === "handled" ? 6 : 7) : 0);
+			if (succeeds) expect(Math.max(...snapshots.map(({ count }) => count))).toBe(UNSENT_INPUT_REPLAY_MAX_COUNT);
+		},
+		10_000,
+	);
 
 	it("persists message_end assistant replacements to the session manager", async () => {
 		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {
