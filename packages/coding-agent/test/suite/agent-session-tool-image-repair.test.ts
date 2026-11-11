@@ -276,7 +276,10 @@ describe("AgentSession proactive tool-image repair", () => {
 				fauxAssistantMessage("image received"),
 			]);
 			await h.session.prompt("Return the public fixture image");
-			const admitted = projectedTool(h.session.messages, call.id);
+			const admitted: ToolResultMessage & { structuredContent?: unknown } = projectedTool(
+				h.session.messages,
+				call.id,
+			);
 			// Executed actual guard through native tool_result dispatch, before any core repair.
 			expectImagePreserved(admitted);
 			if (mixed) {

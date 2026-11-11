@@ -3225,7 +3225,7 @@ export class AgentSession {
 		// are dropped, so a tool that never registers does not stay pending.
 		this._pendingToolNames.clear();
 		this._abortDuringBeforeSettle = false;
-		this._lastActivityOutcome = "completed";
+		this._lastActivityOutcome = "completed" as AgentActivityOutcome;
 		this._inputQueuedBehindPreflight = false;
 		this._isAgentRunActive = true;
 		this._retryFallbackUsed = false;

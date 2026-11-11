@@ -52,7 +52,7 @@ function writeSavedInputs(
 	manager.appendMessage(fauxAssistantMessage("previous answer"));
 	const origin = { sessionId: manager.getSessionId(), host: hostname(), uid: userInfo().uid };
 	const timestamp = Date.now();
-	const inputs: UnsentInput[] = contents.map((content, index) => ({
+	const inputs: (UnsentInput & { message: UserMessage })[] = contents.map((content, index) => ({
 		origin,
 		mode,
 		message: { role: "user", content, timestamp: timestamp + index },

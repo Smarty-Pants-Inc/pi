@@ -2,7 +2,12 @@ import { cpSync, readFileSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { basename, join } from "node:path";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
+import {
+	fauxAssistantMessage,
+	fauxToolCall,
+	type ToolResultMessage,
+	type UserMessage,
+} from "@earendil-works/pi-ai/compat";
 import { isContextOverflow, isRecoverableLength } from "@earendil-works/pi-ai/utils/overflow";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
@@ -14,7 +19,7 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.ts";
 import { assertContextFitsWindow, estimateTokens } from "../../src/core/compaction/compaction.ts";
-import { SessionManager } from "../../src/core/session-manager.ts";
+import { SessionManager, type SessionMessageEntry } from "../../src/core/session-manager.ts";
 import { UNSENT_INPUT_TYPE } from "../../src/core/unsent-input.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
@@ -173,7 +178,10 @@ describe("AgentSession native tool-result context repair", () => {
 		expect(h.session.isIdle).toBe(true);
 		expect(h.eventsOfType("agent_settled")).toHaveLength(1);
 		expect(entries.filter((entry) => entry.type === "compaction")).toEqual([]);
-		const rawResult = entries.find((entry) => entry.type === "message" && entry.message.role === "toolResult");
+		const rawResult = entries.find(
+			(entry): entry is SessionMessageEntry & { message: ToolResultMessage } =>
+				entry.type === "message" && entry.message.role === "toolResult",
+		);
 		if (!rawResult || rawResult.type !== "message") throw new Error("Missing raw tool result");
 		expect(getMessageText(rawResult.message)).toBe(payload);
 		expect(readFileSync(h.session.sessionFile!).subarray(0, rawPrefix.length).equals(rawPrefix)).toBe(true);
@@ -255,7 +263,9 @@ describe("AgentSession native tool-result context repair", () => {
 		expect(reopened.getEntry(outboxId)).toEqual(entries.find((entry) => entry.id === outboxId));
 		const projectedUser = reopened
 			.buildSessionProjection()
-			.messages.find((input) => input.role === "user" && input.timestamp === message.timestamp);
+			.messages.find(
+				(input): input is UserMessage => input.role === "user" && input.timestamp === message.timestamp,
+			);
 		expect.soft(projectedUser?.content).toEqual(payload);
 		for (const request of requests)
 			expect.soft(request.filter((input) => input.role === "user").map(getMessageText)).toContain(payload);
