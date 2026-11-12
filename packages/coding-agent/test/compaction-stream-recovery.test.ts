@@ -318,9 +318,11 @@ describe("compaction recovery across the real local Responses SSE boundary", () 
 		expect(events.filter((event) => event.type === "agent_start")).toHaveLength(path === "auto" ? 1 : 0);
 	});
 
-	it.each(failures)("keeps follow-ups through %s failure and recovery", async (failure) => {
+	it.each(failures)("continues threshold turns and delivers follow-ups after %s failure", async (failure) => {
 		const fixture = await localSse(failure, Number.POSITIVE_INFINITY);
 		const { session, manager, events, settings } = await compactableSession(fixture);
+		// Four failed summary calls (three primary attempts plus the single fallback); ordinary turns then succeed.
+		fixture.failureCount = 4;
 		await session.steer(steeringText);
 		await session.followUp(queuedText);
 		const retryQueues: Array<{ steering: string[]; followUps: string[] }> = [];
@@ -332,15 +334,14 @@ describe("compaction recovery across the real local Responses SSE boundary", () 
 				});
 			}
 		});
-		await expect(session.prompt(triggeringText, { streamingBehavior: "followUp" })).rejects.toThrow(
-			"Input is retained in the followUp queue",
-		);
+		await session.prompt(triggeringText, { streamingBehavior: "followUp" });
+		await session.waitForIdle();
 		expect(fixture.errors).toEqual([]);
-		expect(session.getSteeringMessages()).toEqual([steeringText]);
-		expect(session.getFollowUpMessages()).toEqual([queuedText, triggeringText]);
-		expect(session.pendingMessageCount).toBe(3);
-		expect(session.agent.hasQueuedMessages()).toBe(true);
-		expect(events.filter((event) => event.type === "agent_start")).toHaveLength(0);
+		expect(session.getSteeringMessages()).toEqual([]);
+		expect(session.getFollowUpMessages()).toEqual([]);
+		expect(session.pendingMessageCount).toBe(0);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		expect(events.filter((event) => event.type === "agent_start")).toHaveLength(1);
 		expect(events.filter((event) => event.type === "compaction_end").at(-1)).toMatchObject({
 			result: undefined,
 			aborted: false,
@@ -349,7 +350,7 @@ describe("compaction recovery across the real local Responses SSE boundary", () 
 		expect(manager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
 		expect(JSON.stringify(manager.getEntries())).not.toContain(partialText);
 		console.info(
-			"STREAM_PROBE_QUEUE_HELD",
+			"STREAM_PROBE_QUEUE_DRAINED",
 			JSON.stringify({
 				failure,
 				calls: fixture.requests.length,
@@ -358,13 +359,15 @@ describe("compaction recovery across the real local Responses SSE boundary", () 
 				retryQueues,
 			}),
 		);
-		// Two primary retries plus one fallback request, independent of ordinary settings.retry.
-		expect(fixture.requests.map((request) => request.model)).toEqual([
+		// The failed compaction made three primary attempts and one fallback; ordinary input then continued on primary.
+		expect(fixture.requests.slice(0, 4).map((request) => request.model)).toEqual([
 			"local-compaction-probe",
 			"local-compaction-probe",
 			"local-compaction-probe",
 			"local-compaction-fallback-probe",
 		]);
+		expect(fixture.requests.slice(4).length).toBeGreaterThan(0);
+		expect(fixture.requests.slice(4).every((request) => request.model === "local-compaction-probe")).toBe(true);
 		expect(retryQueues).toEqual([
 			{ steering: [steeringText], followUps: [queuedText] },
 			{ steering: [steeringText], followUps: [queuedText] },
@@ -372,8 +375,8 @@ describe("compaction recovery across the real local Responses SSE boundary", () 
 
 		fixture.failureCount = fixture.requests.length;
 		await expect(session.compact()).resolves.toMatchObject({ summary: expect.stringContaining(recoveredText) });
-		expect(session.getSteeringMessages()).toEqual([steeringText]);
-		expect(session.getFollowUpMessages()).toEqual([queuedText, triggeringText]);
+		expect(session.getSteeringMessages()).toEqual([]);
+		expect(session.getFollowUpMessages()).toEqual([]);
 		settings.applyOverrides({ compaction: { enabled: false } });
 		await session.prompt("resume after successful compaction");
 		await session.waitForIdle();
