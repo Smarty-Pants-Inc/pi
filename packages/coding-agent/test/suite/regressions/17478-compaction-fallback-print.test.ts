@@ -157,7 +157,7 @@ describe("print compaction fallback", () => {
 	});
 
 	it.each(["text", "json"] as const)(
-		"%s terminates visibly with retained queues and no partial checkpoint",
+		"%s reports threshold failure after continuing queued input, without a partial checkpoint",
 		async (mode) => {
 			const { h, runtime } = await fixture();
 			const calls = script(h, true);
@@ -177,9 +177,21 @@ describe("print compaction fallback", () => {
 			});
 			await vi.advanceTimersByTimeAsync(6000);
 			expect(await running).toBe(1);
-			expect(calls.map((call) => call.model)).toEqual(["primary", "primary", "primary", "fallback"]);
+			expect(calls.map((call) => call.model)).toEqual([
+				"primary",
+				"primary",
+				"primary",
+				"fallback",
+				"primary",
+				"primary",
+			]);
 			expect(queues).toEqual(["steering still owned", "follow-up still owned"]);
-			expect(h.eventsOfType("agent_start")).toHaveLength(0);
+			expect(h.session.getSteeringMessages()).toEqual([]);
+			expect(h.session.getFollowUpMessages()).toEqual([]);
+			expect(getUserTexts(h)).toEqual(
+				expect.arrayContaining([retained, "steering still owned", "follow-up still owned"]),
+			);
+			expect(h.eventsOfType("agent_start")).toHaveLength(1);
 			expect(h.session.model?.id).toBe("primary");
 			expect(h.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
 			expect(JSON.stringify(h.sessionManager.getEntries())).not.toContain(partial);
@@ -193,7 +205,7 @@ describe("print compaction fallback", () => {
 					errorMessage: expect.stringContaining("Auto-compaction failed"),
 				});
 				const rejections = records.filter((record) => record.type === "input_rejected");
-				expect(JSON.stringify(rejections)).toContain(retained);
+				expect(JSON.stringify(rejections)).not.toContain(retained);
 				expect(JSON.stringify(rejections)).toContain("must not start another turn");
 				expect(records.some((record) => record.type === "print_end" || record.type === "error")).toBe(false);
 			}
@@ -216,7 +228,7 @@ describe("print compaction fallback", () => {
 			expect(await running).toBe(1);
 			expect(calls.map((call) => call.model)).toEqual(["primary", "primary", "primary", "primary", "fallback"]);
 			expect(h.eventsOfType("agent_start")).toHaveLength(1);
-			expect(h.eventsOfType("agent_settled").at(-1)).toMatchObject({ outcome: "error" });
+			expect(h.eventsOfType("agent_settled").at(-1)).toMatchObject({ outcome: "completed" });
 			expect(h.session.messages.findLast((message) => message.role === "assistant")?.stopReason).toBe("stop");
 			expect(stderr.mock.calls.some(([line]) => String(line).includes("Auto-compaction failed"))).toBe(true);
 			if (mode === "text") expect(lines.join("")).toBe("");
@@ -479,7 +491,7 @@ describe("native print launch compaction fallback", () => {
 					.split("\n")
 					.map((line) => JSON.parse(line));
 				expect(records.filter((record) => record.type === "agent_start")).toHaveLength(1);
-				expect(records.find((record) => record.type === "agent_settled")).toMatchObject({ outcome: "error" });
+				expect(records.find((record) => record.type === "agent_settled")).toMatchObject({ outcome: "completed" });
 				expect(JSON.stringify(records.filter((record) => record.type === "input_rejected"))).toContain(
 					"second untouched prompt",
 				);
@@ -531,7 +543,13 @@ describe("native print launch compaction fallback", () => {
 			const result = await launchCli(mode, true);
 			expect(result.signal).toBeNull();
 			expect(result.code, result.stderr).toBe(1);
-			expect(result.calls.map((call) => call.model)).toEqual(["primary", "primary", "primary", "fallback"]);
+			expect(result.calls.map((call) => call.model)).toEqual([
+				"primary",
+				"primary",
+				"primary",
+				"fallback",
+				"primary",
+			]);
 			expect(result.entries.some((entry) => entry.type === "compaction")).toBe(false);
 			expect(JSON.stringify(result.entries)).not.toContain(partial);
 			expect(result.stderr).toContain("Auto-compaction failed");
@@ -549,9 +567,10 @@ describe("native print launch compaction fallback", () => {
 					willRetry: false,
 					errorMessage: expect.stringContaining("Auto-compaction failed"),
 				});
-				expect(records.some((record) => record.type === "agent_start")).toBe(false);
+				expect(records.some((record) => record.type === "agent_start")).toBe(true);
+				expect(records.find((record) => record.type === "agent_settled")).toMatchObject({ outcome: "completed" });
 				const rejected = records.filter((record) => record.type === "input_rejected");
-				expect(JSON.stringify(rejected)).toContain("continue once");
+				expect(JSON.stringify(rejected)).not.toContain("continue once");
 				expect(JSON.stringify(rejected)).toContain("second untouched prompt");
 			}
 		},

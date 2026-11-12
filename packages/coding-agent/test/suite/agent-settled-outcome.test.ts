@@ -68,16 +68,18 @@ describe("agent_settled outcome", () => {
 		expect(publicOutcomes).toEqual(["error"]);
 	});
 
-	// A pre-turn compaction stop aborts the agent loop, which records an aborted synthetic turn.
-	// The compaction result, not that turn, decides the outcome.
+	// The failed threshold attempt is terminal only when its unchanged projection is over-window.
+	// Extension cancellation remains terminal even when the projection fits.
 	it.each([
-		{ stop: "failure", expected: "error" },
-		{ stop: "extension cancel", expected: "aborted" },
+		{ stop: "failure", expected: "completed", contextWindow: 2600 },
+		{ stop: "over-window", expected: "error", contextWindow: 2200 },
+		{ stop: "extension cancel", expected: "aborted", contextWindow: 2600 },
 	] as const)(
-		"reports $expected when pre-turn threshold compaction stops the run ($stop)",
-		async ({ stop, expected }) => {
+		"reports $expected after pre-turn threshold compaction ($stop)",
+		async ({ stop, expected, contextWindow }) => {
 			let failSummary = false;
 			let streamCalls = 0;
+			const failedCompactions: Array<{ errorMessage?: string }> = [];
 			const preparedTokens: number[] = [];
 			const largeTool: AgentTool = {
 				name: "large_result",
@@ -85,13 +87,14 @@ describe("agent_settled outcome", () => {
 				description: "Returns fitting results whose combined context crosses the compaction threshold",
 				parameters: Type.Object({}),
 				execute: async () => {
-					failSummary = stop === "failure";
-					return { content: [{ type: "text", text: `large-tool-result:${"x".repeat(2000)}` }], details: {} };
+					failSummary = stop !== "extension cancel";
+					const resultSize = 2000;
+					return { content: [{ type: "text", text: `large-tool-result:${"x".repeat(resultSize)}` }], details: {} };
 				},
 			};
 			const { harness, extensionOutcomes, publicOutcomes } = await createObservedHarness(
 				{
-					models: [{ id: "faux-1", contextWindow: 2600, maxTokens: 100 }],
+					models: [{ id: "faux-1", contextWindow, maxTokens: 100 }],
 					settings: { compaction: { enabled: true, reserveTokens: 400, keepRecentTokens: 1750 } },
 					tools: [largeTool],
 				},
@@ -100,6 +103,9 @@ describe("agent_settled outcome", () => {
 						pi.on("session_before_compact", (event) => {
 							preparedTokens.push(event.preparation.tokensBefore);
 							if (stop === "extension cancel") return { cancel: true };
+						});
+						pi.on("session_compact_failed", (event) => {
+							failedCompactions.push(event);
 						});
 					},
 				],
@@ -115,12 +121,16 @@ describe("agent_settled outcome", () => {
 						stopReason: "toolUse",
 					},
 				),
-				fauxAssistantMessage("must not run"),
+				fauxAssistantMessage("summary after the first failed attempt"),
+				fauxAssistantMessage("continued successfully"),
 			]);
 			const streamFunction = harness.session.agent.streamFunction;
 			harness.session.agent.streamFunction = (...args) => {
 				streamCalls++;
-				if (failSummary) throw new Error("summary generator blew up");
+				if (failSummary) {
+					if (stop === "failure") failSummary = false;
+					throw new Error("summary generator blew up");
+				}
 				return streamFunction(...args);
 			};
 
@@ -128,25 +138,39 @@ describe("agent_settled outcome", () => {
 			await harness.session.prompt("seed recent history");
 			await harness.session.prompt("run the large tool");
 
-			expect(harness.faux.state.callCount).toBe(3);
-			// Include the failing summary attempt, but never an ordinary continuation after the stop.
-			expect(streamCalls).toBe(stop === "failure" ? 4 : 3);
+			expect(harness.faux.state.callCount).toBeGreaterThanOrEqual(3);
+			// Fitting failures continue with the next assistant request; over-window and cancelled runs stop.
+			expect(streamCalls).toBe(stop === "failure" ? 6 : stop === "over-window" ? 4 : 3);
 			expect(harness.eventsOfType("tool_execution_end")).toHaveLength(3);
 			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "context_edit")).toEqual([]);
-			expect(preparedTokens).toHaveLength(1);
+			expect(preparedTokens.length).toBeGreaterThanOrEqual(1);
 			expect(preparedTokens[0]).toBeGreaterThan(2600 - 400);
 			expect(preparedTokens[0]).toBeLessThanOrEqual(2600);
-			expect(harness.eventsOfType("compaction_start")).toEqual([{ type: "compaction_start", reason: "threshold" }]);
-			expect(harness.eventsOfType("compaction_end")).toEqual([
-				{
+			expect(harness.eventsOfType("compaction_start").length).toBeGreaterThanOrEqual(1);
+			expect(harness.eventsOfType("compaction_start").every((event) => event.reason === "threshold")).toBe(true);
+			expect(harness.eventsOfType("compaction_end")).toContainEqual(
+				expect.objectContaining({
 					type: "compaction_end",
 					reason: "threshold",
 					result: undefined,
 					aborted: stop === "extension cancel",
 					willRetry: false,
-					errorMessage: stop === "failure" ? "Auto-compaction failed: summary generator blew up" : undefined,
-				},
-			]);
+					errorMessage:
+						stop === "failure" || stop === "over-window"
+							? "Auto-compaction failed: summary generator blew up"
+							: undefined,
+				}),
+			);
+			if (stop === "failure" || stop === "over-window") {
+				expect(failedCompactions.length).toBeGreaterThanOrEqual(1);
+				expect(failedCompactions[0]).toMatchObject({
+					errorMessage: "Auto-compaction failed: summary generator blew up",
+				});
+			} else if (stop === "extension cancel") {
+				expect(failedCompactions).toMatchObject([{ aborted: true, reason: "threshold" }]);
+			} else {
+				expect(failedCompactions).toEqual([]);
+			}
 			expect(extensionOutcomes).toEqual(["completed", "completed", expected]);
 			expect(publicOutcomes).toEqual(["completed", "completed", expected]);
 		},
