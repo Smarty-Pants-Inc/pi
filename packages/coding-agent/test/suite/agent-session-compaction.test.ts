@@ -993,7 +993,6 @@ describe("AgentSession compaction characterization", () => {
 				enabled: true,
 				reserveTokens: 400,
 				keepRecentTokens: 1750,
-				maxSummaryTokens: 8000,
 				primaryTimeoutMs: 300000,
 				fallbackTimeoutMs: 240000,
 			});

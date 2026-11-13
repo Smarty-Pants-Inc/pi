@@ -99,11 +99,8 @@
           "default": 20000
         },
         "maxSummaryTokens": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 8000,
-          "default": 8000,
-          "description": "Output allowance for one complete compaction checkpoint, shared across history and turn-prefix summaries; independent of reserves and triggering. Provider enforcement is not guaranteed."
+          "deprecated": true,
+          "description": "Ignored legacy setting. Summaries use the model's output limit."
         },
         "primaryTimeoutMs": {
           "type": "integer",

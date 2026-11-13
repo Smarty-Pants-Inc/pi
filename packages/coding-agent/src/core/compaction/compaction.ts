@@ -35,7 +35,6 @@ import {
 	type SessionProjection,
 	sessionEntryToContextMessages,
 } from "../session-manager.ts";
-import { SETTINGS_DEFAULTS } from "../settings-defaults.ts";
 import { combineUsage } from "../usage-totals.ts";
 import {
 	computeFileLists,
@@ -145,7 +144,7 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
-	/** One candidate-checkpoint output allowance, shared by split summaries. */
+	/** @deprecated Ignored; summaries use the model's output limit. */
 	maxSummaryTokens?: number;
 	primaryTimeoutMs?: number;
 	fallbackTimeoutMs?: number;
@@ -155,7 +154,6 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
-	maxSummaryTokens: SETTINGS_DEFAULTS.compaction.maxSummaryTokens,
 };
 
 // ============================================================================
@@ -651,12 +649,8 @@ class SummarizationError extends Error {
 	}
 }
 
-/** Native checkpoint allocation/validation failure, not a provider or observer error. */
-class CompactionBudgetError extends Error {}
-
 function createSummarizationOptions(
 	model: Model<any>,
-	maxTokens: number,
 	apiKey: string | undefined,
 	headers: Record<string, string> | undefined,
 	env: Record<string, string> | undefined,
@@ -664,7 +658,7 @@ function createSummarizationOptions(
 	thinkingLevel: ThinkingLevel | undefined,
 	sessionId: string | undefined,
 ): SimpleStreamOptions {
-	const options: SimpleStreamOptions = { maxTokens, signal, apiKey, headers, env, sessionId };
+	const options: SimpleStreamOptions = { signal, apiKey, headers, env, sessionId };
 	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
 		options.reasoning = thinkingLevel;
 	}
@@ -681,7 +675,6 @@ function getCompactionRetryThinkingLevel(
 }
 
 interface SummarizationLimits {
-	maxTokens?: number;
 	requestTimeoutMs?: number;
 }
 
@@ -805,7 +798,8 @@ export async function completeSummarization(
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	// Unused. Kept for existing callers; summaries use the model's output limit (#9512).
+	_reserveTokens: number | undefined,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
@@ -822,7 +816,7 @@ export async function generateSummary(
 		await generateSummaryWithUsage(
 			currentMessages,
 			model,
-			reserveTokens,
+			_reserveTokens,
 			apiKey,
 			headers,
 			signal,
@@ -856,7 +850,8 @@ function buildSummarizationContext(promptText: string): TranscriptContext {
 export async function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	// Unused. Kept for existing callers; summaries use the model's output limit (#9512).
+	_reserveTokens: number | undefined,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
@@ -870,18 +865,10 @@ export async function generateSummaryWithUsage(
 	sessionId?: string,
 	limits?: SummarizationLimits,
 ): Promise<{ text: string; usage: Usage }> {
-	const maxTokens = Math.min(
-		limits?.maxTokens ?? Math.floor(0.8 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	);
-
 	// Use update prompt if we have a previous summary, otherwise initial prompt
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
-	}
-	if (limits?.maxTokens !== undefined) {
-		basePrompt += `\n\nCheckpoint output allowance: at most ${maxTokens} tokens for this part. Preserve all active requirements and exact continuation references; consolidate completed history. This is a prompt target, not a guaranteed tokenizer bound.`;
 	}
 
 	// Serialize conversation to text so model doesn't try to continue it
@@ -896,16 +883,7 @@ export async function generateSummaryWithUsage(
 	}
 	promptText += basePrompt;
 
-	const completionOptions = createSummarizationOptions(
-		model,
-		maxTokens,
-		apiKey,
-		headers,
-		env,
-		signal,
-		thinkingLevel,
-		sessionId,
-	);
+	const completionOptions = createSummarizationOptions(model, apiKey, headers, env, signal, thinkingLevel, sessionId);
 
 	const response = await completeSummarization(
 		model,
@@ -1161,13 +1139,7 @@ export async function compact(
 		tokensBefore,
 		previousSummary,
 		fileOps,
-		settings,
 	} = preparation;
-
-	const maxSummaryTokens = settings.maxSummaryTokens ?? SETTINGS_DEFAULTS.compaction.maxSummaryTokens;
-	if (!Number.isSafeInteger(maxSummaryTokens) || maxSummaryTokens < 1 || maxSummaryTokens > 8000) {
-		throw new Error("Invalid compaction.maxSummaryTokens: expected an integer from 1 to 8000");
-	}
 	const fileLists = computeFileLists(fileOps);
 	const { readFiles, modifiedFiles } = fileLists;
 	const fileSuffix = formatFileOperations(fileLists);
@@ -1175,22 +1147,6 @@ export async function compact(
 	const hasPrefix = isSplitTurn && turnPrefixMessages.length > 0;
 	// A prior checkpoint is history too, even when the kept boundary starts this turn.
 	const split = hasPrefix && (messagesToSummarize.length > 0 || previousSummary !== undefined);
-	const fixedHistory = hasPrefix && !split ? "No prior history." : "";
-	const suffixTokens = Math.ceil(fileSuffix.length / 4);
-	const outputBudget =
-		maxSummaryTokens - suffixTokens - Math.ceil((fixedHistory.length + (hasPrefix ? turnSeparator.length : 0)) / 4);
-	const historyBudget = split ? Math.floor((outputBudget * 2) / 3) : outputBudget;
-	const prefixBudget = split ? outputBudget - historyBudget : outputBudget;
-	const validateSummary = (text: string): string => {
-		const checkpoint = text + fileSuffix;
-		const estimate = Math.ceil(checkpoint.length / 4);
-		if (estimate > maxSummaryTokens) {
-			throw new CompactionBudgetError(
-				`Compaction summary estimate ${estimate} exceeds maxSummaryTokens ${maxSummaryTokens}; checkpoint was not saved`,
-			);
-		}
-		return checkpoint;
-	};
 
 	// One retry allowance for the operation, not a fresh allowance for each
 	// split summary. Do not mutate the caller's policy or retry ordinary turns.
@@ -1220,11 +1176,6 @@ export async function compact(
 
 	try {
 		signal?.throwIfAborted();
-		if (outputBudget < (split ? 2 : 1)) {
-			throw new CompactionBudgetError(
-				"Compaction output allowance cannot fit the retained references and split summary",
-			);
-		}
 		if (hasPrefix) {
 			let historyText = previousSummary ?? "No prior history.";
 			let historyUsage: Usage | undefined;
@@ -1232,7 +1183,7 @@ export async function compact(
 				const historyResult = await generateSummaryWithUsage(
 					messagesToSummarize,
 					model,
-					settings.reserveTokens,
+					undefined,
 					apiKey,
 					headers,
 					signal,
@@ -1244,7 +1195,6 @@ export async function compact(
 					retry,
 					callbacks,
 					sessionId,
-					{ maxTokens: historyBudget },
 				);
 				historyText = historyResult.text;
 				historyUsage = historyResult.usage;
@@ -1254,7 +1204,6 @@ export async function compact(
 			const turnPrefixResult = await generateTurnPrefixSummary(
 				turnPrefixMessages,
 				model,
-				settings.reserveTokens,
 				apiKey,
 				headers,
 				env,
@@ -1264,7 +1213,6 @@ export async function compact(
 				retry,
 				callbacks,
 				sessionId,
-				{ maxTokens: prefixBudget },
 			);
 			// Merge into single summary
 			summary = `${historyText}${turnSeparator}${turnPrefixResult.text}`;
@@ -1274,7 +1222,7 @@ export async function compact(
 			const result = await generateSummaryWithUsage(
 				messagesToSummarize,
 				model,
-				settings.reserveTokens,
+				undefined,
 				apiKey,
 				headers,
 				signal,
@@ -1286,20 +1234,18 @@ export async function compact(
 				retry,
 				callbacks,
 				sessionId,
-				{ maxTokens: outputBudget },
 			);
 			summary = result.text;
 			summaryUsage = result.usage;
 		}
 		completedPrimaryUsage = summaryUsage;
-		summary = validateSummary(summary);
+		summary += fileSuffix;
 	} catch (error) {
 		fallback?.signal.throwIfAborted();
 		const deadlineExpired = signal !== undefined && isCompactionTimeout(error, signal);
 		const primaryError = deadlineExpired ? signal.reason : error;
 		const eligible =
 			deadlineExpired ||
-			error instanceof CompactionBudgetError ||
 			(error instanceof SummarizationError &&
 				isRetryableAssistantError(error.response, undefined, { discardPartialOutput: true }));
 		if (!fallback || !eligible) throw primaryError;
@@ -1308,9 +1254,6 @@ export async function compact(
 		const fallbackSignal = fallback.start();
 		try {
 			fallbackSignal.throwIfAborted();
-			if (maxSummaryTokens - suffixTokens < 1) {
-				throw new CompactionBudgetError("Compaction output allowance cannot fit the retained file references");
-			}
 			const request = await raceWithAbortSignal(fallback.resolve(fallbackSignal), fallbackSignal);
 			fallbackSignal.throwIfAborted();
 			const instructions = [
@@ -1326,7 +1269,7 @@ export async function compact(
 				generateSummaryWithUsage(
 					[...messagesToSummarize, ...turnPrefixMessages],
 					request.model,
-					settings.reserveTokens,
+					undefined,
 					request.apiKey,
 					request.headers,
 					fallbackSignal,
@@ -1338,12 +1281,11 @@ export async function compact(
 					undefined,
 					undefined,
 					sessionId,
-					{ maxTokens: maxSummaryTokens - suffixTokens },
 				),
 				fallbackSignal,
 			);
 			fallbackSignal.throwIfAborted();
-			summary = validateSummary(result.text);
+			summary = result.text + fileSuffix;
 			summaryUsage = completedPrimaryUsage ? combineUsage(completedPrimaryUsage, result.usage) : result.usage;
 		} catch (fallbackError) {
 			const failure = fallbackSignal.aborted ? fallbackSignal.reason : fallbackError;
@@ -1382,7 +1324,6 @@ export async function compact(
 async function generateTurnPrefixSummary(
 	messages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	env?: Record<string, string>,
@@ -1394,22 +1335,14 @@ async function generateTurnPrefixSummary(
 	sessionId?: string,
 	limits?: SummarizationLimits,
 ): Promise<{ text: string; usage: Usage }> {
-	const maxTokens = Math.min(
-		limits?.maxTokens ?? Math.floor(0.5 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	); // Smaller budget for turn prefix
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
-	const allowance =
-		limits?.maxTokens === undefined
-			? ""
-			: `\n\nCheckpoint output allowance: at most ${maxTokens} tokens for this part. Preserve all active requirements, pending/in-flight task IDs, exact file/evidence paths and the next step; consolidate repeated completed history. This is a prompt target, not a guaranteed tokenizer bound.`;
-	const promptText = `# Conversation\n${conversationText}\n\n# Instructions\n${TURN_PREFIX_SUMMARIZATION_PROMPT}${allowance}`;
+	const promptText = `# Conversation\n${conversationText}\n\n# Instructions\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 
 	const response = await completeSummarization(
 		model,
 		buildSummarizationContext(promptText),
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
+		createSummarizationOptions(model, apiKey, headers, env, signal, thinkingLevel, sessionId),
 		streamFn,
 		retry,
 		callbacks,

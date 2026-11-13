@@ -902,16 +902,6 @@ export class SettingsManager {
 		return reference;
 	}
 
-	getCompactionMaxSummaryTokens(): number {
-		const value = this.settings.compaction?.maxSummaryTokens ?? SETTINGS_DEFAULTS.compaction.maxSummaryTokens;
-		if (!Number.isSafeInteger(value) || value < 1 || value > 8000) {
-			throw new Error(
-				`Invalid compaction.maxSummaryTokens setting: ${String(value)}. Expected an integer from 1 to 8000.`,
-			);
-		}
-		return value;
-	}
-
 	getCompactionTimeouts(): { primaryTimeoutMs: number; fallbackTimeoutMs: number } {
 		const timeouts = {
 			primaryTimeoutMs: SETTINGS_DEFAULTS.compaction.primaryTimeoutMs as number,
@@ -938,7 +928,6 @@ export class SettingsManager {
 		enabled: boolean;
 		reserveTokens: number;
 		keepRecentTokens: number;
-		maxSummaryTokens: number;
 		primaryTimeoutMs: number;
 		fallbackTimeoutMs: number;
 	} {
@@ -947,7 +936,6 @@ export class SettingsManager {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(model),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
-			maxSummaryTokens: this.getCompactionMaxSummaryTokens(),
 		};
 	}
 

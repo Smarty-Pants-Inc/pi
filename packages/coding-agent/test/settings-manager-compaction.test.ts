@@ -1,8 +1,10 @@
 import { readFileSync } from "node:fs";
+import { Compile } from "typebox/compile";
 import { describe, expect, it } from "vitest";
 import { renderConfigSchemas } from "../scripts/generate-schemas.ts";
 import { SETTINGS_DEFAULTS } from "../src/core/settings-defaults.ts";
 import { InMemorySettingsStorage, SettingsManager } from "../src/core/settings-manager.ts";
+import { SettingsSchema } from "../src/core/settings-schema.ts";
 
 const model = { provider: "provider", id: "family/model" };
 const modelKey = "provider/family/model";
@@ -10,7 +12,6 @@ const defaults = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
-	maxSummaryTokens: 8000,
 	primaryTimeoutMs: 300000,
 	fallbackTimeoutMs: 240000,
 };
@@ -35,7 +36,6 @@ describe("compaction model overrides", () => {
 			...defaults,
 			reserveTokens: 400000,
 			keepRecentTokens: 10000,
-			maxSummaryTokens: 8000,
 		});
 		expect(manager.getCompactionReserveTokens(model)).toBe(400000);
 		expect(manager.getCompactionKeepRecentTokens(model)).toBe(10000);
@@ -43,7 +43,6 @@ describe("compaction model overrides", () => {
 			...defaults,
 			reserveTokens: 8192,
 			keepRecentTokens: 10000,
-			maxSummaryTokens: 8000,
 		});
 
 		manager.applyOverrides({ compaction: { modelOverrides: { [modelKey]: { keepRecentTokens: 30000 } } } });
@@ -51,23 +50,45 @@ describe("compaction model overrides", () => {
 		expect(manager.getCompactionReserveTokens(model)).toBe(400000);
 	});
 
-	// smarty-dev#17478: output limits must not change the reserve or follow model overrides.
-	it("keeps the summary output allowance independent of model reserve overrides", () => {
-		const manager = SettingsManager.inMemory({
-			compaction: {
-				reserveTokens: 400000,
-				maxSummaryTokens: 2000,
-				modelOverrides: { [modelKey]: { reserveTokens: 1 } },
-			},
-		});
-		expect(manager.getCompactionSettings(model)).toEqual({
-			...defaults,
-			reserveTokens: 1,
-			maxSummaryTokens: 2000,
-		});
-		expect(manager.getCompactionSettings().reserveTokens).toBe(400000);
-		expect(manager.getCompactionSettings().maxSummaryTokens).toBe(2000);
-	});
+	// pi#325: legacy maxSummaryTokens must not affect resolved compaction settings.
+	it.each([2000, 8000, 8001, 100000, null, "legacy"])(
+		"ignores legacy summary setting %j with model reserve overrides",
+		(maxSummaryTokens) => {
+			expect(Compile(SettingsSchema).Check({ compaction: { maxSummaryTokens } })).toBe(true);
+			const manager = SettingsManager.inMemory({
+				compaction: {
+					reserveTokens: 400000,
+					maxSummaryTokens,
+					modelOverrides: { [modelKey]: { reserveTokens: 1 } },
+				},
+			});
+			expect(manager.getCompactionSettings(model)).toEqual({
+				...defaults,
+				reserveTokens: 1,
+			});
+			expect(manager.getCompactionSettings().reserveTokens).toBe(400000);
+			expect(manager.getCompactionSettings()).not.toHaveProperty("maxSummaryTokens");
+		},
+	);
+
+	// pi#325: loading and reloading existing global/project settings must keep working.
+	it.each(["global", "project"] as const)(
+		"loads and ignores a legacy cap above 8000 from %s settings",
+		async (scope) => {
+			const storage = new InMemorySettingsStorage();
+			const bytes = JSON.stringify({ compaction: { maxSummaryTokens: 100000 } });
+			storage.withLock(scope, () => bytes);
+			const manager = SettingsManager.fromStorage(storage);
+			expect(manager.getCompactionSettings()).toEqual(defaults);
+			await manager.reload();
+			expect(manager.getCompactionSettings()).toEqual(defaults);
+			expect(manager.drainErrors()).toEqual([]);
+			storage.withLock(scope, (current) => {
+				expect(current).toBe(bytes);
+				return undefined;
+			});
+		},
+	);
 
 	it("falls back to built-in defaults for missing fields", () => {
 		const manager = SettingsManager.inMemory({
@@ -119,13 +140,11 @@ describe("compaction model overrides", () => {
 			...defaults,
 			reserveTokens: 400000,
 			keepRecentTokens: 2000,
-			maxSummaryTokens: 8000,
 		});
 		expect(manager.getCompactionSettings({ provider: "provider", id: "other" })).toEqual({
 			...defaults,
 			reserveTokens: 1024,
 			keepRecentTokens: 4096,
-			maxSummaryTokens: 8000,
 		});
 		await manager.reload();
 		expect(manager.getCompactionKeepRecentTokens(model)).toBe(2000);

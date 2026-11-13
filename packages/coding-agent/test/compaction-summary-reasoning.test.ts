@@ -96,6 +96,12 @@ describe("generateSummary reasoning options", () => {
 		});
 	});
 
+	// Upstream #11036 retains the reserveTokens argument for external callers but ignores it.
+	it.each([1, 2000, 500000, undefined])("ignores legacy summary helper reserve=%s", async (reserveTokens) => {
+		await generateSummary(messages, createModel(false), reserveTokens, "test-key");
+		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("maxTokens");
+	});
+
 	it("preserves the string result from generateSummary", async () => {
 		await expect(generateSummary(messages, createModel(false), 2000, "test-key")).resolves.toBe(
 			"## Goal\nTest summary",
@@ -158,7 +164,7 @@ describe("generateSummary reasoning options", () => {
 		const historyContext = calls[0][1] as TranscriptContext;
 		const historyPrompt = JSON.stringify(historyContext.messages);
 		expect(historyPrompt).toContain("<previous-summary>\\nprevious checkpoint\\n</previous-summary>");
-		expect(historyPrompt).toContain("Checkpoint output allowance: at most");
+		expect(historyPrompt).not.toContain("Checkpoint output allowance: at most");
 		expect(historyPrompt).not.toContain("Summarize this.");
 		expect(calls[0][2]).toMatchObject({ apiKey: "test-key", reasoning: "low", cacheRetention: "none" });
 
@@ -169,17 +175,14 @@ describe("generateSummary reasoning options", () => {
 		expect(prefixPrompt).toContain(
 			"# Instructions\\nThe messages above are earlier context from an ongoing conversation.",
 		);
-		expect(prefixPrompt).toContain("Checkpoint output allowance: at most");
+		expect(prefixPrompt).not.toContain("Checkpoint output allowance: at most");
 		expect(prefixPrompt).not.toContain("previous checkpoint");
 		expect(calls[1][2]).toMatchObject({
 			apiKey: "test-key",
 			reasoning: "low",
 			cacheRetention: "none",
-			maxTokens: expect.any(Number),
 		});
-		const allocations = calls.map((call) => call[2]?.maxTokens);
-		expect(allocations.every((tokens) => typeof tokens === "number" && tokens > 0)).toBe(true);
-		expect((allocations[0] ?? 0) + (allocations[1] ?? 0)).toBeLessThanOrEqual(8000);
+		for (const call of calls) expect(call[2]).not.toHaveProperty("maxTokens");
 
 		expect(result.summary).toContain(historySummary);
 		expect(result.summary).toContain(prefixSummary);
@@ -311,8 +314,8 @@ describe("generateSummary reasoning options", () => {
 		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("refusalFallbacks");
 	});
 
-	// Regression test for #17478: both calls must clamp below their shared allocations.
-	it("clamps compaction summary maxTokens to the model output cap", async () => {
+	// Upstream #11036: each summary uses the provider's model-output sizing, not reserveTokens.
+	it("leaves compaction summary output sizing to the provider", async () => {
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
 			messagesToSummarize: messages,
@@ -332,6 +335,6 @@ describe("generateSummary reasoning options", () => {
 			totalTokens: 40,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		});
-		expect(completeSimpleMock.mock.calls.map((call) => call[2]?.maxTokens)).toEqual([2000, 2000]);
+		for (const call of completeSimpleMock.mock.calls) expect(call[2]).not.toHaveProperty("maxTokens");
 	});
 });

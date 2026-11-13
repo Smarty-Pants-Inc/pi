@@ -32,7 +32,7 @@ Auto-compaction triggers when:
 contextTokens > contextWindow - reserveTokens
 ```
 
-By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). This leaves room for the LLM's response.
+By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). It only decides when compaction starts. Summary requests use the model's output limit, reduced when needed so input and output fit the context window.
 
 During a multi-turn agent run, Pi checks the canonical projected context after tools finish and their results are appended, before starting the next assistant response. If the threshold is crossed, Pi compacts during `prepareNextTurn`, then performs the existing catch-up steering poll before `turn_start`. It skips this between-turn check when the completed tool batch terminates the run and no queued message requires another response. Pi also checks before a new user prompt and performs final-attempt overflow recovery after the low-level run ends.
 
@@ -150,7 +150,7 @@ Built-in manual and automatic compaction allow **two transient retries shared ac
 
 After an eligible retryable primary failure or primary deadline expiry, Pi allows **one fallback-model request for the entire operation**, with no fallback retry. For a split compaction, that request sees the original history, original turn prefix, and previous summary together. It does not repeat preparation or substitute a partial summary for the original input. The fallback budget includes its model/authentication setup. The selected main model and its model-change history do not change. Unknown, denied, or unauthenticated fallback models fail visibly; deterministic provider errors, incomplete length-capped summaries, and operator cancellation do not admit fallback.
 
-`compaction.maxSummaryTokens` defaults to 8000 independently of compaction reserves and triggers. Split primary summaries share that allowance, including their merge markers and exact file-operation suffix. Primary and fallback prompts request concise goal, state, open items, file paths, and next steps while preserving active requirements and references. Provider output limits are requested, but a gateway may strip them: **prompt caps do not bound latency**. Before append, Pi rejects a checkpoint whose `ceil(summary.length / 4)` estimate exceeds the allowance, without truncating it. This is a character-based estimate, not exact model tokenization or a mechanical proof of semantic completeness.
+Summary requests use the model's output limit through the provider layer, not a fixed checkpoint allowance. This applies to history, turn-prefix, fallback, and branch summaries. Existing `compaction.maxSummaryTokens` settings are accepted but ignored. Pi does not reject a completed checkpoint for exceeding an arbitrary summary-size estimate; incomplete length-capped provider responses still fail.
 
 A failed threshold auto-compaction emits `compaction_end` with `errorMessage` and `session_compact_failed`, but does not by itself stop the turn: when the unchanged projected request is estimated to fit the selected model's context window, the assistant request proceeds and queued follow-ups continue. Ordinary preflight stops rather than sending a projection estimated over the window; routed requests are admitted against the actual converted context and use overflow recovery if needed. Failed overflow recovery ends the turn visibly. Aborted compaction remains terminal. A prompt waiting for a separate manual compaction still does not run after that compaction fails or is cancelled; its text and attachments remain in the existing steering queue, or the follow-up queue when requested. Likewise, when a new prompt's preflight projection is over the model's context window, failed or cancelled overflow compaction rejects `prompt()` and keeps the input queued. `preflightResult` receives `false`. Recover queued input before resubmitting it to avoid duplicates.
 
@@ -468,7 +468,6 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
     "enabled": true,
     "reserveTokens": 16384,
     "keepRecentTokens": 20000,
-    "maxSummaryTokens": 8000,
     "primaryTimeoutMs": 300000,
     "fallbackTimeoutMs": 240000,
     "fallbackModel": "cliproxyapi-anthropic/claude-opus-5-5"
@@ -479,9 +478,9 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Enable auto-compaction |
-| `reserveTokens` | `16384` | Tokens to reserve for LLM response |
+| `reserveTokens` | `16384` | Free context tokens below which auto-compaction starts |
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
-| `maxSummaryTokens` | `8000` | Shared checkpoint output allowance, an integer from 1 to 8000 |
+| `maxSummaryTokens` | Ignored | Deprecated; accepted for existing settings files without limiting summary output |
 | `primaryTimeoutMs` | `300000` | Shared primary phase budget in milliseconds |
 | `fallbackTimeoutMs` | `240000` | Single fallback phase budget in milliseconds |
 | `fallbackModel` | `cliproxyapi-anthropic/claude-opus-5-5` | Exact provider/model ID used only for compaction fallback |
@@ -508,7 +507,7 @@ Use `compaction.modelOverrides` to tune token budgets for different models:
 }
 ```
 
-For a model with a 1M context window, this override triggers compaction above 600K tokens and keeps the ordinary 20000 recent tokens. Other models retain the ordinary 16384-token reserve. Native compaction output instead uses the independent shared `maxSummaryTokens` allowance, capped per request by the model's maximum output tokens. Direct summarization helpers that do not receive native output limits retain their reserve-derived defaults.
+For a model with a 1M context window, this override triggers compaction above 600K tokens and keeps the ordinary 20000 recent tokens. Other models retain the ordinary 16384-token reserve.
 
 Keys are exact, case-sensitive `provider/modelId` values, including any slashes within the model ID. Each `reserveTokens` and `keepRecentTokens` value falls back independently from the model override to the ordinary setting to the built-in default. Values must be non-negative safe integers. Invalid values in the matching model override produce an error when read; only omitted fields fall back to the ordinary setting. Model override entries must be objects. Invalid ordinary token settings produce an error when read, even if the active model has a valid override. Only omitted ordinary values use built-in defaults. `enabled` remains global, not model-specific.
 
