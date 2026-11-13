@@ -89,7 +89,6 @@ describe("AgentSession compaction model overrides", () => {
 				enabled: path !== "manual",
 				reserveTokens: 2000,
 				keepRecentTokens: 150,
-				maxSummaryTokens: 7000,
 				primaryTimeoutMs: 12345,
 				fallbackTimeoutMs: 23456,
 			});
@@ -109,37 +108,40 @@ describe("AgentSession compaction model overrides", () => {
 		},
 	);
 
-	it.each(["manual", "automatic"] as const)("passes resolved budgets to built-in %s summarization", async (path) => {
-		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 4000, maxTokens: 3000 }],
-			tools: [],
-			settings: {
-				compaction: {
-					reserveTokens: 10,
-					modelOverrides: { "faux/faux-1": { reserveTokens: 2000, keepRecentTokens: 150 } },
+	it.each(["manual", "automatic"] as const)(
+		"leaves output sizing to the provider for built-in %s summarization",
+		async (path) => {
+			const harness = await createHarness({
+				models: [{ id: "faux-1", contextWindow: 4000, maxTokens: 3000 }],
+				tools: [],
+				settings: {
+					compaction: {
+						reserveTokens: 10,
+						modelOverrides: { "faux/faux-1": { reserveTokens: 2000, keepRecentTokens: 150 } },
+					},
 				},
-			},
-		});
-		harnesses.push(harness);
-		const recentUserId = seedHistory(harness, 2500);
-		const budgets: Array<number | undefined> = [];
-		harness.setResponses([
-			(_context, options) => {
-				budgets.push(options?.maxTokens);
-				return fauxAssistantMessage("built-in summary");
-			},
-			...(path === "automatic" ? [fauxAssistantMessage("done")] : []),
-		]);
-		if (path === "manual") await harness.session.compact();
-		else await harness.session.prompt("continue");
-		// pi#325: reserveTokens no longer sets the summary output target; the model's 3000-token cap does.
-		expect(budgets).toEqual([3000]);
-		expect(harness.sessionManager.getEntries().find((entry) => entry.type === "compaction")).toMatchObject({
-			firstKeptEntryId: recentUserId,
-			summary: "built-in summary",
-		});
-		expect(harness.getPendingResponseCount()).toBe(0);
-	});
+			});
+			harnesses.push(harness);
+			const recentUserId = seedHistory(harness, 2500);
+			const budgets: Array<number | undefined> = [];
+			harness.setResponses([
+				(_context, options) => {
+					budgets.push(options?.maxTokens);
+					return fauxAssistantMessage("built-in summary");
+				},
+				...(path === "automatic" ? [fauxAssistantMessage("done")] : []),
+			]);
+			if (path === "manual") await harness.session.compact();
+			else await harness.session.prompt("continue");
+			// Upstream #11036: no maxTokens override; provider sizing uses the actual request and model.
+			expect(budgets).toEqual([undefined]);
+			expect(harness.sessionManager.getEntries().find((entry) => entry.type === "compaction")).toMatchObject({
+				firstKeptEntryId: recentUserId,
+				summary: "built-in summary",
+			});
+			expect(harness.getPendingResponseCount()).toBe(0);
+		},
+	);
 
 	it("uses the newly selected model without changing ordinary settings", async () => {
 		const harness = await createHarness({
@@ -214,6 +216,6 @@ describe("AgentSession compaction model overrides", () => {
 		]);
 		await harness.session.compact();
 		// pi#325: auth mutates the active selection, but sizing and dispatch stay on the captured first model.
-		expect(requests).toEqual([{ id: "first", maxTokens: 900 }]);
+		expect(requests).toEqual([{ id: "first", maxTokens: undefined }]);
 	});
 });

@@ -10,7 +10,6 @@ export const SETTINGS_DEFAULTS = {
 		reserveTokens: 16384,
 		keepRecentTokens: 20000,
 		fallbackModel: "cliproxyapi-anthropic/claude-opus-5-5",
-		maxSummaryTokens: 8000,
 		primaryTimeoutMs: 300000,
 		fallbackTimeoutMs: 240000,
 	},
