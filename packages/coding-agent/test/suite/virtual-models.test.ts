@@ -445,7 +445,7 @@ describe("AgentSession virtual models", () => {
 
 		expect(result.summary).toContain("summary");
 		expect(reasons()).toEqual(["user", "user", "direct"]);
-		// pi#325: route before sizing; history and prefix budgets both respect the routed model's 4000-token cap.
-		expect(summaries).toEqual(["large:low:4000", "large:low:2664"]);
+		// Upstream #11036: both summaries leave output sizing to the routed model's provider.
+		expect(summaries).toEqual(["large:low:undefined", "large:low:undefined"]);
 	});
 });

@@ -61,11 +61,11 @@ describe("branch summarization", () => {
 			streamFn,
 		});
 
-		expect(requestOptions?.maxTokens).toBe(4096);
+		expect(requestOptions).not.toHaveProperty("maxTokens");
 		expect(requestOptions?.toolChoice).toBeUndefined();
 	});
 
-	it("clamps the branch summary output cap to the model limit", async () => {
+	it("leaves branch summary output sizing to the provider", async () => {
 		let requestOptions: SimpleStreamOptions | undefined;
 		const streamFn: StreamFn = (_model, _context, options) => {
 			requestOptions = options;
@@ -82,7 +82,7 @@ describe("branch summarization", () => {
 			streamFn,
 		});
 
-		expect(requestOptions?.maxTokens).toBe(1024);
+		expect(requestOptions).not.toHaveProperty("maxTokens");
 	});
 
 	it("rejects tool calls from branch summaries", async () => {

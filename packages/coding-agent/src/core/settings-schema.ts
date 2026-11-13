@@ -20,12 +20,9 @@ const CompactionSettingsSchema = Type.Object({
 	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
 	maxSummaryTokens: Type.Optional(
-		Type.Integer({
-			minimum: 1,
-			maximum: 8000,
-			default: SETTINGS_DEFAULTS.compaction.maxSummaryTokens,
-			description:
-				"Output allowance for one complete compaction checkpoint, shared across history and turn-prefix summaries; independent of reserves and triggering. Provider enforcement is not guaranteed.",
+		Type.Unknown({
+			deprecated: true,
+			description: "Ignored legacy setting. Summaries use the model's output limit.",
 		}),
 	),
 	primaryTimeoutMs: Type.Optional(

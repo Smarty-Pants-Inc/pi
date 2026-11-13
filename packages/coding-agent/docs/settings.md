@@ -94,13 +94,15 @@ CLI tool options override this setting for one invocation. `--tools` with only `
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `compaction.enabled` | boolean | `true` | Enable automatic compaction. |
-| `compaction.reserveTokens` | number | `16384` | Tokens reserved for the model response. |
+| `compaction.reserveTokens` | number | `16384` | Free context tokens below which auto-compaction starts. |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained without summarization. |
 | `compaction.modelOverrides` | object | None | Per-model token settings keyed by exact `provider/modelId`. |
 
 <a id="per-model-compaction-overrides"></a>
 
 Compaction token values must be non-negative safe integers. Each value resolves independently from the matching model override, then the ordinary compaction setting, then the built-in default. Project and user objects merge before model lookup.
+
+Summaries use the model's output limit, not `compaction.reserveTokens`. The legacy `compaction.maxSummaryTokens` setting is accepted but ignored.
 
 See [Compaction Reference](compaction.md) for trigger, summarization, and validation behavior.
 
