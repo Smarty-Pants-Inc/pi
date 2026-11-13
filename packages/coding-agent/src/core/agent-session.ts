@@ -1288,9 +1288,9 @@ export class AgentSession {
 		const overflow =
 			estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens > model.contextWindow;
 		const outcome = await this._runAutoCompaction("threshold", false);
-		if (outcome === "failed" || outcome === "aborted") {
-			// Stop this run rather than sending unchanged oversized context or
-			// turning a compaction timeout into an ordinary agent retry.
+		if (outcome === "aborted" || (outcome === "failed" && overflow)) {
+			// A failed threshold summary does not stop a fitting request. Keep the hard
+			// stop only when the unchanged projection is estimated over the model window.
 			this._stopAfterCompactionFailure = true;
 			this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
 			this.agent.abort();
@@ -1441,11 +1441,11 @@ export class AgentSession {
 			// the projection.
 			if (this._exceedsCompactionThreshold(route.model, projection)) {
 				const outcome = await this._runAutoCompaction("threshold", false);
-				if (outcome === "failed" || outcome === "aborted") {
+				if (outcome === "aborted") {
 					this._stopAfterCompactionFailure = true;
-					this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
+					this._compactionStopOutcome = "aborted";
 					this.agent.abort();
-					throw new Error(`Compaction ${outcome} before the routed assistant turn`);
+					throw new Error("Compaction aborted before the routed assistant turn");
 				}
 				// Do not rerun request hooks: they may consume one-shot input. Keep the accepted preparation and
 				// rebuild only proven stateless input (the canonical projection, untouched by the hooks). Otherwise
@@ -6497,7 +6497,10 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			return await this._runAutoCompaction("threshold", false);
+			const outcome = await this._runAutoCompaction("threshold", false);
+			// The failure is already emitted. Preserve the completed turn and let any
+			// queued input continue; overflow failures remain terminal above.
+			return outcome === "failed" ? false : outcome;
 		}
 		return false;
 	}

@@ -537,23 +537,51 @@ describe("native compaction single fallback", () => {
 		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
 	});
 
-	it("holds auto-compaction queues and exposes one terminal failure without ordinary replay", async () => {
-		const f = await fixture(({ model }) => transient(model));
+	it("continues threshold turns and delivers queued inputs after one terminal compaction failure", async () => {
+		const f = await fixture(({ model }, index) => {
+			if (index <= 4) return transient(model);
+			const answer = response(model, "CONTINUED_AFTER_THRESHOLD_FAILURE");
+			answer.usage = {
+				input: 100,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 110,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			};
+			return answer;
+		});
 		await f.session.steer("STEERING_TASK_17478");
 		await f.session.followUp("FOLLOWUP_TASK_17478");
 		const result = await settle(f.session.prompt("TRIGGER_TASK_17478", { streamingBehavior: "followUp" }));
-		expect(result).toHaveProperty("error");
-		expect(f.requests).toHaveLength(4);
-		expect(f.session.getSteeringMessages()).toEqual(["STEERING_TASK_17478"]);
-		expect(f.session.getFollowUpMessages()).toEqual(["FOLLOWUP_TASK_17478", "TRIGGER_TASK_17478"]);
-		expect(f.session.pendingMessageCount).toBe(3);
-		expect(f.events.filter((event) => event.type === "agent_start")).toEqual([]);
+		expect(result).toHaveProperty("value", undefined);
+		expect(f.requests.slice(0, 4).map(({ model }) => model.id)).toEqual([
+			primary.id,
+			primary.id,
+			primary.id,
+			fallback.id,
+		]);
+		expect(f.requests.slice(4).length).toBeGreaterThan(0);
+		expect(f.requests.slice(4).every(({ model }) => model.id === primary.id)).toBe(true);
+		expect(f.session.getSteeringMessages()).toEqual([]);
+		expect(f.session.getFollowUpMessages()).toEqual([]);
+		expect(f.session.pendingMessageCount).toBe(0);
+		expect(f.session.agent.hasQueuedMessages()).toBe(false);
+		expect(f.events.filter((event) => event.type === "agent_start")).toHaveLength(1);
+		const userTexts = f.manager
+			.getEntries()
+			.flatMap((entry) =>
+				entry.type === "message" && entry.message.role === "user" ? [contentText(entry.message.content)] : [],
+			);
+		for (const text of ["STEERING_TASK_17478", "FOLLOWUP_TASK_17478", "TRIGGER_TASK_17478"])
+			expect(userTexts.filter((userText) => userText === text)).toHaveLength(1);
 		expect(f.failedEvents).toMatchObject([
 			{ reason: "threshold", aborted: false, willRetry: false, fromExtension: false },
 		]);
 		expect(f.events.filter((event) => event.type === "compaction_end")).toMatchObject([
 			{ aborted: false, errorMessage: expect.stringContaining("fallback") },
 		]);
+		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
 		expect(f.session.model).toBe(primary);
 	});
 
@@ -762,9 +790,9 @@ describe("native compaction single fallback", () => {
 		expect(f.hooks.preparations).toBe(1);
 	});
 
-	// smarty-dev#17478: native deadline failures must publish terminal state, not only a watchdog receipt.
-	it.each(["manual", "threshold"] as const)("terminates %s primary+fallback hangs at nine minutes", async (reason) => {
-		const f = await fixture(() => "hang");
+	// smarty-dev#17478: manual failures reject, but a fitting threshold turn continues after publishing failure.
+	it.each(["manual", "threshold"] as const)("reports %s primary+fallback deadline failure", async (reason) => {
+		const f = await fixture(({ model }, index) => (reason === "threshold" && index > 2 ? response(model) : "hang"));
 		const operation = reason === "manual" ? f.session.compact() : f.session.prompt("TRIGGER");
 		const observed = operation.catch((error: unknown) => error);
 		await vi.advanceTimersByTimeAsync(299999);
@@ -774,7 +802,8 @@ describe("native compaction single fallback", () => {
 		await vi.advanceTimersByTimeAsync(239999);
 		expect(f.events.filter((event) => event.type === "compaction_end")).toEqual([]);
 		await vi.advanceTimersByTimeAsync(1);
-		expect(await observed).toBeInstanceOf(Error);
+		if (reason === "manual") expect(await observed).toBeInstanceOf(Error);
+		else expect(await observed).toBeUndefined();
 		expect(f.events.filter((event) => event.type === "compaction_end")).toMatchObject([
 			{ reason, aborted: false, willRetry: false, errorMessage: expect.stringContaining("240000ms deadline") },
 		]);
@@ -783,8 +812,10 @@ describe("native compaction single fallback", () => {
 		for (const stream of f.held) stream.push({ type: "done", reason: "stop", message: response(primary, "LATE") });
 		await vi.advanceTimersByTimeAsync(600000);
 		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([]);
-		expect(f.requests).toHaveLength(2);
-		expect(f.events.filter((event) => event.type === "agent_start")).toEqual([]);
+		expect(f.requests.map(({ model }) => model.id)).toEqual(
+			reason === "threshold" ? [primary.id, fallback.id, primary.id] : [primary.id, fallback.id],
+		);
+		expect(f.events.filter((event) => event.type === "agent_start")).toHaveLength(reason === "threshold" ? 1 : 0);
 	});
 
 	it("uses configured phase budgets rather than request-specific timers", async () => {
@@ -833,7 +864,7 @@ describe("native compaction single fallback", () => {
 
 	it.each(["manual", "threshold"] as const)("falls back after %s hook expiry without replay", async (reason) => {
 		const hook = Promise.withResolvers<void>();
-		const f = await fixture(({ model }) => (reason === "manual" ? response(model) : "hang"), {
+		const f = await fixture(({ model }, index) => (reason === "manual" || index > 1 ? response(model) : "hang"), {
 			beforeCompact: async (event) => {
 				event.preparation.previousSummary = "PARTIAL_MUTABLE_HOOK_DRAFT";
 				await hook.promise;
@@ -850,16 +881,17 @@ describe("native compaction single fallback", () => {
 		if (reason === "threshold") await vi.advanceTimersByTimeAsync(240000);
 		const result = await observed;
 		if (reason === "manual") expect(result).toHaveProperty("details.durationMs", 0);
-		else expect(result).toBeInstanceOf(Error);
+		else expect(result).toBeUndefined();
 		expect(f.hooks.preparations).toBe(1);
 		expect(f.events.filter((event) => event.type === "compaction_end")).toHaveLength(1);
 		hook.resolve();
 		await vi.advanceTimersByTimeAsync(600000);
 		expect(f.hooks.preparations).toBe(1);
-		expect(f.requests).toHaveLength(1);
+		expect(f.requests).toHaveLength(reason === "threshold" ? 2 : 1);
 		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(
 			reason === "manual" ? 1 : 0,
 		);
+		expect(f.events.filter((event) => event.type === "agent_start")).toHaveLength(reason === "threshold" ? 1 : 0);
 	});
 
 	it.each(["manual", "threshold"] as const)("honors a timely %s hook veto without fallback", async (reason) => {
@@ -897,15 +929,18 @@ describe("native compaction single fallback", () => {
 		await vi.advanceTimersByTimeAsync(1);
 		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
 		await vi.advanceTimersByTimeAsync(299999);
-		expect(await observed).toBeInstanceOf(Error);
+		if (reason === "manual") expect(await observed).toBeInstanceOf(Error);
+		else expect(await observed).toBeUndefined();
 		expect(f.events.filter((event) => event.type === "compaction_end")).toMatchObject([
 			{ reason, aborted: false, willRetry: false, errorMessage: expect.stringContaining("300000ms deadline") },
 		]);
 		observer.resolve();
 		await vi.advanceTimersByTimeAsync(600000);
 		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
-		expect(f.requests.map(({ model }) => model.id)).toEqual([primary.id, primary.id]);
-		expect(f.events.filter((event) => event.type === "agent_start")).toEqual([]);
+		expect(f.requests.map(({ model }) => model.id)).toEqual(
+			reason === "threshold" ? [primary.id, primary.id, primary.id] : [primary.id, primary.id],
+		);
+		expect(f.events.filter((event) => event.type === "agent_start")).toHaveLength(reason === "threshold" ? 1 : 0);
 	});
 
 	it.each(["manual", "threshold"] as const)("does not replay %s post-append observer failure", async (reason) => {
@@ -920,11 +955,15 @@ describe("native compaction single fallback", () => {
 			},
 		});
 		const operation = reason === "manual" ? f.session.compact() : f.session.prompt("TRIGGER");
-		expect(await settle<unknown>(operation, 0)).toHaveProperty("error");
+		const result = await settle<unknown>(operation, 0);
+		if (reason === "manual") expect(result).toHaveProperty("error");
+		else expect(result).toHaveProperty("value", undefined);
 		await vi.advanceTimersByTimeAsync(600000);
 		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
-		expect(f.requests.map(({ model }) => model.id)).toEqual([primary.id, primary.id]);
-		expect(f.events.filter((event) => event.type === "agent_start")).toEqual([]);
+		expect(f.requests.map(({ model }) => model.id)).toEqual(
+			reason === "threshold" ? [primary.id, primary.id, primary.id] : [primary.id, primary.id],
+		);
+		expect(f.events.filter((event) => event.type === "agent_start")).toHaveLength(reason === "threshold" ? 1 : 0);
 		expect(f.events.filter((event) => event.type === "compaction_end")).toMatchObject([
 			{ reason, aborted: false, willRetry: false, errorMessage: expect.stringContaining("observer failure") },
 		]);
@@ -1072,7 +1111,8 @@ describe("native compaction single fallback", () => {
 		const operation = reason === "manual" ? f.session.compact() : f.session.prompt("TRIGGER");
 		const observed = operation.catch((error: unknown) => error);
 		await vi.advanceTimersByTimeAsync(300000);
-		expect(await observed).toBeInstanceOf(Error);
+		if (reason === "manual") expect(await observed).toBeInstanceOf(Error);
+		else expect(await observed).toBeUndefined();
 		expect(f.events.filter((event) => event.type === "compaction_end").at(-1)).toMatchObject({
 			type: "compaction_end",
 			reason,
@@ -1082,9 +1122,11 @@ describe("native compaction single fallback", () => {
 		});
 		observer.resolve();
 		await vi.advanceTimersByTimeAsync(600000);
-		expect(f.requests.map(({ model }) => model.id)).toEqual([primary.id, primary.id]);
+		expect(f.requests.map(({ model }) => model.id)).toEqual(
+			reason === "threshold" ? [primary.id, primary.id, primary.id] : [primary.id, primary.id],
+		);
 		expect(f.manager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
-		expect(f.events.filter((event) => event.type === "agent_start")).toEqual([]);
+		expect(f.events.filter((event) => event.type === "agent_start")).toHaveLength(reason === "threshold" ? 1 : 0);
 	});
 
 	it("does not grant ordinary partial-EOF turns the compaction retry/fallback allowance", async () => {
