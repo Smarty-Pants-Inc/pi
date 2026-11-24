@@ -705,6 +705,12 @@ function consumeLine(text: string): { line: string; rest: string } | null {
 	};
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) {
+		throw new Error("Request was aborted");
+	}
+}
+
 async function* iterateSseMessages(
 	body: ReadableStream<Uint8Array>,
 	signal?: AbortSignal,
@@ -741,9 +747,7 @@ async function* iterateSseMessages(
 
 	try {
 		while (true) {
-			if (signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
+			throwIfAborted(signal);
 
 			const { value, done } = abortRejection
 				? await Promise.race([reader.read(), abortRejection])
@@ -758,6 +762,7 @@ async function* iterateSseMessages(
 				buffer = consumed.rest;
 				const event = decodeSseLine(consumed.line, state);
 				if (event) {
+					throwIfAborted(signal);
 					yield event;
 				}
 				consumed = consumeLine(buffer);
@@ -770,6 +775,7 @@ async function* iterateSseMessages(
 			buffer = consumed.rest;
 			const event = decodeSseLine(consumed.line, state);
 			if (event) {
+				throwIfAborted(signal);
 				yield event;
 			}
 			consumed = consumeLine(buffer);
@@ -778,12 +784,14 @@ async function* iterateSseMessages(
 		if (buffer.length > 0) {
 			const event = decodeSseLine(buffer, state);
 			if (event) {
+				throwIfAborted(signal);
 				yield event;
 			}
 		}
 
 		const trailingEvent = flushSseEvent(state);
 		if (trailingEvent) {
+			throwIfAborted(signal);
 			yield trailingEvent;
 		}
 	} finally {
@@ -980,6 +988,8 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
 				await options?.onProviderStreamEvent?.(event, model);
+				// A yielded SSE event may already be in flight when the consumer aborts.
+				throwIfAborted(options?.signal);
 				if (event.type === "message_start") {
 					output.responseId = event.message.id;
 					const transformations = event.message.input_transformations;

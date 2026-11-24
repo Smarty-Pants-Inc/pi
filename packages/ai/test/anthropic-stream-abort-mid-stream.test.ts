@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { stream } from "../src/api/anthropic-messages.ts";
 import type { Context, Model } from "../src/types.ts";
+import { normalizeContext } from "../src/utils/transcript.ts";
 
 function testModel(): Model<"anthropic-messages"> {
 	return {
@@ -69,14 +70,66 @@ function stallingFetch(): typeof fetch {
 	}) as unknown as typeof fetch;
 }
 
+// catch: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605
+// Unit test agreed in the task brief: hermetic RED for buffered events on Node.
 describe("Anthropic stream abort mid-stream", () => {
+	it.each(["\n\n", ""])("stops between events from one read (last delimiter %j)", async (delimiter) => {
+		const controller = new AbortController();
+		const delta = `event: content_block_delta\ndata: ${JSON.stringify({
+			type: "content_block_delta",
+			index: 0,
+			delta: { type: "text_delta", text: "must-not-appear" },
+		})}`;
+		const body = new ReadableStream<Uint8Array>({
+			start(source) {
+				// All events arrive in one read; no later read can unblock the abort.
+				source.enqueue(new TextEncoder().encode(SSE_PREFIX + Array(64).fill(delta).join("\n\n") + delimiter));
+				source.close();
+			},
+		});
+		const response = stream(
+			testModel(),
+			normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 1 }] }),
+			{
+				apiKey: "test-key",
+				cacheRetention: "none",
+				signal: controller.signal,
+				fetch: (async () =>
+					new Response(body, { headers: { "content-type": "text/event-stream" } })) as typeof fetch,
+			},
+		);
+		const deltas: string[] = [];
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				(async () => {
+					for await (const event of response) {
+						if (event.type === "text_delta") {
+							deltas.push(event.delta);
+							controller.abort();
+						}
+					}
+				})(),
+				new Promise<never>((_resolve, reject) => {
+					timeout = setTimeout(() => reject(new Error("stream did not settle promptly after abort")), 1000);
+				}),
+			]);
+		} finally {
+			clearTimeout(timeout);
+		}
+		expect(deltas).toEqual(["hello"]);
+		const message = await response.result();
+		expect(message.stopReason).toBe("aborted");
+		expect(message.content).toEqual([{ type: "text", text: "hello" }]);
+	});
+
 	it("ends the turn when the signal fires while a read is pending", async () => {
 		const context: Context = {
 			messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
 		};
 		const controller = new AbortController();
 
-		const response = stream(testModel(), context, {
+		const response = stream(testModel(), normalizeContext(context), {
 			apiKey: "test-key",
 			cacheRetention: "none",
 			signal: controller.signal,
